@@ -1,5 +1,7 @@
 # pi-external-agent
 
+English | [中文](README.zh-CN.md)
+
 A [pi](https://github.com/earendil-works/pi) extension that lets pi dispatch coding tasks to other agent CLIs installed on the same machine, and steer them while they run.
 
 ## Install
