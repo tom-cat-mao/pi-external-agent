@@ -7,7 +7,11 @@ A [pi](https://github.com/earendil-works/pi) extension that lets pi dispatch cod
 ## Install
 
 ```bash
-pi install git:https://github.com/tom-cat-mao/pi-external-agent
+# Pin a version (recommended; pi update leaves pinned installs alone)
+pi install git:github.com/tom-cat-mao/pi-external-agent@v0.2.0
+
+# Or track main
+pi install git:github.com/tom-cat-mao/pi-external-agent
 ```
 
 Requires pi ≥ 0.85 and whichever agent CLIs you want to drive (they don't all need to be installed).

@@ -7,7 +7,11 @@
 ## 安装
 
 ```bash
-pi install npm:pi-external-agent
+# 锁定版本（推荐，pi update 不会动它）
+pi install git:github.com/tom-cat-mao/pi-external-agent@v0.2.0
+
+# 或跟随 main 分支
+pi install git:github.com/tom-cat-mao/pi-external-agent
 ```
 
 要求 pi ≥ 0.85，以及按需安装的各 agent CLI（不需要全部装齐）。
