@@ -1,0 +1,41 @@
+{
+  "name": "pi-external-agent",
+  "version": "0.2.0",
+  "description": "Pi extension: dispatch coding tasks to other agent CLIs (codex, pi, kimi, codebuddy, claude, reasonix) and steer them mid-run",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "coding-agent",
+    "multi-agent"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tom-cat-mao/pi-external-agent"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  },
+  "files": [
+    "index.ts",
+    "adapters.ts",
+    "sessions.ts",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  }
+}
