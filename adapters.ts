@@ -50,6 +50,8 @@
  *                    for the og/deepseek-v4-flash relay model)
  */
 
+import { fileURLToPath } from "node:url";
+
 export type AgentId = "codex" | "pi" | "kimi" | "codebuddy" | "claude" | "reasonix";
 
 /** Permission mode requested at dispatch; each adapter maps it to real CLI flags. */
@@ -348,6 +350,31 @@ function parseClaudeFamilyStreamLine(line: string): AgentEvent | null {
 	return null;
 }
 
+/**
+ * Runtime-built `--settings` JSON for the codebuddy readonly tier. Replaces the
+ * old plan-mode mapping (verified 2026-09-09 against codebuddy 2.147.0 ACP):
+ * settings-injected permissions.allow/deny and hooks.PreToolUse are fully
+ * honored under --acp, and a rule-layer deny is a SILENT refusal — no prompt,
+ * no request_permission round-trip, the turn continues. plan mode, by contrast,
+ * dies wholesale when the driver auto-rejects its permission request.
+ * (--disallowedTools is ignored under ACP; everything must go through
+ * --settings.) The Bash hook path is resolved from this module's directory at
+ * call time, so it stays correct wherever the extension is installed.
+ */
+export function buildReadonlySettings(): string {
+	const hookPath = fileURLToPath(new URL("./hooks/codebuddy-readonly.js", import.meta.url));
+	const quotedHookPath = `'${hookPath.replaceAll("'", `'\\''`)}'`;
+	return JSON.stringify({
+		permissions: {
+			allow: ["Read", "Grep", "Glob", "LS", "WebSearch", "WebFetch"],
+			deny: ["Edit", "Write", "MultiEdit", "NotebookEdit"],
+		},
+		hooks: {
+			PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command: `node ${quotedHookPath}` }] }],
+		},
+	});
+}
+
 function claudeFamily(
 	id: AgentId,
 	bin: string,
@@ -361,6 +388,11 @@ function claudeFamily(
 	degraded?: string,
 	// Only codebuddy is driven over ACP today; claude stays one-shot.
 	session?: Adapter["session"],
+	// codebuddy only: when set, the readonly tier runs default mode with this
+	// runtime-built --settings JSON (silent allow/deny rules + Bash hook)
+	// instead of plan mode — plan's permission requests, once auto-rejected by
+	// the ACP driver, cancel the whole turn. claude keeps plan.
+	readonlySettings?: () => string,
 ): Adapter {
 	return {
 		id,
@@ -379,16 +411,28 @@ function claudeFamily(
 			// "acceptEdits" auto-approves file edits only. bypassPermissions (codebuddy)
 			// runs everything — the codex danger-full-access analogue; verified headless
 			// on 2.143.1 (Write executed without prompts, permission_denials empty).
-			const permissionMode =
-				mode === "readonly" ? "plan" : mode === "write" ? "acceptEdits" : (yoloPermissionMode ?? "acceptEdits");
+			// codebuddy readonly overrides plan (readonlySettings set): default mode +
+			// --settings deny rules refuse silently, so a readonly run neither prompts
+			// nor dies on a permission request.
+			const settingsJson = mode === "readonly" ? readonlySettings?.() : undefined;
+			const permissionMode = settingsJson
+				? "default"
+				: mode === "readonly"
+					? "plan"
+					: mode === "write"
+						? "acceptEdits"
+						: (yoloPermissionMode ?? "acceptEdits");
 			argv.push("--permission-mode", permissionMode);
+			if (settingsJson) argv.push("--settings", settingsJson);
 			if (model) argv.push("--model", model);
 			if (effort) argv.push("--effort", effort);
 			return {
 				argv,
 				promptArgIndex: 1,
 				cwdForwardedToCli: false,
-				effectivePolicy: `--permission-mode ${permissionMode}`,
+				effectivePolicy: settingsJson
+					? "--permission-mode default --settings (allow/deny rules + PreToolUse Bash hook; denies are silent)"
+					: `--permission-mode ${permissionMode}`,
 				readOnlyEnforcement: mode === "readonly" ? "harness-enforced" : "not-applicable",
 				model: model
 					? { requested: model, forwarded: true, note: "Passed to the target CLI as --model." }
@@ -772,6 +816,10 @@ export const ADAPTERS: Record<AgentId, Adapter> = {
 			followUp: true,
 			steerNote: "second session/prompt on the active session; injected at the next model step boundary",
 		},
+		// Readonly maps to default mode + runtime-built --settings (silent deny
+		// rules + Bash hook) instead of plan mode, whose auto-rejected permission
+		// requests cancel an ACP turn outright.
+		buildReadonlySettings,
 	),
 	claude: claudeFamily(
 		"claude",

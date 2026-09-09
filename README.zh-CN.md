@@ -44,6 +44,7 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
 - **无硬超时**：任务跑到结束为止。静默超过 watchdog（默认 15 分钟）会通知宿主模型，由它决定是否停止。需要立刻拿结果时用 `external_agent_wait`。
 - **持久会话**：支持 steer 的 agent 以 turn 结束为完成信号而非进程退出，进程保活 30 分钟，这是 follow-up 能保留上下文的原因。
 - **回执透明**：每次派发返回完整回执，记录实际 argv、生效权限策略、model/effort 是否真实转发——无法转发的会如实标注，不会静默丢弃。
+- **codebuddy readonly 的实现**：不用 plan 模式，而是 `default` 权限模式 + 动态生成的 `--settings`——工具 allow/deny 规则，外加一个 `PreToolUse` Bash hook（`hooks/codebuddy-readonly.js`），启发式放行常见只读命令，拒绝编辑、写入、重定向、命令替换和已知会改状态的命令。hook 是启发式的 shell 过滤器，**不是** OS 级沙箱：它不得不放行的通用脚本入口（`node`、`npm`、`gh` 等）可以越过它的模式匹配，因此 readonly 是尽力而为，不是绝对保证。claude 的 readonly 仍走 plan 模式。
 
 各 CLI 的兼容性结论（flag、输出格式、坑）写在 `adapters.ts` 注释里。
 
@@ -53,6 +54,7 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
 index.ts       工具注册、任务注册表、watchdog、通知
 adapters.ts    各 CLI 一次性适配器
 sessions.ts    持久会话驱动（steer / follow-up）
+hooks/         codebuddy readonly --settings 使用的 PreToolUse Bash hook
 ```
 
 ## 协议

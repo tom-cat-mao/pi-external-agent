@@ -44,6 +44,7 @@ Requires pi ≥ 0.85 and whichever agent CLIs you want to drive (they don't all 
 - **No hard timeout**: tasks run to completion. A stall watchdog (default 15m quiet) notifies the host model, which decides whether to stop the task. `external_agent_wait` exists for when you need the answer inside the current turn.
 - **Persistent sessions**: for steer-capable agents, completion means the turn ended, not that the process exited. The process stays alive for 30 minutes, which is what makes follow-up questions keep their context.
 - **Honest receipts**: every dispatch returns a receipt recording the exact argv, effective permission policy, and whether model/effort overrides were actually forwarded — unsupported overrides are reported as not forwarded instead of silently dropped.
+- **Codebuddy `readonly` enforcement**: instead of plan mode, codebuddy's readonly tier runs in `default` permission mode with a generated `--settings` payload — allow/deny tool rules plus a `PreToolUse` Bash hook (`hooks/codebuddy-readonly.js`) that heuristically allows common read-only commands and denies edits, writes, redirects, command substitution and known-mutating commands. The hook is a heuristic shell filter, **not** an OS sandbox: general script runners it has to allow (`node`, `npm`, `gh`, …) can act beyond its patterns, so readonly is best-effort, not an absolute guarantee. Claude's readonly tier keeps plan mode.
 
 Per-CLI compatibility notes (flags, output formats, pitfalls) live as comments in `adapters.ts`.
 
@@ -53,6 +54,7 @@ Per-CLI compatibility notes (flags, output formats, pitfalls) live as comments i
 index.ts       tool registration, task registry, watchdog, notifications
 adapters.ts    per-CLI one-shot adapters
 sessions.ts    persistent session drivers (steer / follow-up)
+hooks/         PreToolUse Bash hook used by codebuddy's readonly --settings
 ```
 
 ## License
