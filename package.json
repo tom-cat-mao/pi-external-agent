@@ -33,6 +33,7 @@
     "index.ts",
     "adapters.ts",
     "sessions.ts",
+    "hooks/codebuddy-readonly.js",
     "README.md",
     "README.zh-CN.md",
     "LICENSE"

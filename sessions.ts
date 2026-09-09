@@ -45,7 +45,7 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { ADAPTERS, codexEffortToken, type AgentEvent, type AgentId, type Effort, type Mode } from "./adapters.ts";
+import { ADAPTERS, buildReadonlySettings, codexEffortToken, type AgentEvent, type AgentId, type Effort, type Mode } from "./adapters.ts";
 
 const MAX_STDERR_CHARS = 8_000;
 const HANDSHAKE_TIMEOUT_MS = 30_000;
@@ -781,6 +781,13 @@ class AcpDriver extends BaseSessionDriver implements SessionDriver {
 	}
 
 	async start(input: SessionStartInput): Promise<void> {
+		// Readonly fail-safe only: since the settings-based readonly design
+		// (codebuddy: --permission-mode default + --settings deny rules + Bash
+		// hook), a permission request should never reach this driver at all —
+		// rule-layer denies happen silently inside codebuddy. "reject" stays as
+		// the backstop for dialects without settings enforcement (and note that
+		// rejecting a codebuddy ACP request cancels the whole turn, which is
+		// exactly why readonly moved off plan mode).
 		this.autoPermission = input.mode === "readonly" ? "reject" : "allow";
 		this.spawnProcess(ADAPTERS[this.dialect.id].bin, this.buildArgv(input), input.cwd);
 		this.onNotification((method, params) => this.handleNotification(method, params));
@@ -1019,7 +1026,17 @@ export const SESSION_DRIVERS: Partial<Record<AgentId, () => SessionDriver>> = {
 		new AcpDriver({
 			id: "codebuddy",
 			baseArgv: (input) => {
-				const argv = ["--permission-mode", input.mode === "readonly" ? "plan" : input.mode === "write" ? "acceptEdits" : "bypassPermissions"];
+				// Readonly is NOT plan mode: a plan-mode permission request, once
+				// auto-rejected by this driver, cancels the ENTIRE turn (verified
+				// 2026-09-09), making readonly delegation unusable. Instead: default
+				// mode + runtime-built --settings whose allow/deny rules and
+				// PreToolUse Bash hook deny silently — no request_permission ever
+				// reaches the driver. (--disallowedTools is ignored under ACP;
+				// everything must go through --settings.)
+				const argv =
+					input.mode === "readonly"
+						? ["--permission-mode", "default", "--settings", buildReadonlySettings()]
+						: ["--permission-mode", input.mode === "write" ? "acceptEdits" : "bypassPermissions"];
 				if (input.model) argv.push("--model", input.model);
 				if (input.effort) argv.push("--effort", input.effort);
 				return argv;
