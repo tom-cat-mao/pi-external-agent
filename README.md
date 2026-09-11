@@ -57,6 +57,10 @@ sessions.ts    persistent session drivers (steer / follow-up)
 hooks/         PreToolUse Bash hook used by codebuddy's readonly --settings
 ```
 
+## Community
+
+[LINUX DO](https://linux.do/)
+
 ## License
 
 MIT
