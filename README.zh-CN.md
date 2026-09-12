@@ -35,7 +35,7 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
 | `pi` | pi 子进程 | yolo | `--model` 完全可配的执行体 | ✅ `--mode rpc` |
 | `reasonix` | DeepSeek 原生 | yolo（deny 规则和 OS 沙箱仍生效） | 执行 / 评审 | ✅ ACP vendor 扩展 |
 | `codebuddy` | 腾讯 | yolo | 快速执行 / 仓库探索 | ✅ ACP step 边界注入 |
-| `qoder` | 阿里 | yolo | 执行 / 独立评审 | ✅ `--acp`（`session/prompt` 排队） |
+| `qoder` | 阿里 | yolo | 执行 / 独立评审 | follow-up ✅ `--acp`；steer ❌（仅证明排队，未验证可引导当前轮） |
 | `kimi` | Moonshot | 仅 yolo（headless 拒收权限旗标） | 执行 | ❌ |
 | `claude` | Anthropic | readonly | 分析 / 规划 | ❌ |
 
@@ -47,9 +47,9 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
 - **回执透明**：每次派发返回完整回执，记录实际 argv、生效权限策略、model/effort 是否真实转发——无法转发的会如实标注，不会静默丢弃。
 - **effort 需显式指定**：只有显式请求时才会转发（并按各 CLI 支持的档位校验）`effort` 覆盖；否则沿用目标 CLI/config 默认值——扩展不会根据任务复杂度推断思考档位，`off` 是显式请求，不等同于省略该参数。
 - **codebuddy readonly 的实现**：不用 plan 模式，而是 `default` 权限模式 + 动态生成的 `--settings`——工具 allow/deny 规则，外加一个 `PreToolUse` Bash hook（`hooks/codebuddy-readonly.js`），启发式放行常见只读命令，拒绝编辑、写入、重定向、命令替换和已知会改状态的命令。hook 是启发式的 shell 过滤器，**不是** OS 级沙箱：它不得不放行的通用脚本入口（`node`、`npm`、`gh` 等）可以越过它的模式匹配，因此 readonly 是尽力而为，不是绝对保证。claude 的 readonly 仍走 plan 模式。
-- **qoder readonly 的实现**：`--permission-mode dont_ask`（headless 下需要确认的操作一律拒绝）+ 内置工具白名单 `--tools Read,Grep,Glob,WebSearch,WebFetch`、`--disallowed-tools mcp__*,Agent`，并用 `--strict-mcp-config` 传入空 MCP 列表，因此编辑、Bash、MCP 工具和子 agent 启动都会被 Qoder 自身拒绝。`write` 映射到 `--permission-mode accept_edits`（目录内编辑自动放行，其他需确认操作仍拒绝），`yolo` 映射到 `bypass_permissions`。非默认模式仅在受信任的启动目录生效，否则回落到 `default`（headless 下需要确认的操作同样被拒绝）。用户/项目级 `PreToolUse` hook 优先级高于权限模式，返回 `allow` 的 hook 仍可短路权限流程。已在 qodercli 1.0.18 实测：readonly 运行拒绝创建 fixture 文件，`accept_edits` 则成功创建。
+- **qoder readonly 的实现**：`--permission-mode dont_ask`（headless 下需要确认的操作一律拒绝）+ 内置工具白名单 `--tools Read,Grep,Glob,WebSearch,WebFetch`、`--disallowed-tools mcp__*,Agent`，并用 `--strict-mcp-config` 传入空 MCP 列表，另加每次调用专用的 `--settings {"disableAllHooks":true}` 关闭 user/project/local/plugin 全部 hook，使 hook 无法短路权限流程。因此编辑、Bash、MCP 工具和子 agent 启动都会被 Qoder 自身拒绝。`write` 映射到 `--permission-mode accept_edits`（目录内编辑自动放行；ACP 权限请求一律回以 reject，没有 reject 选项时回 cancelled，绝不自动 allow），`yolo` 映射到 `bypass_permissions`。非默认模式仅在受信任的启动目录生效，否则回落到 `default`（headless 下需要确认的操作同样被拒绝）。已在 qodercli 1.0.18 实测：readonly 运行拒绝创建 fixture 文件，`accept_edits` 则成功创建。
 
-各 CLI 的兼容性结论（flag、输出格式、坑）写在 `adapters.ts` 注释里。
+各 CLI 的兼容性结论写在 `adapters.ts` 注释以及每次派发回执的 `effective policy` 一行里。
 
 ## 文件
 

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { ADAPTERS, qoderPermissionArgs } from "../adapters.ts";
-import { SESSION_DRIVERS } from "../sessions.ts";
+import { FOLLOWUP_AGENT_IDS, SESSION_DRIVERS, STEER_AGENT_IDS } from "../sessions.ts";
 
 test("qoder adapter basics", () => {
 	const a = ADAPTERS.qoder;
@@ -10,13 +10,22 @@ test("qoder adapter basics", () => {
 	assert.equal(a.defaultMode, "yolo");
 	assert.equal(a.maxMode, "yolo");
 	assert.equal(a.enforcesReadOnly, true);
-	assert.equal(a.session?.steer, true);
+	assert.equal(a.session?.steer, false);
 	assert.equal(a.session?.followUp, true);
 	assert.deepEqual(a.supportedEfforts, ["off", "low", "medium", "high", "xhigh", "max"]);
 	assert.equal((a.supportedEfforts as readonly string[]).includes("minimal"), false);
+	assert.match(a.sessionPolicy!("readonly"), /dont_ask/);
+	assert.match(a.sessionPolicy!("write"), /accept_edits/);
 });
 
-test("qoder one-shot dispatch: readonly restricts tools and MCP", () => {
+test("qoder is follow-up only in the capability lists", () => {
+	assert.equal(STEER_AGENT_IDS.includes("qoder"), false);
+	assert.equal(FOLLOWUP_AGENT_IDS.includes("qoder"), true);
+	assert.equal(STEER_AGENT_IDS.includes("codebuddy"), true);
+	assert.equal(FOLLOWUP_AGENT_IDS.includes("codebuddy"), true);
+});
+
+test("qoder one-shot dispatch: readonly restricts tools, hooks and MCP", () => {
 	const ro = ADAPTERS.qoder.buildDispatch({ task: "audit", cwd: "/tmp", mode: "readonly" });
 	assert.deepEqual(ro.argv.slice(0, 3), ["-p", "audit", "--output-format"]);
 	assert.equal(ro.argv[3], "stream-json");
@@ -25,10 +34,12 @@ test("qoder one-shot dispatch: readonly restricts tools and MCP", () => {
 	assert.equal(ro.argv[ro.argv.indexOf("--disallowed-tools") + 1], "mcp__*,Agent");
 	assert.equal(ro.argv.includes("--strict-mcp-config"), true);
 	assert.deepEqual(JSON.parse(ro.argv[ro.argv.indexOf("--mcp-config") + 1]), { mcpServers: {} });
+	assert.deepEqual(JSON.parse(ro.argv[ro.argv.indexOf("--settings") + 1]), { disableAllHooks: true });
 	assert.equal(ro.promptArgIndex, 1);
 	assert.equal(ro.argv[ro.promptArgIndex], "audit");
 	assert.equal(ro.readOnlyEnforcement, "harness-enforced");
 	assert.match(ro.effectivePolicy ?? "", /dont_ask/);
+	assert.match(ro.effectivePolicy ?? "", /disableAllHooks/);
 });
 
 test("qoder one-shot dispatch: write/yolo mapping and no readonly extras", () => {
@@ -79,6 +90,7 @@ test("qoder ACP session driver argv", () => {
 	assert.equal(ro[ro.indexOf("--permission-mode") + 1], "dont_ask");
 	assert.equal(ro[ro.indexOf("--tools") + 1], "Read,Grep,Glob,WebSearch,WebFetch");
 	assert.equal(ro[ro.indexOf("--disallowed-tools") + 1], "mcp__*,Agent");
+	assert.deepEqual(JSON.parse(ro[ro.indexOf("--settings") + 1]), { disableAllHooks: true });
 	assert.equal(ro[ro.indexOf("--model") + 1], "lite");
 	assert.equal(ro[ro.indexOf("--reasoning-effort") + 1], "high");
 
@@ -91,6 +103,48 @@ test("qoder ACP session driver argv", () => {
 test("qoderPermissionArgs mode mapping", () => {
 	assert.deepEqual(qoderPermissionArgs("readonly").slice(0, 2), ["--permission-mode", "dont_ask"]);
 	assert.equal(qoderPermissionArgs("readonly").includes("--strict-mcp-config"), true);
+	assert.deepEqual(JSON.parse(qoderPermissionArgs("readonly")[qoderPermissionArgs("readonly").indexOf("--settings") + 1]), {
+		disableAllHooks: true,
+	});
 	assert.deepEqual(qoderPermissionArgs("write"), ["--permission-mode", "accept_edits"]);
 	assert.deepEqual(qoderPermissionArgs("yolo"), ["--permission-mode", "bypass_permissions"]);
+});
+
+test("qoder ACP permission requests fail closed for readonly and write", () => {
+	const driver = SESSION_DRIVERS.qoder!() as any;
+	assert.deepEqual(driver.dialect.failClosedPermissionModes, ["readonly", "write"]);
+	const calls: any[] = [];
+	driver.respond = (id: number, result: unknown) => calls.push({ id, result });
+	driver.respondError = (id: number, message: string) => calls.push({ id, error: message });
+
+	driver.autoPermission = "reject";
+	driver.handleRequest({
+		id: 1,
+		method: "session/request_permission",
+		params: { options: [{ optionId: "allow_once", kind: "allow_once" }] },
+	});
+	assert.equal(calls[0].result.outcome.outcome, "cancelled");
+	assert.equal(calls[0].result.outcome.optionId, undefined);
+
+	driver.autoPermission = "reject";
+	driver.handleRequest({
+		id: 2,
+		method: "session/request_permission",
+		params: {
+			options: [
+				{ optionId: "allow_once", kind: "allow_once" },
+				{ optionId: "reject_once", kind: "reject_once" },
+			],
+		},
+	});
+	assert.equal(calls[1].result.outcome.outcome, "selected");
+	assert.equal(calls[1].result.outcome.optionId, "reject_once");
+
+	driver.autoPermission = "allow";
+	driver.handleRequest({
+		id: 3,
+		method: "session/request_permission",
+		params: { options: [{ optionId: "allow_once", kind: "allow_once" }] },
+	});
+	assert.equal(calls[2].result.outcome.optionId, "allow_once");
 });

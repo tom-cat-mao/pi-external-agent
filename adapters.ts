@@ -172,6 +172,7 @@ export interface Adapter {
 		/** How mid-run guidance is delivered; injected at a step boundary, never an immediate interrupt. */
 		steerNote: string;
 	};
+	sessionPolicy?: (mode: Mode) => string;
 	buildDispatch(input: BuildArgsInput): AdapterDispatch;
 	/** Return null for lines that carry no useful signal. */
 	parseEvent(line: string): AgentEvent | null;
@@ -679,9 +680,21 @@ export function qoderPermissionArgs(mode: Mode): string[] {
 			"--strict-mcp-config",
 			"--mcp-config",
 			'{"mcpServers":{}}',
+			"--settings",
+			'{"disableAllHooks":true}',
 		);
 	}
 	return argv;
+}
+
+function qoderEffectivePolicy(mode: Mode): string {
+	if (mode === "readonly") {
+		return "--permission-mode dont_ask (ask is denied) + --tools Read,Grep,Glob,WebSearch,WebFetch + --settings disableAllHooks; MCP servers disabled; Agent launches denied";
+	}
+	if (mode === "write") {
+		return "--permission-mode accept_edits (in-directory edits auto-approved; every other permission request is refused, never auto-allowed); non-default modes require a trusted startup directory";
+	}
+	return "--permission-mode bypass_permissions (no sandbox); non-default modes require a trusted startup directory";
 }
 
 const qoderAdapter: Adapter = {
@@ -696,10 +709,11 @@ const qoderAdapter: Adapter = {
 	maxMode: "yolo",
 	supportedEfforts: ["off", "low", "medium", "high", "xhigh", "max"],
 	session: {
-		steer: true,
+		steer: false,
 		followUp: true,
-		steerNote: "second session/prompt on the active ACP session; Qoder advertises promptQueueing, so guidance lands at the next step boundary or as a follow-up if the turn ends first",
+		steerNote: "no mid-run steering: Qoder advertises promptQueueing, which proves queuing only, so a second prompt cannot be relied on to redirect the active turn",
 	},
+	sessionPolicy: qoderEffectivePolicy,
 	enforcesReadOnly: true,
 	buildDispatch({ task, mode, model, effort }) {
 		const argv = ["-p", task, "--output-format", "stream-json", ...qoderPermissionArgs(mode)];
@@ -709,10 +723,7 @@ const qoderAdapter: Adapter = {
 			argv,
 			promptArgIndex: 1,
 			cwdForwardedToCli: false,
-			effectivePolicy:
-				mode === "readonly"
-					? "--permission-mode dont_ask (ask is denied) + --tools Read,Grep,Glob,WebSearch,WebFetch; MCP servers disabled; Agent launches denied"
-					: `--permission-mode ${mode === "write" ? "accept_edits" : "bypass_permissions"} (non-default modes require a trusted startup directory)`,
+			effectivePolicy: qoderEffectivePolicy(mode),
 			readOnlyEnforcement: mode === "readonly" ? "harness-enforced" : "not-applicable",
 			model: model
 				? { requested: model, forwarded: true, note: "Passed to the target CLI as --model." }
