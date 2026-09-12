@@ -1,7 +1,7 @@
 {
   "name": "pi-external-agent",
   "version": "0.2.0",
-  "description": "Pi extension: dispatch coding tasks to other agent CLIs (codex, pi, kimi, codebuddy, claude, reasonix) and steer them mid-run",
+  "description": "Pi extension: dispatch coding tasks to other agent CLIs (codex, pi, kimi, codebuddy, claude, reasonix, qoder) and steer them mid-run",
   "type": "module",
   "keywords": [
     "pi-package",

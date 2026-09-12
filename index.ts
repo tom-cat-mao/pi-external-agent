@@ -1266,22 +1266,23 @@ export default function (pi: ExtensionAPI) {
 			"this turn, block on external_agent_wait instead of sleep-polling. Use external_agent_status to",
 			"inspect progress or read full answers.",
 			`Agents: ${agentTable}.`,
-			"Modes: readonly, write (workspace edits), yolo (no sandbox; codex/pi/kimi/codebuddy). When mode is omitted",
+			"Modes: readonly, write (workspace edits), yolo (no sandbox; codex/pi/kimi/codebuddy/qoder). When mode is omitted",
 			"the agent's own default applies. Concurrent write/yolo tasks in the same directory are refused.",
 			"Effort is an opt-in reasoning-effort override: set it only when the user explicitly asks for a reasoning-effort",
 			"or thinking level. Otherwise omit it so the target CLI/config default applies — never infer a level from task",
 			"complexity. Per-agent support is listed in the effort parameter, and unsupported levels are refused.",
 			"Each call is a fresh session for the other agent: it sees no pi conversation history, so the task text",
 			"must be self-contained (state the goal, name the files, say what to return).",
-			`pi, codex, reasonix and codebuddy run as persistent sessions: their conversation survives the answer, so`,
+			`pi, codex, reasonix, codebuddy and qoder run as persistent sessions: their conversation survives the answer, so`,
 			"you can steer them mid-run (external_agent_steer) or continue the same session afterwards",
 			"(external_agent_follow_up). The others are one-shot processes with no way back in.",
 		].join(" "),
-		promptSnippet: "Delegate a task to an external coding agent CLI (codex, kimi, codebuddy, claude, reasonix)",
+		promptSnippet: "Delegate a task to an external coding agent CLI (codex, qoder, kimi, codebuddy, claude, reasonix)",
 		promptGuidelines: [
-			"Use external_agent_start with codex, pi, or kimi for code-writing and execution tasks; they run unsandboxed (yolo) by default. Pick pi when a specific model should do the work — the model parameter is forwarded to the child pi (e.g. deepseek-v4-flash). Kimi is yolo-only: readonly/write requests are refused — use codebuddy or claude for read-only exploration.",
+			"Use external_agent_start with codex, pi, or kimi for code-writing and execution tasks; they run unsandboxed (yolo) by default. Pick pi when a specific model should do the work — the model parameter is forwarded to the child pi (e.g. deepseek-v4-flash). Kimi is yolo-only: readonly/write requests are refused — use codebuddy, qoder or claude for read-only exploration.",
 			"Use external_agent_start with reasonix when a DeepSeek-native harness (not a codex/pi fork) should attempt or review the work; its yolo stays bounded by deny rules and the OS bash sandbox.",
 			"Use external_agent_start with codebuddy for fast repository exploration that may turn into execution — it leans toward codebase understanding but runs yolo (bypassPermissions) by default like codex.",
+			"Use external_agent_start with qoder for an independent executor or reviewer on the Qoder CLI; all tiers are open and yolo is the default like codex, while its readonly tier is harness-enforced by dont_ask plus a built-in tool allowlist.",
 			"Use external_agent_start when a second model's opinion is worth more than another pass by yourself, or when the user explicitly asks for a specific agent such as codex.",
 			"Prefer asking two different agents the same question and comparing their answers over chaining agents in a pipeline; disagreement is the useful signal.",
 			"Treat any external agent's answer as a claim, not verified fact: check its conclusions against the code yourself before acting on them.",
@@ -1304,7 +1305,7 @@ export default function (pi: ExtensionAPI) {
 						"readonly forbids mutations (harness-enforced where the agent supports it). write allows workspace edits. " +
 						"yolo removes the sandbox entirely (codex; on pi, write and yolo are equivalent full-tool runs since pi has no sandbox; " +
 						"on reasonix, yolo stays bounded by deny rules and the OS bash sandbox). " +
-						"Defaults to the agent's own default: codex/pi/reasonix/kimi/codebuddy yolo, others readonly.",
+						"Defaults to the agent's own default: codex/pi/reasonix/kimi/codebuddy/qoder yolo, others readonly.",
 				}),
 			),
 			model: Type.Optional(Type.String({ description: "Override the external agent's model, if it supports one." })),
@@ -1315,8 +1316,9 @@ export default function (pi: ExtensionAPI) {
 						"effort/thinking level; do not choose one from task complexity. " +
 						"pi: off..max; codebuddy: minimal..max; claude: low..max; codex: off..xhigh (off maps to 'none'); " +
 						"reasonix: off..max (mapped onto the DeepSeek vocabulary: off->disabled, minimal->low, medium->high, xhigh->max); " +
+						"qoder: off, low..max (Qoder's documented vocabulary is disabled|off|none|low|medium|high|xhigh|max, so minimal is not offered); " +
 						"kimi: unsupported — an effort request for kimi is refused. Omit it to inherit the target CLI/config default " +
-						"(specifying off is an explicit override, not the same as omitting).",
+						"(specifying off is an explicit override, not the same as omitting)."
 				}),
 			),
 			notify: Type.Optional(
@@ -1743,7 +1745,7 @@ export default function (pi: ExtensionAPI) {
 		].join(" "),
 		promptSnippet: "Redirect a running external agent task at its next step boundary",
 		promptGuidelines: [
-			"Use external_agent_steer while a pi/codex/reasonix/codebuddy task is running to correct its approach instead of stopping and re-dispatching.",
+			"Use external_agent_steer while a pi/codex/reasonix/codebuddy/qoder task is running to correct its approach instead of stopping and re-dispatching.",
 			"Steering is delivered at a step boundary, never mid-tool-call: do not expect it to abort a bash command that is already running.",
 			"If external_agent_steer reports the turn is no longer active, use external_agent_follow_up instead — the task has already settled.",
 		],
@@ -1809,7 +1811,7 @@ export default function (pi: ExtensionAPI) {
 		].join(" "),
 		promptSnippet: "Ask a follow-up question in the same external agent session",
 		promptGuidelines: [
-			"Use external_agent_follow_up after a pi/codex/reasonix/codebuddy task settles to ask a clarifying question or request a revision in the same session, instead of dispatching a fresh task that would repeat all the work.",
+			"Use external_agent_follow_up after a pi/codex/reasonix/codebuddy/qoder task settles to ask a clarifying question or request a revision in the same session, instead of dispatching a fresh task that would repeat all the work.",
 			"A refused follow-up means the session process is gone; dispatch a new task with a self-contained prompt rather than trying to restore it.",
 		],
 		parameters: Type.Object({

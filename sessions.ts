@@ -45,7 +45,7 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { ADAPTERS, buildReadonlySettings, codexEffortToken, type AgentEvent, type AgentId, type Effort, type Mode } from "./adapters.ts";
+import { ADAPTERS, buildReadonlySettings, codexEffortToken, qoderPermissionArgs, type AgentEvent, type AgentId, type Effort, type Mode } from "./adapters.ts";
 
 const MAX_STDERR_CHARS = 8_000;
 const HANDSHAKE_TIMEOUT_MS = 30_000;
@@ -1039,6 +1039,16 @@ export const SESSION_DRIVERS: Partial<Record<AgentId, () => SessionDriver>> = {
 						: ["--permission-mode", input.mode === "write" ? "acceptEdits" : "bypassPermissions"];
 				if (input.model) argv.push("--model", input.model);
 				if (input.effort) argv.push("--effort", input.effort);
+				return argv;
+			},
+		}),
+	qoder: () =>
+		new AcpDriver({
+			id: "qoder",
+			baseArgv: (input) => {
+				const argv = qoderPermissionArgs(input.mode);
+				if (input.model) argv.push("--model", input.model);
+				if (input.effort) argv.push("--reasoning-effort", input.effort);
 				return argv;
 			},
 		}),
