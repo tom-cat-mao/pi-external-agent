@@ -1839,7 +1839,7 @@ export default function (pi: ExtensionAPI) {
 			"The task goes back to running and notifies you again when the new turn settles.",
 			`Supported agents: ${FOLLOWUP_AGENTS}. Requires the task to have settled (not running) and its session process`,
 			"to still be alive — sessions are reclaimed after 30 minutes idle, after which a follow-up is refused and",
-			"you should dispatch a new task instead. For a task that is still running, use external_agent_steer.",
+			`you should dispatch a new task instead. If the task is still running, wait for it to settle first — only ${STEER_AGENTS} also support mid-run steering.`,
 		].join(" "),
 		promptSnippet: "Ask a follow-up question in the same external agent session",
 		promptGuidelines: [
@@ -1861,11 +1861,14 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: "A non-empty message is required." }], details: { continued: false } };
 			}
 			if (task.state === "running") {
+				const canSteer = ADAPTERS[task.agent].session?.steer === true;
 				return {
 					content: [
 						{
 							type: "text",
-							text: `${task.id} is still running. Use external_agent_steer taskId="${task.id}" for mid-run guidance, or wait for it to settle.`,
+							text: canSteer
+								? `${task.id} is still running. Use external_agent_steer taskId="${task.id}" for mid-run guidance, or wait for it to settle.`
+								: `${task.id} is still running and ${task.agent} does not support mid-run steering. Wait for it to settle, then follow up.`,
 						},
 					],
 					details: { continued: false, taskId: task.id, state: task.state },

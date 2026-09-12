@@ -936,15 +936,14 @@ class AcpDriver extends BaseSessionDriver implements SessionDriver {
 		}
 		const options: any[] = Array.isArray(msg.params?.options) ? msg.params.options : [];
 		if (this.autoPermission === "reject") {
-			const reject =
-				options.find((o) => typeof o?.kind === "string" && (o.kind.startsWith("reject") || o.kind.startsWith("deny"))) ??
-				options.find(
-					(o) =>
-						typeof o?.optionId === "string" &&
-						(o.optionId.toLowerCase().includes("reject") || o.optionId.toLowerCase().includes("deny")),
-				);
+			const reject = options.find(
+				(o) =>
+					(o?.kind === "reject_once" || o?.kind === "reject_always") &&
+					typeof o?.optionId === "string" &&
+					o.optionId.length > 0,
+			);
 			if (reject) {
-				this.respond(msg.id, { outcome: { outcome: "selected", optionId: reject.optionId ?? reject.kind } });
+				this.respond(msg.id, { outcome: { outcome: "selected", optionId: reject.optionId } });
 				return;
 			}
 			this.respond(msg.id, { outcome: { outcome: "cancelled" } });

@@ -116,35 +116,28 @@ test("qoder ACP permission requests fail closed for readonly and write", () => {
 	const calls: any[] = [];
 	driver.respond = (id: number, result: unknown) => calls.push({ id, result });
 	driver.respondError = (id: number, message: string) => calls.push({ id, error: message });
+	const request = (id: number, options: unknown[]) => {
+		driver.autoPermission = "reject";
+		driver.handleRequest({ id, method: "session/request_permission", params: { options } });
+		return calls[calls.length - 1];
+	};
 
-	driver.autoPermission = "reject";
-	driver.handleRequest({
-		id: 1,
-		method: "session/request_permission",
-		params: { options: [{ optionId: "allow_once", kind: "allow_once" }] },
-	});
-	assert.equal(calls[0].result.outcome.outcome, "cancelled");
-	assert.equal(calls[0].result.outcome.optionId, undefined);
-
-	driver.autoPermission = "reject";
-	driver.handleRequest({
-		id: 2,
-		method: "session/request_permission",
-		params: {
-			options: [
-				{ optionId: "allow_once", kind: "allow_once" },
-				{ optionId: "reject_once", kind: "reject_once" },
-			],
-		},
-	});
-	assert.equal(calls[1].result.outcome.outcome, "selected");
-	assert.equal(calls[1].result.outcome.optionId, "reject_once");
+	assert.equal(request(1, [{ optionId: "allow_once", kind: "allow_once" }]).result.outcome.outcome, "cancelled");
+	const decoy = request(2, [{ optionId: "never_reject", kind: "allow_once" }]);
+	assert.equal(decoy.result.outcome.outcome, "cancelled");
+	assert.equal(decoy.result.outcome.optionId, undefined);
+	assert.equal(request(3, [{ optionId: "reject_once" }]).result.outcome.outcome, "cancelled");
+	assert.equal(request(4, [{ kind: "reject_once" }]).result.outcome.outcome, "cancelled");
+	assert.equal(request(5, [{ optionId: "", kind: "reject_once" }]).result.outcome.outcome, "cancelled");
+	assert.equal(request(6, [{}]).result.outcome.outcome, "cancelled");
+	assert.equal(request(7, [{ optionId: "reject_once", kind: "reject_once" }]).result.outcome.optionId, "reject_once");
+	assert.equal(request(8, [{ optionId: "reject_always", kind: "reject_always" }]).result.outcome.optionId, "reject_always");
 
 	driver.autoPermission = "allow";
 	driver.handleRequest({
-		id: 3,
+		id: 9,
 		method: "session/request_permission",
 		params: { options: [{ optionId: "allow_once", kind: "allow_once" }] },
 	});
-	assert.equal(calls[2].result.outcome.optionId, "allow_once");
+	assert.equal(calls[calls.length - 1].result.outcome.optionId, "allow_once");
 });
