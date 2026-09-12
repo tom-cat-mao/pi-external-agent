@@ -138,21 +138,10 @@ test("settings hook command works from an install path with spaces and quotes", 
 		});
 		assert.equal(JSON.parse(out).hookSpecificOutput.permissionDecision, "allow");
 	} finally {
-		// Non-recursive teardown: remove only the files this test copied, then the
-		// known directories it created (rmdirSync refuses non-empty dirs).
-		for (const file of [path.join(sub, "adapters.ts"), path.join(sub, "hooks", "codebuddy-readonly.js")]) {
-			try {
-				unlinkSync(file);
-			} catch {
-				/* already gone */
-			}
-		}
-		for (const directory of [path.join(sub, "hooks"), sub, dir]) {
-			try {
-				rmdirSync(directory);
-			} catch {
-				/* already gone or not empty */
-			}
-		}
+		unlinkSync(path.join(sub, "adapters.ts"));
+		unlinkSync(path.join(sub, "hooks", "codebuddy-readonly.js"));
+		rmdirSync(path.join(sub, "hooks"));
+		rmdirSync(sub);
+		rmdirSync(dir);
 	}
 });

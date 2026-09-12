@@ -19,16 +19,77 @@ import { ADAPTERS, AGENT_IDS } from "../adapters.ts";
 import { SESSION_DRIVERS } from "../sessions.ts";
 import type { AgentId, Effort } from "../adapters.ts";
 
-/** The effort payload any adapter places in argv, however it spells the flag. */
 function effortPayload(argv: string[]): string | undefined {
 	const cIndex = argv.indexOf("-c");
 	if (cIndex !== -1 && argv[cIndex + 1]?.startsWith("model_reasoning_effort=")) return argv[cIndex + 1];
-	for (const flag of ["--effort", "--thinking"]) {
+	for (const flag of ["--effort", "--thinking", "--reasoning-effort"]) {
 		const index = argv.indexOf(flag);
 		if (index !== -1) return argv[index + 1];
 	}
 	return undefined;
 }
+
+const INDEX_SOURCE = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+
+function sliceBetween(source: string, start: string, end: string): string {
+	const from = source.indexOf(start);
+	const to = source.indexOf(end, from + start.length);
+	assert.notEqual(from, -1, `missing source marker: ${start}`);
+	assert.notEqual(to, -1, `missing source marker: ${end}`);
+	return source.slice(from, to);
+}
+
+function prose(source: string): string {
+	const literals = [...source.matchAll(/"([^"\\]*(?:\\.[^"\\]*)*)"/g)].map((match) => match[1]);
+	return literals.join(" ").replace(/\s+/g, " ").trim();
+}
+
+const START_TOOL_SOURCE = sliceBetween(
+	INDEX_SOURCE,
+	'name: "external_agent_start"',
+	'name: "external_agent_status"',
+);
+const DESCRIPTION_SURFACE = prose(sliceBetween(START_TOOL_SOURCE, "description: [", "promptSnippet:"));
+const GUIDELINES_SURFACE = prose(sliceBetween(START_TOOL_SOURCE, "promptGuidelines: [", "parameters:"));
+const EFFORT_PARAM_SURFACE = prose(sliceBetween(START_TOOL_SOURCE, "effort: Type.Optional(", "notify: Type.Optional("));
+
+const COMPLEXITY_TO_EFFORT = [
+	/fast lookup/i,
+	/hard design/i,
+	/hard debug/i,
+	/low\/minimal/i,
+	/high\/xhigh/i,
+	/tune reasoning depth/i,
+];
+
+test("metadata: external_agent_start surfaces do not recommend inferring effort from task complexity", () => {
+	assert.doesNotMatch(INDEX_SOURCE, /low\/minimal for fast lookups/);
+	assert.doesNotMatch(INDEX_SOURCE, /high\/xhigh for hard/);
+	for (const surface of [DESCRIPTION_SURFACE, GUIDELINES_SURFACE, EFFORT_PARAM_SURFACE]) {
+		for (const pattern of COMPLEXITY_TO_EFFORT) {
+			assert.doesNotMatch(surface, pattern, `complexity-based effort recommendation reintroduced: ${pattern}`);
+		}
+	}
+});
+
+test("metadata: effort is described as opt-in on description, schema, and the named guideline", () => {
+	assert.match(DESCRIPTION_SURFACE, /opt-in reasoning-effort override/i);
+	assert.match(DESCRIPTION_SURFACE, /never infer a level from task complexity/i);
+	assert.match(DESCRIPTION_SURFACE, /target CLI\/config default/i);
+
+	assert.match(EFFORT_PARAM_SURFACE, /opt-in reasoning-effort override/i);
+	assert.match(EFFORT_PARAM_SURFACE, /explicitly requests an/i);
+	assert.match(EFFORT_PARAM_SURFACE, /Omit it to inherit the target CLI\/config default/i);
+
+	const effortGuideline = INDEX_SOURCE.split("\n").find((line) =>
+		line.includes("Never infer an effort level from task complexity"),
+	);
+	assert.ok(effortGuideline, "the opt-in effort promptGuideline is missing");
+	assert.match(effortGuideline, /external_agent_start/);
+	assert.match(effortGuideline, /explicitly requests a reasoning-effort/i);
+	assert.match(effortGuideline, /omit it entirely/i);
+	assert.match(effortGuideline, /target CLI\/config default/i);
+});
 
 test("one-shot: omitting effort adds no effort argument and invents no default", () => {
 	for (const id of AGENT_IDS) {
@@ -91,11 +152,6 @@ test("persistent reasonix ACP: effort is never forwarded, requested or not", () 
 	assert.equal(effortPayload(driver.buildArgv({ task: "t", cwd: "/tmp", mode: "yolo" })), undefined);
 	assert.equal(effortPayload(driver.buildArgv({ task: "t", cwd: "/tmp", mode: "yolo", effort: "high" })), undefined);
 });
-
-// ---------------------------------------------------------------------------
-// codex app-server: effort travels in the turn/start protocol params, so the
-// driver runs against a mock `codex` executable placed first on PATH.
-// ---------------------------------------------------------------------------
 
 const CODEX_MOCK = `#!/usr/bin/env node
 const fs = require("node:fs");

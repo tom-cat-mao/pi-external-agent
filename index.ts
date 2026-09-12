@@ -1285,7 +1285,7 @@ export default function (pi: ExtensionAPI) {
 			"Use external_agent_start when a second model's opinion is worth more than another pass by yourself, or when the user explicitly asks for a specific agent such as codex.",
 			"Prefer asking two different agents the same question and comparing their answers over chaining agents in a pipeline; disagreement is the useful signal.",
 			"Treat any external agent's answer as a claim, not verified fact: check its conclusions against the code yourself before acting on them.",
-			"Set effort only when the user explicitly requests a reasoning-effort or thinking-level override; otherwise omit it entirely so the target CLI/config default applies. Never infer an effort level from task complexity (specifying off is an explicit request, not the same as omitting it).",
+			"On external_agent_start, set the effort parameter only when the user explicitly requests a reasoning-effort or thinking-level override; otherwise omit it entirely so the target CLI/config default applies. Never infer an effort level from task complexity (specifying off is an explicit request, not the same as omitting it).",
 			"Default async pattern: after dispatching external agents whose results are not needed in this turn, end your turn — completion and stall notifications will re-invoke you. Do not poll with bash sleep loops.",
 			"Use external_agent_wait when the user is waiting for the result in this turn, or your immediate next step depends on it.",
 			"Use external_agent_status only for sparse progress checks (at least 60s apart) or when a task was started with notify off.",
