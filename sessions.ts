@@ -45,7 +45,7 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { ADAPTERS, buildReadonlySettings, codexEffortToken, type AgentEvent, type AgentId, type Effort, type Mode } from "./adapters.ts";
+import { ADAPTERS, buildReadonlySettings, codexEffortToken, qoderPermissionArgs, type AgentEvent, type AgentId, type Effort, type Mode } from "./adapters.ts";
 
 const MAX_STDERR_CHARS = 8_000;
 const HANDSHAKE_TIMEOUT_MS = 30_000;
@@ -728,6 +728,7 @@ interface AcpDialect {
 	id: AgentId;
 	/** Extra argv appended after --acp. */
 	baseArgv: (input: SessionStartInput) => string[];
+	failClosedPermissionModes?: Mode[];
 }
 
 const ACP_FLAG = "--acp";
@@ -788,7 +789,7 @@ class AcpDriver extends BaseSessionDriver implements SessionDriver {
 		// the backstop for dialects without settings enforcement (and note that
 		// rejecting a codebuddy ACP request cancels the whole turn, which is
 		// exactly why readonly moved off plan mode).
-		this.autoPermission = input.mode === "readonly" ? "reject" : "allow";
+		this.autoPermission = (this.dialect.failClosedPermissionModes ?? ["readonly"]).includes(input.mode) ? "reject" : "allow";
 		this.spawnProcess(ADAPTERS[this.dialect.id].bin, this.buildArgv(input), input.cwd);
 		this.onNotification((method, params) => this.handleNotification(method, params));
 		this.onRequest((msg) => this.handleRequest(msg));
@@ -934,10 +935,23 @@ class AcpDriver extends BaseSessionDriver implements SessionDriver {
 			return;
 		}
 		const options: any[] = Array.isArray(msg.params?.options) ? msg.params.options : [];
-		const wanted = this.autoPermission;
+		if (this.autoPermission === "reject") {
+			const reject = options.find(
+				(o) =>
+					(o?.kind === "reject_once" || o?.kind === "reject_always") &&
+					typeof o?.optionId === "string" &&
+					o.optionId.length > 0,
+			);
+			if (reject) {
+				this.respond(msg.id, { outcome: { outcome: "selected", optionId: reject.optionId } });
+				return;
+			}
+			this.respond(msg.id, { outcome: { outcome: "cancelled" } });
+			return;
+		}
 		const chosen =
-			options.find((o) => typeof o?.kind === "string" && o.kind.startsWith(wanted)) ??
-			options.find((o) => typeof o?.optionId === "string" && o.optionId.toLowerCase().includes(wanted)) ??
+			options.find((o) => typeof o?.kind === "string" && o.kind.startsWith("allow")) ??
+			options.find((o) => typeof o?.optionId === "string" && o.optionId.toLowerCase().includes("allow")) ??
 			options[0];
 		if (!chosen) {
 			this.respondError(msg.id, "no permission option available");
@@ -1042,9 +1056,23 @@ export const SESSION_DRIVERS: Partial<Record<AgentId, () => SessionDriver>> = {
 				return argv;
 			},
 		}),
+	qoder: () =>
+		new AcpDriver({
+			id: "qoder",
+			failClosedPermissionModes: ["readonly", "write"],
+			baseArgv: (input) => {
+				const argv = qoderPermissionArgs(input.mode);
+				if (input.model) argv.push("--model", input.model);
+				if (input.effort) argv.push("--reasoning-effort", input.effort);
+				return argv;
+			},
+		}),
 };
 
 export const SESSION_AGENT_IDS = Object.keys(SESSION_DRIVERS) as AgentId[];
+
+export const STEER_AGENT_IDS = SESSION_AGENT_IDS.filter((id) => ADAPTERS[id].session?.steer);
+export const FOLLOWUP_AGENT_IDS = SESSION_AGENT_IDS.filter((id) => ADAPTERS[id].session?.followUp);
 
 export function hasSessionDriver(agent: AgentId): boolean {
 	return SESSION_DRIVERS[agent] !== undefined;

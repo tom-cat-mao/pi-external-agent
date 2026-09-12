@@ -52,7 +52,7 @@
 
 import { fileURLToPath } from "node:url";
 
-export type AgentId = "codex" | "pi" | "kimi" | "codebuddy" | "claude" | "reasonix";
+export type AgentId = "codex" | "pi" | "kimi" | "codebuddy" | "claude" | "reasonix" | "qoder";
 
 /** Permission mode requested at dispatch; each adapter maps it to real CLI flags. */
 export type Mode = "readonly" | "write" | "yolo";
@@ -172,6 +172,7 @@ export interface Adapter {
 		/** How mid-run guidance is delivered; injected at a step boundary, never an immediate interrupt. */
 		steerNote: string;
 	};
+	sessionPolicy?: (mode: Mode) => string;
 	buildDispatch(input: BuildArgsInput): AdapterDispatch;
 	/** Return null for lines that carry no useful signal. */
 	parseEvent(line: string): AgentEvent | null;
@@ -562,7 +563,7 @@ const reasonixAdapter: Adapter = {
 	provider: "DeepSeek-native (esengine/deepseek-reasonix)",
 	useFor:
 		"Execution workhorse like codex and pi, running on a DeepSeek-native harness tuned for prefix-cache " +
-		"stability. Default model is og/deepseek-v4-flash at max effort via the user's own relay; omit the model " +
+		"stability. Default model is og/deepseek-v4-flash via the user's own relay; omit the model " +
 		"parameter unless a different provider is genuinely needed. " +
 		"yolo is bounded: deny rules and the OS bash sandbox still apply.",
 	defaultMode: "yolo",
@@ -665,6 +666,76 @@ const reasonixAdapter: Adapter = {
 				return null;
 		}
 	},
+};
+
+export function qoderPermissionArgs(mode: Mode): string[] {
+	const permissionMode = mode === "readonly" ? "dont_ask" : mode === "write" ? "accept_edits" : "bypass_permissions";
+	const argv = ["--permission-mode", permissionMode];
+	if (mode === "readonly") {
+		argv.push(
+			"--tools",
+			"Read,Grep,Glob,WebSearch,WebFetch",
+			"--disallowed-tools",
+			"mcp__*,Agent",
+			"--strict-mcp-config",
+			"--mcp-config",
+			'{"mcpServers":{}}',
+			"--settings",
+			'{"disableAllHooks":true}',
+		);
+	}
+	return argv;
+}
+
+function qoderEffectivePolicy(mode: Mode): string {
+	if (mode === "readonly") {
+		return "--permission-mode dont_ask (ask is denied) + --tools Read,Grep,Glob,WebSearch,WebFetch + --settings disableAllHooks; MCP servers disabled; Agent launches denied";
+	}
+	if (mode === "write") {
+		return "--permission-mode accept_edits (in-directory edits auto-approved; every other permission request is refused, never auto-allowed); non-default modes require a trusted startup directory";
+	}
+	return "--permission-mode bypass_permissions (no sandbox); non-default modes require a trusted startup directory";
+}
+
+const qoderAdapter: Adapter = {
+	id: "qoder",
+	bin: "qodercli",
+	provider: "Qoder (Alibaba)",
+	useFor:
+		"Full coding agent with a Claude-Code-compatible CLI surface. All tiers are open and yolo is the default, like codex; " +
+		"readonly is harness-enforced through dont_ask plus a built-in tool allowlist. Reach for it when a third independent " +
+		"executor or reviewer is useful, or when the user names Qoder.",
+	defaultMode: "yolo",
+	maxMode: "yolo",
+	supportedEfforts: ["off", "low", "medium", "high", "xhigh", "max"],
+	session: {
+		steer: false,
+		followUp: true,
+		steerNote: "no mid-run steering: Qoder advertises promptQueueing, which proves queuing only, so a second prompt cannot be relied on to redirect the active turn",
+	},
+	sessionPolicy: qoderEffectivePolicy,
+	enforcesReadOnly: true,
+	buildDispatch({ task, mode, model, effort }) {
+		const argv = ["-p", task, "--output-format", "stream-json", ...qoderPermissionArgs(mode)];
+		if (model) argv.push("--model", model);
+		if (effort) argv.push("--reasoning-effort", effort);
+		return {
+			argv,
+			promptArgIndex: 1,
+			cwdForwardedToCli: false,
+			effectivePolicy: qoderEffectivePolicy(mode),
+			readOnlyEnforcement: mode === "readonly" ? "harness-enforced" : "not-applicable",
+			model: model
+				? { requested: model, forwarded: true, note: "Passed to the target CLI as --model." }
+				: { forwarded: false, note: "No model override requested; target CLI/config selects the model." },
+			effort: effortReceipt(
+				effort,
+				true,
+				"Passed to the target CLI as --reasoning-effort; Qoder's documented vocabulary is disabled|off|none|low|medium|high|xhigh|max (the extension's \"minimal\" is not offered).",
+			),
+		};
+	},
+	parseEvent: parseClaudeFamilyStreamLine,
 };
 
 // ---------------------------------------------------------------------------
@@ -830,6 +901,7 @@ export const ADAPTERS: Record<AgentId, Adapter> = {
 		"json",
 	),
 	reasonix: reasonixAdapter,
+	qoder: qoderAdapter,
 };
 
 export const AGENT_IDS = Object.keys(ADAPTERS) as AgentId[];

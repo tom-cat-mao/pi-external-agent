@@ -45,7 +45,14 @@ import {
 	type Effort,
 	type Mode,
 } from "./adapters.ts";
-import { SESSION_AGENT_IDS, SESSION_DRIVERS, hasSessionDriver, type SessionDriver, type SteerResult } from "./sessions.ts";
+import {
+	FOLLOWUP_AGENT_IDS,
+	SESSION_DRIVERS,
+	STEER_AGENT_IDS,
+	hasSessionDriver,
+	type SessionDriver,
+	type SteerResult,
+} from "./sessions.ts";
 
 // ---------------------------------------------------------------------------
 // Task registry
@@ -299,9 +306,10 @@ function copyDispatchReceipt(receipt: DispatchReceipt): DispatchReceipt {
 
 function dispatchSummary(receipt: DispatchReceipt, taskId?: string): string[] {
 	const persistent = receipt.transport === "persistent";
+	const canSteer = ADAPTERS[receipt.agent]?.session?.steer === true;
 	const lines = [
 		`provider: ${escapeTerminalControls(receipt.provider)}`,
-		`transport: ${persistent ? "persistent session (steer + follow-up)" : "one-shot process"}`,
+		`transport: ${persistent ? (canSteer ? "persistent session (steer + follow-up)" : "persistent session (follow-up only)") : "one-shot process"}`,
 		`requested mode: ${receipt.requestedMode}`,
 		`effective policy: ${receipt.effectivePolicy === null ? "none" : escapeTerminalControls(receipt.effectivePolicy)}`,
 		`readonly: ${enforcementDisplay(receipt)}`,
@@ -648,7 +656,7 @@ function startPersistentTask(
 		agent,
 		provider: adapter.provider,
 		requestedMode: mode,
-		effectivePolicy: `${adapter.session?.steerNote ?? "session"} (persistent session)`,
+		effectivePolicy: adapter.sessionPolicy?.(mode) ?? `${adapter.session?.steerNote ?? "session"} (persistent session)`,
 		readOnlyEnforcement: mode === "readonly" ? "harness-enforced" : "not-applicable",
 		model: model
 			? { requested: model, forwarded: true, note: "Passed to the persistent session at startup." }
@@ -939,9 +947,12 @@ function detailReport(task: Task, tailCount: number): string {
 	if (task.exitCode !== null) lines.push(`exit: ${task.exitCode}`);
 	if (task.spawnError) lines.push(`spawn error: ${task.spawnError}`);
 	if (task.transport === "persistent") {
+		const canSteer = ADAPTERS[task.agent].session?.steer === true;
 		lines.push(
 			task.sessionAlive
-				? "session: alive (external_agent_steer while running, external_agent_follow_up once settled)"
+				? canSteer
+					? "session: alive (external_agent_steer while running, external_agent_follow_up once settled)"
+					: "session: alive (external_agent_follow_up once settled; no mid-run steer)"
 				: "session: reclaimed — follow-ups are refused, dispatch a new task",
 		);
 	}
@@ -1159,7 +1170,7 @@ function receiptFromStartArgs(args: Record<string, unknown>, fallbackCwd: string
 			agent,
 			provider: adapter.provider,
 			requestedMode: mode,
-			effectivePolicy: `${adapter.session?.steerNote ?? "session"} (persistent session)`,
+			effectivePolicy: adapter.sessionPolicy?.(mode) ?? `${adapter.session?.steerNote ?? "session"} (persistent session)`,
 			readOnlyEnforcement: mode === "readonly" ? "harness-enforced" : "not-applicable",
 			model: model
 				? { requested: model, forwarded: true, note: "Passed to the persistent session at startup." }
@@ -1212,7 +1223,15 @@ const agentTable = AGENT_IDS.map((id) => {
 		a.supportedEfforts
 			? `effort: ${a.supportedEfforts[0]}..${a.supportedEfforts[a.supportedEfforts.length - 1]}`
 			: "no effort control",
-		a.session ? "steer+follow-up" : "no steer",
+		a.session
+			? a.session.steer && a.session.followUp
+				? "steer+follow-up"
+				: a.session.followUp
+					? "follow-up only"
+					: a.session.steer
+						? "steer only"
+						: "session"
+			: "no steer",
 		a.degraded ? `DEGRADED: ${a.degraded}` : null,
 	]
 		.filter(Boolean)
@@ -1220,20 +1239,30 @@ const agentTable = AGENT_IDS.map((id) => {
 	return `${id} = ${a.provider} — ${a.useFor} [${flags}]`;
 }).join(" | ");
 
-const STEER_AGENTS = SESSION_AGENT_IDS.join(", ");
+const STEER_AGENTS = STEER_AGENT_IDS.join(", ") || "(none)";
+const FOLLOWUP_AGENTS = FOLLOWUP_AGENT_IDS.join(", ") || "(none)";
 
 /** Shared guard for the two session-only tools. */
-function requireSteerableTask(taskId: unknown): { task: Task } | { error: string } {
+function requireCapableTask(taskId: unknown, capability: "steer" | "followUp"): { task: Task } | { error: string } {
 	if (typeof taskId !== "string" || !taskId) {
 		return { error: `Missing taskId. Known: ${[...tasks.keys()].join(", ") || "(none)"}` };
 	}
 	const task = tasks.get(taskId);
 	if (!task) return { error: `Unknown taskId "${taskId}". Known: ${[...tasks.keys()].join(", ") || "(none)"}` };
+	const supportedList = capability === "steer" ? STEER_AGENTS : FOLLOWUP_AGENTS;
 	if (task.transport !== "persistent" || !task.driver) {
 		return {
 			error:
-				`${task.agent} runs as a one-shot process, so it cannot be steered or continued (${task.id}). ` +
-				`Steer and follow-up are available for: ${STEER_AGENTS}.`,
+				`${task.agent} runs as a one-shot process, so it cannot be ${capability === "steer" ? "steered" : "continued"} (${task.id}). ` +
+				`${capability === "steer" ? "Steering" : "Follow-up"} is available for: ${supportedList}.`,
+		};
+	}
+	const supportedByAgent = capability === "steer" ? ADAPTERS[task.agent].session?.steer : ADAPTERS[task.agent].session?.followUp;
+	if (!supportedByAgent) {
+		return {
+			error:
+				`${task.agent} does not support ${capability === "steer" ? "mid-run steering" : "follow-up"} (${task.id}). ` +
+				`${capability === "steer" ? "Steering" : "Follow-up"} is available for: ${supportedList}.`,
 		};
 	}
 	return { task };
@@ -1266,30 +1295,32 @@ export default function (pi: ExtensionAPI) {
 			"this turn, block on external_agent_wait instead of sleep-polling. Use external_agent_status to",
 			"inspect progress or read full answers.",
 			`Agents: ${agentTable}.`,
-			"Modes: readonly, write (workspace edits), yolo (no sandbox; codex/pi/kimi/codebuddy). When mode is omitted",
+			"Modes: readonly, write (workspace edits), yolo (no sandbox; codex/pi/kimi/codebuddy/qoder). When mode is omitted",
 			"the agent's own default applies. Concurrent write/yolo tasks in the same directory are refused.",
-			"Effort is an optional reasoning-effort override; per-agent support is listed in the effort parameter",
-			"and refused where unsupported.",
+			"Effort is an opt-in reasoning-effort override: set it only when the user explicitly asks for a reasoning-effort",
+			"or thinking level. Otherwise omit it so the target CLI/config default applies — never infer a level from task",
+			"complexity. Per-agent support is listed in the effort parameter, and unsupported levels are refused.",
 			"Each call is a fresh session for the other agent: it sees no pi conversation history, so the task text",
 			"must be self-contained (state the goal, name the files, say what to return).",
-			`pi, codex, reasonix and codebuddy run as persistent sessions: their conversation survives the answer, so`,
-			"you can steer them mid-run (external_agent_steer) or continue the same session afterwards",
-			"(external_agent_follow_up). The others are one-shot processes with no way back in.",
+			`pi, codex, reasonix, codebuddy and qoder run as persistent sessions: their conversation survives the answer, so`,
+			"you can continue the same session afterwards (external_agent_follow_up). pi, codex, reasonix and codebuddy can",
+			"additionally be steered mid-run (external_agent_steer); qoder is follow-up only. The others are one-shot with no way back in.",
 		].join(" "),
-		promptSnippet: "Delegate a task to an external coding agent CLI (codex, kimi, codebuddy, claude, reasonix)",
+		promptSnippet: "Delegate a task to an external coding agent CLI (codex, qoder, kimi, codebuddy, claude, reasonix)",
 		promptGuidelines: [
-			"Use external_agent_start with codex, pi, or kimi for code-writing and execution tasks; they run unsandboxed (yolo) by default. Pick pi when a specific model should do the work — the model parameter is forwarded to the child pi (e.g. deepseek-v4-flash). Kimi is yolo-only: readonly/write requests are refused — use codebuddy or claude for read-only exploration.",
+			"Use external_agent_start with codex, pi, or kimi for code-writing and execution tasks; they run unsandboxed (yolo) by default. Pick pi when a specific model should do the work — the model parameter is forwarded to the child pi (e.g. deepseek-v4-flash). Kimi is yolo-only: readonly/write requests are refused — use codebuddy, qoder or claude for read-only exploration.",
 			"Use external_agent_start with reasonix when a DeepSeek-native harness (not a codex/pi fork) should attempt or review the work; its yolo stays bounded by deny rules and the OS bash sandbox.",
 			"Use external_agent_start with codebuddy for fast repository exploration that may turn into execution — it leans toward codebase understanding but runs yolo (bypassPermissions) by default like codex.",
+			"Use external_agent_start with qoder for an independent executor or reviewer on the Qoder CLI; all tiers are open and yolo is the default like codex, its readonly tier is harness-enforced by dont_ask plus a built-in tool allowlist, and it supports same-session follow-up but not mid-run steering.",
 			"Use external_agent_start when a second model's opinion is worth more than another pass by yourself, or when the user explicitly asks for a specific agent such as codex.",
 			"Prefer asking two different agents the same question and comparing their answers over chaining agents in a pipeline; disagreement is the useful signal.",
 			"Treat any external agent's answer as a claim, not verified fact: check its conclusions against the code yourself before acting on them.",
-			"Use effort to tune reasoning depth on agents that support it (all except kimi) — low/minimal for fast lookups, high/xhigh for hard design or debugging. Omit it to keep the target CLI's default.",
+			"On external_agent_start, set the effort parameter only when the user explicitly requests a reasoning-effort or thinking-level override; otherwise omit it entirely so the target CLI/config default applies. Never infer an effort level from task complexity (specifying off is an explicit request, not the same as omitting it).",
 			"Default async pattern: after dispatching external agents whose results are not needed in this turn, end your turn — completion and stall notifications will re-invoke you. Do not poll with bash sleep loops.",
 			"Use external_agent_wait when the user is waiting for the result in this turn, or your immediate next step depends on it.",
 			"Use external_agent_status only for sparse progress checks (at least 60s apart) or when a task was started with notify off.",
 			`Use external_agent_steer on a running ${STEER_AGENTS} task to redirect it: correct a wrong approach, narrow the scope, or tell it to stop early. It is NOT an interrupt — the message lands at the next step boundary, so a bash command already running still completes.`,
-			`Use external_agent_follow_up on a settled ${STEER_AGENTS} task to ask a second question in the same session: it remembers what it just did, so you do not have to restate the task. Refused once the session process has been reclaimed (30m idle) — dispatch a new task instead.`,
+			`Use external_agent_follow_up on a settled ${FOLLOWUP_AGENTS} task to ask a second question in the same session: it remembers what it just did, so you do not have to restate the task. Refused once the session process has been reclaimed (30m idle) — dispatch a new task instead.`,
 		],
 		parameters: Type.Object({
 			agent: StringEnum(AGENT_IDS as unknown as readonly string[]),
@@ -1303,17 +1334,20 @@ export default function (pi: ExtensionAPI) {
 						"readonly forbids mutations (harness-enforced where the agent supports it). write allows workspace edits. " +
 						"yolo removes the sandbox entirely (codex; on pi, write and yolo are equivalent full-tool runs since pi has no sandbox; " +
 						"on reasonix, yolo stays bounded by deny rules and the OS bash sandbox). " +
-						"Defaults to the agent's own default: codex/pi/reasonix/kimi/codebuddy yolo, others readonly.",
+						"Defaults to the agent's own default: codex/pi/reasonix/kimi/codebuddy/qoder yolo, others readonly.",
 				}),
 			),
 			model: Type.Optional(Type.String({ description: "Override the external agent's model, if it supports one." })),
 			effort: Type.Optional(
 				StringEnum(EFFORT_LEVELS, {
 					description:
-						"Reasoning effort override, where the agent supports one. " +
+						"Opt-in reasoning-effort override, where the agent supports one. Set it only when the user explicitly requests an " +
+						"effort/thinking level; do not choose one from task complexity. " +
 						"pi: off..max; codebuddy: minimal..max; claude: low..max; codex: off..xhigh (off maps to 'none'); " +
 						"reasonix: off..max (mapped onto the DeepSeek vocabulary: off->disabled, minimal->low, medium->high, xhigh->max); " +
-						"kimi: unsupported — an effort request for kimi is refused. Omit to use the target CLI/config default.",
+						"qoder: off, low..max (Qoder's documented vocabulary is disabled|off|none|low|medium|high|xhigh|max, so minimal is not offered); " +
+						"kimi: unsupported — an effort request for kimi is refused. Omit it to inherit the target CLI/config default " +
+						"(specifying off is an explicit override, not the same as omitting)."
 				}),
 			),
 			notify: Type.Optional(
@@ -1454,8 +1488,11 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const persistent = task.transport === "persistent";
+			const canSteer = adapter.session?.steer === true;
 			const sessionNote = persistent
-				? `This session stays alive after it settles: steer it with external_agent_steer taskId="${task.id}" while it runs, or continue it with external_agent_follow_up taskId="${task.id}" (reclaimed after ${Math.round(IDLE_REAP_MS / 60_000)}m idle).`
+				? canSteer
+					? `This session stays alive after it settles: steer it with external_agent_steer taskId="${task.id}" while it runs, or continue it with external_agent_follow_up taskId="${task.id}" (reclaimed after ${Math.round(IDLE_REAP_MS / 60_000)}m idle).`
+					: `This session stays alive after it settles: continue it with external_agent_follow_up taskId="${task.id}" (reclaimed after ${Math.round(IDLE_REAP_MS / 60_000)}m idle). It does not support mid-run steering.`
 				: null;
 			return {
 				content: [
@@ -1735,12 +1772,12 @@ export default function (pi: ExtensionAPI) {
 			"call that is already executing finishes and before the next model call — so a long-running bash command",
 			"still completes. Use it to correct the approach, narrow the scope, add a constraint, or tell the agent to",
 			"wrap up early; do not expect it to cancel work in flight (use external_agent_stop for that).",
-			`Supported agents: ${STEER_AGENTS}. Other agents run as one-shot processes and cannot be steered.`,
+			`Supported agents: ${STEER_AGENTS}. qoder is persistent but supports follow-up only, and other agents run as one-shot processes; neither can be steered.`,
 			"Requires the task to still be running; for a task that has already settled, use external_agent_follow_up.",
 		].join(" "),
 		promptSnippet: "Redirect a running external agent task at its next step boundary",
 		promptGuidelines: [
-			"Use external_agent_steer while a pi/codex/reasonix/codebuddy task is running to correct its approach instead of stopping and re-dispatching.",
+			`Use external_agent_steer while a ${STEER_AGENTS} task is running to correct its approach instead of stopping and re-dispatching.`,
 			"Steering is delivered at a step boundary, never mid-tool-call: do not expect it to abort a bash command that is already running.",
 			"If external_agent_steer reports the turn is no longer active, use external_agent_follow_up instead — the task has already settled.",
 		],
@@ -1752,7 +1789,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 
 		async execute(_id, params): Promise<AgentToolResult<ExternalAgentSteerDetails>> {
-			const guard = requireSteerableTask(params.taskId);
+			const guard = requireCapableTask(params.taskId, "steer");
 			if ("error" in guard) {
 				return { content: [{ type: "text", text: guard.error }], details: { steered: false } };
 			}
@@ -1800,13 +1837,13 @@ export default function (pi: ExtensionAPI) {
 			"Continue a settled external agent task with another message in the SAME session: the agent still has",
 			"everything it did and learned, so you can ask a second question without restating the task.",
 			"The task goes back to running and notifies you again when the new turn settles.",
-			`Supported agents: ${STEER_AGENTS}. Requires the task to have settled (not running) and its session process`,
+			`Supported agents: ${FOLLOWUP_AGENTS}. Requires the task to have settled (not running) and its session process`,
 			"to still be alive — sessions are reclaimed after 30 minutes idle, after which a follow-up is refused and",
-			"you should dispatch a new task instead. For a task that is still running, use external_agent_steer.",
+			`you should dispatch a new task instead. If the task is still running, wait for it to settle first — only ${STEER_AGENTS} also support mid-run steering.`,
 		].join(" "),
 		promptSnippet: "Ask a follow-up question in the same external agent session",
 		promptGuidelines: [
-			"Use external_agent_follow_up after a pi/codex/reasonix/codebuddy task settles to ask a clarifying question or request a revision in the same session, instead of dispatching a fresh task that would repeat all the work.",
+			`Use external_agent_follow_up after a ${FOLLOWUP_AGENTS} task settles to ask a clarifying question or request a revision in the same session, instead of dispatching a fresh task that would repeat all the work.`,
 			"A refused follow-up means the session process is gone; dispatch a new task with a self-contained prompt rather than trying to restore it.",
 		],
 		parameters: Type.Object({
@@ -1815,7 +1852,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 
 		async execute(_id, params): Promise<AgentToolResult<ExternalAgentFollowUpDetails>> {
-			const guard = requireSteerableTask(params.taskId);
+			const guard = requireCapableTask(params.taskId, "followUp");
 			if ("error" in guard) {
 				return { content: [{ type: "text", text: guard.error }], details: { continued: false } };
 			}
@@ -1824,11 +1861,14 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: "A non-empty message is required." }], details: { continued: false } };
 			}
 			if (task.state === "running") {
+				const canSteer = ADAPTERS[task.agent].session?.steer === true;
 				return {
 					content: [
 						{
 							type: "text",
-							text: `${task.id} is still running. Use external_agent_steer taskId="${task.id}" for mid-run guidance, or wait for it to settle.`,
+							text: canSteer
+								? `${task.id} is still running. Use external_agent_steer taskId="${task.id}" for mid-run guidance, or wait for it to settle.`
+								: `${task.id} is still running and ${task.agent} does not support mid-run steering. Wait for it to settle, then follow up.`,
 						},
 					],
 					details: { continued: false, taskId: task.id, state: task.state },
