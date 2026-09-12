@@ -151,6 +151,9 @@ async function spawnQoder(input: {
 			model: input.model,
 			effort: input.effort,
 		});
+	} catch (error) {
+		driver.kill();
+		throw error;
 	} finally {
 		if (previousPath === undefined) delete process.env.PATH;
 		else process.env.PATH = previousPath;
