@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { afterEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
@@ -19,7 +19,7 @@ const STUBS: Record<string, string> = {
 	};`,
 };
 
-registerHooks({
+const moduleHooks = registerHooks({
 	resolve(specifier, context, nextResolve) {
 		if (Object.prototype.hasOwnProperty.call(STUBS, specifier)) return { url: `stub:${specifier}`, shortCircuit: true };
 		return nextResolve(specifier, context);
@@ -31,13 +31,16 @@ registerHooks({
 });
 
 const hub = (await import("../index.ts")) as { default: (pi: unknown) => void };
+moduleHooks.deregister();
 const tools = new Map<string, any>();
+const lifecycle = new Map<string, (event: { reason: string }) => void>();
 hub.default({
 	registerTool: (tool: any) => tools.set(tool.name, tool),
 	registerMessageRenderer: () => {},
-	on: () => {},
+	on: (event: string, handler: (event: { reason: string }) => void) => lifecycle.set(event, handler),
 	sendMessage: () => {},
 });
+afterEach(() => lifecycle.get("session_shutdown")!({ reason: "quit" }));
 
 const QODER_HUB_MOCK = `#!/usr/bin/env node
 const scenario = process.env.QODER_MOCK_SCENARIO ? JSON.parse(process.env.QODER_MOCK_SCENARIO) : {};
@@ -138,7 +141,10 @@ test("hub: qoder start/wait/status expose a settled receipt, answer, and omitted
 		const status = await call("external_agent_status", { taskId });
 		assert.equal(status.details.kind, "external-agent-status");
 		assert.match(status.content[0].text, new RegExp(taskId));
-		assert.match(status.content[0].text, /done/);
+		assert.equal(status.details.task.state, "done");
+		assert.match(status.details.task.dispatch.effectivePolicy, /dont_ask.*disableAllHooks/);
+		assert.equal(status.details.task.dispatch.argv[0], "--acp");
+		assert.equal(status.details.task.dispatch.argv.includes("--reasoning-effort"), false);
 	} finally {
 		await call("external_agent_stop", { all: true });
 		restoreScenario();
@@ -164,6 +170,7 @@ test("hub: qoder follow-up continues the settled session", async () => {
 
 		const second = await call("external_agent_wait", { taskIds: [taskId], timeout: 5 });
 		assert.match(second.content[0].text, /SECOND/);
+		assert.doesNotMatch(second.content[0].text, /FIRST/);
 	} finally {
 		await call("external_agent_stop", { all: true });
 		restoreScenario();
