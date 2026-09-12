@@ -9,7 +9,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmdirSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
@@ -138,6 +138,21 @@ test("settings hook command works from an install path with spaces and quotes", 
 		});
 		assert.equal(JSON.parse(out).hookSpecificOutput.permissionDecision, "allow");
 	} finally {
-		rmSync(dir, { recursive: true, force: true });
+		// Non-recursive teardown: remove only the files this test copied, then the
+		// known directories it created (rmdirSync refuses non-empty dirs).
+		for (const file of [path.join(sub, "adapters.ts"), path.join(sub, "hooks", "codebuddy-readonly.js")]) {
+			try {
+				unlinkSync(file);
+			} catch {
+				/* already gone */
+			}
+		}
+		for (const directory of [path.join(sub, "hooks"), sub, dir]) {
+			try {
+				rmdirSync(directory);
+			} catch {
+				/* already gone or not empty */
+			}
+		}
 	}
 });

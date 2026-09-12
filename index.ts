@@ -1268,8 +1268,9 @@ export default function (pi: ExtensionAPI) {
 			`Agents: ${agentTable}.`,
 			"Modes: readonly, write (workspace edits), yolo (no sandbox; codex/pi/kimi/codebuddy). When mode is omitted",
 			"the agent's own default applies. Concurrent write/yolo tasks in the same directory are refused.",
-			"Effort is an optional reasoning-effort override; per-agent support is listed in the effort parameter",
-			"and refused where unsupported.",
+			"Effort is an opt-in reasoning-effort override: set it only when the user explicitly asks for a reasoning-effort",
+			"or thinking level. Otherwise omit it so the target CLI/config default applies — never infer a level from task",
+			"complexity. Per-agent support is listed in the effort parameter, and unsupported levels are refused.",
 			"Each call is a fresh session for the other agent: it sees no pi conversation history, so the task text",
 			"must be self-contained (state the goal, name the files, say what to return).",
 			`pi, codex, reasonix and codebuddy run as persistent sessions: their conversation survives the answer, so`,
@@ -1284,7 +1285,7 @@ export default function (pi: ExtensionAPI) {
 			"Use external_agent_start when a second model's opinion is worth more than another pass by yourself, or when the user explicitly asks for a specific agent such as codex.",
 			"Prefer asking two different agents the same question and comparing their answers over chaining agents in a pipeline; disagreement is the useful signal.",
 			"Treat any external agent's answer as a claim, not verified fact: check its conclusions against the code yourself before acting on them.",
-			"Use effort to tune reasoning depth on agents that support it (all except kimi) — low/minimal for fast lookups, high/xhigh for hard design or debugging. Omit it to keep the target CLI's default.",
+			"Set effort only when the user explicitly requests a reasoning-effort or thinking-level override; otherwise omit it entirely so the target CLI/config default applies. Never infer an effort level from task complexity (specifying off is an explicit request, not the same as omitting it).",
 			"Default async pattern: after dispatching external agents whose results are not needed in this turn, end your turn — completion and stall notifications will re-invoke you. Do not poll with bash sleep loops.",
 			"Use external_agent_wait when the user is waiting for the result in this turn, or your immediate next step depends on it.",
 			"Use external_agent_status only for sparse progress checks (at least 60s apart) or when a task was started with notify off.",
@@ -1310,10 +1311,12 @@ export default function (pi: ExtensionAPI) {
 			effort: Type.Optional(
 				StringEnum(EFFORT_LEVELS, {
 					description:
-						"Reasoning effort override, where the agent supports one. " +
+						"Opt-in reasoning-effort override, where the agent supports one. Set it only when the user explicitly requests an " +
+						"effort/thinking level; do not choose one from task complexity. " +
 						"pi: off..max; codebuddy: minimal..max; claude: low..max; codex: off..xhigh (off maps to 'none'); " +
 						"reasonix: off..max (mapped onto the DeepSeek vocabulary: off->disabled, minimal->low, medium->high, xhigh->max); " +
-						"kimi: unsupported — an effort request for kimi is refused. Omit to use the target CLI/config default.",
+						"kimi: unsupported — an effort request for kimi is refused. Omit it to inherit the target CLI/config default " +
+						"(specifying off is an explicit override, not the same as omitting).",
 				}),
 			),
 			notify: Type.Optional(

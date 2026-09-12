@@ -562,7 +562,7 @@ const reasonixAdapter: Adapter = {
 	provider: "DeepSeek-native (esengine/deepseek-reasonix)",
 	useFor:
 		"Execution workhorse like codex and pi, running on a DeepSeek-native harness tuned for prefix-cache " +
-		"stability. Default model is og/deepseek-v4-flash at max effort via the user's own relay; omit the model " +
+		"stability. Default model is og/deepseek-v4-flash via the user's own relay; omit the model " +
 		"parameter unless a different provider is genuinely needed. " +
 		"yolo is bounded: deny rules and the OS bash sandbox still apply.",
 	defaultMode: "yolo",
