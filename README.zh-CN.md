@@ -16,7 +16,7 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
 
 要求 pi ≥ 0.85，以及按需安装的各 agent CLI（不需要全部装齐）。
 
-使用 qoder agent 需要安装 Qoder CLI（`qodercli`）并确保它在 `PATH` 上且已登录（`qodercli login`）。本集成针对 qodercli 1.0.18 测试；官方链接：[Input Modes](https://docs.qoder.com/cli/sdk/input-modes)（流式 `priority` / `shouldQuery` 契约）、[Run in Scripts](https://docs.qoder.com/cli/run-in-scripts)（`--input-format stream-json`）、[Permissions](https://docs.qoder.com/cli/permissions)、[CLI reference](https://docs.qoder.com/cli/cli-reference)、[Settings reference](https://docs.qoder.com/cli/settings-reference)。线上报文格式另与已发布的 [`@qoder-ai/qoder-agent-sdk`](https://www.npmjs.com/package/@qoder-ai/qoder-agent-sdk) 1.0.39 交叉核对。
+使用 qoder agent 需要安装 Qoder CLI（`qodercli`）并确保它在 `PATH` 上且已登录（`qodercli login`）。已用 qodercli 1.0.18 验证部分启动、权限和续问路径；steer 则要求满足本适配器的稳定版本基线 1.1.49（详见下方兼容性说明）。官方链接：[Input Modes](https://docs.qoder.com/cli/sdk/input-modes)（流式 `priority` / `shouldQuery` 契约）、[Run in Scripts](https://docs.qoder.com/cli/run-in-scripts)（`--input-format stream-json`）、[Permissions](https://docs.qoder.com/cli/permissions)、[CLI reference](https://docs.qoder.com/cli/cli-reference)、[Settings reference](https://docs.qoder.com/cli/settings-reference)。线上报文格式另与已发布的 [`@qoder-ai/qoder-agent-sdk`](https://www.npmjs.com/package/@qoder-ai/qoder-agent-sdk) 1.0.39 交叉核对。
 
 ## 工具
 
@@ -37,7 +37,7 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
 | `pi` | pi 子进程 | yolo | `--model` 完全可配的执行体 | ✅ `--mode rpc` |
 | `reasonix` | DeepSeek 原生 | yolo（deny 规则和 OS 沙箱仍生效） | 执行 / 评审 | ✅ ACP vendor 扩展 |
 | `codebuddy` | 腾讯 | yolo | 快速执行 / 仓库探索 | ✅ ACP step 边界注入 |
-| `qoder` | 阿里 | yolo | 执行 / 独立评审 | ✅ `--input-format stream-json`（`priority: next`） |
+| `qoder` | 阿里 | yolo | 执行 / 独立评审 | follow-up ✅；steer ✅，需 CLI 声明的版本满足 1.1.49 基线 |
 | `kimi` | Moonshot | 仅 yolo（headless 拒收权限旗标） | 执行 | ❌ |
 | `claude` | Anthropic | readonly | 分析 / 规划 | ❌ |
 
@@ -47,7 +47,7 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
 
 - **无硬超时**：任务跑到结束为止。静默超过 watchdog（默认 15 分钟）会通知宿主模型，由它决定是否停止。需要立刻拿结果时用 `external_agent_wait`。
 
-- **持久会话意味着可以 follow-up**：有会话通道的 agent 以 turn 结束为完成信号而非进程退出，进程保活 30 分钟，这是 `external_agent_follow_up` 能在保留完整上下文的前提下继续提问的原因。运行中 steer 是另一项独立能力，五个会话型 agent（`codex`、`pi`、`reasonix`、`codebuddy`、`qoder`）都支持。
+- **持久会话意味着可以 follow-up**：有会话通道的 agent 以 turn 结束为完成信号而非进程退出，进程保活 30 分钟，这是 `external_agent_follow_up` 能在保留完整上下文的前提下继续提问的原因。运行中 steer 是另一项独立能力，`codex`、`pi`、`reasonix`、`codebuddy` 支持；Qoder 还须满足 CLI 版本兼容性检查。
 
 - **回执透明**：每次派发返回完整回执，记录实际 argv、生效权限策略、model/effort 是否真实转发——无法转发的会如实标注，不会静默丢弃。
 
@@ -59,7 +59,7 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
 
 - **qoder 的 write / yolo**：`write` 映射到 `--permission-mode accept_edits`（目录内编辑自动放行；其余需要确认的操作一律拒绝，绝不自动 allow），`yolo` 映射到 `bypass_permissions`。两者都继承 Qoder 自身配置的权限规则与 hook，**不是** OS 沙箱。非默认模式仅在受信任的启动目录生效，否则回落到 `default`（headless 下需要确认的操作同样被拒绝）。已在 qodercli 1.0.18 实测：`accept_edits` 成功创建 fixture 文件。
 
-- **qoder 的 steer 与传输方式**：qoder 走官方文档的流式输入通道 `qodercli -p --output-format stream-json --input-format stream-json`（与官方 SDK `buildArgs()` 构造的 argv 完全一致），不再使用 `--acp`。ACP 文档只描述编辑器集成，没有暴露任何 steer 元数据，因此在 ACP 下再发一次 `session/prompt` 只能证明"排队"，不能证明"可引导当前轮"。
+- **qoder 的 steer 与传输方式**：qoder 走官方文档的流式输入通道 `qodercli -p --output-format stream-json --input-format stream-json`（与官方 SDK 使用相同的流式输入输出旗标），不再使用 `--acp`。ACP 文档只描述编辑器集成，没有暴露任何 steer 元数据，因此在 ACP 下再发一次 `session/prompt` 只能证明"排队"，不能证明"可引导当前轮"。
 
   报文格式（均与 `@qoder-ai/qoder-agent-sdk` 1.0.39 及 CLI 文档交叉核对）：
 
@@ -67,16 +67,16 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
   - 启动时进程一起来就发送 SDK 的 `initialize` control request，然后等待它的 `control_response` **或** CLI 的 `system`/`init` 记录（二者任一先到即可），之后才发送第一条用户消息。两个信号都不能单独作为唯一条件：已登录的 qodercli 1.0.18 会回答 `initialize`，但不会在此时主动发 `system`/`init`；未登录的则相反，只发 `system`/`init`、不回答。若失败帧（合成 API 错误、失败 result、无法回答的 control request）与握手一起到达，`start()` 直接抛错，不会在一个已失败的会话上开一轮。
   - `result` 恰好结束一轮；没有 `subtype` 的 result 属不完整记录，会被忽略，而不会以空答案 settle。
   - steer 是单条用户消息，带 `priority: "next"`（文档的"下一个合适时机"，即 step 边界）与 `shouldQuery: false`（消息进入当前轮上下文，但不会自己起一轮）：既不中断，也永远不会被提升为独立的一轮。因此 steer 回执只声明**已发送 / 已排队**，不声明"一定已生效"；错过本轮最后一个 step 的引导会作为下一次用户消息前的上下文保留。steer 绝不使用 `priority: "now"`（中断）。
-  - 被标记 `aborted` 的 assistant 帧（流被截断）会把该轮 settle 为 cancelled，而不是干净的 done；合成的 API 错误 assistant 帧（`message.model === "<synthetic>"`）会以去掉 `[API Error: …]` 外壳后的文本把该轮判为失败。
-  - 取消使用 SDK 的 `interrupt` control request。当响应里 `still_queued` 非空时会给出 warning，并把该排队命令自己的后续 `result` 作为"新的一轮"上报，而不是丢弃——取消之后的继续工作不会被隐藏。
+  - 主 assistant 的流被截断且未恢复时，该轮判为 cancelled，而不是干净的 done；主 assistant 的合成 API 错误会以其错误信息将该轮判为失败。子 agent 的 assistant 错误不会单独导致主轮失败或取消。
+  - 取消使用 SDK 的 `interrupt` control request。匹配的响应若报告 `still_queued`，则给出 warning；随后由宿主的 stop 流程终止进程。残留 result 不会被当作新的任务轮次。
   - 任何入站 `can_use_tool` control request 都会被回答（readonly/write 为 fail-closed 的 `deny`，yolo 为 `allow`），并原样回填它自己的 `request_id`；若请求没有可用的 id，则将该轮判为失败，而不是让 CLI 干等一个永远不会来的回复。
   - CLI 若发送 `command_lifecycle`，其 `discarded`/`cancelled` 状态会触发 warning，而不是让先前的"已接受"回执继续成立。
 
   **steer 是有条件的。** 只有当 CLI 声明了**不低于 1.1.49 的稳定版本**时才会发送 steer——1.1.49 是我们文档化 SDK 配对（`@qoder-ai/qoder-agent-sdk` 1.0.39）所对应的版本。这是我们**文档契约的基线**，不是对厂商最早支持版本的断言。CLI 声明的 `qodercli_version`（来自 `system`/`init` 记录，或 `initialize` 响应中的同名字段）必须存在、必须是稳定版本号、且达到该基线；缺失、格式异常、预发布或更旧的版本会让 `external_agent_steer` 直接拒绝并回显所报版本与升级提示，完全不写出 steer 帧，同时 start/status/follow-up/stop 均不受影响。
 
-  设置该门槛的原因：本地公开二进制的入站用户消息 schema 声明了 `priority: ["now","next","later"]`，但没有 `shouldQuery`，且二进制中没有任何地方从入站帧读取 `shouldQuery`——因此在旧版 CLI 上 steer 只是一条普通的排队消息，其投递契约无法确认。逐命令的 `command_lifecycle` 回执在 1.0.18 上同样缺失（从 1.1.x 代际才有），因此不会阻塞等待它。
+  设置该门槛的原因：本地公开二进制的入站用户消息 schema 声明了 `priority: ["now","next","later"]`，但没有 `shouldQuery`，且二进制中没有任何地方从入站帧读取 `shouldQuery`——因此在旧版 CLI 上 steer 只是一条普通的排队消息，其投递契约无法确认。SDK 1.0.39 的协议类型包含逐命令 `command_lifecycle` 记录，但本地 1.0.18 二进制中没有；该记录按可选事件处理，不会阻塞等待。
 
-  **实机验证状态：**本机唯一一次获批的实机探测在任何工具调用之前就被账号权益（entitlement）拒绝而终止，更早的一次无模型运行也遇到了同样的权益门槛。因此 Qoder steer **在任何版本上都还没有经过实机模型验证**（包括 1.0.18），目前的依据是文档契约、公开 SDK/二进制证据与离线协议测试。
+  **实机验证状态：**本机只读 steering 探测在任何工具调用之前就被账号权益（entitlement）拒绝而终止；独立的无模型探测只验证了启动流程。因此 Qoder steer **在任何版本上都还没有经过实机模型验证**（包括 1.0.18），目前的依据是文档契约、公开 SDK/二进制证据与离线协议测试。
 
 各 CLI 的兼容性结论写在 `adapters.ts` 注释以及每次派发回执的 `effective policy` 一行里。
 

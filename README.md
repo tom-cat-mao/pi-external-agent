@@ -16,7 +16,7 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
 
 Requires pi ≥ 0.85 and whichever agent CLIs you want to drive (they don't all need to be installed).
 
-For the Qoder agent, install the Qoder CLI (`qodercli`) and make sure it is on `PATH` and signed in (`qodercli login`). This integration is tested against qodercli 1.0.18; official references: [Input Modes](https://docs.qoder.com/cli/sdk/input-modes) (the streaming `priority` / `shouldQuery` contract), [Run in Scripts](https://docs.qoder.com/cli/run-in-scripts) (`--input-format stream-json`), [Permissions](https://docs.qoder.com/cli/permissions), the [CLI reference](https://docs.qoder.com/cli/cli-reference) and the [Settings reference](https://docs.qoder.com/cli/settings-reference). The wire shapes were cross-checked against the published [`@qoder-ai/qoder-agent-sdk`](https://www.npmjs.com/package/@qoder-ai/qoder-agent-sdk) 1.0.39.
+For the Qoder agent, install the Qoder CLI (`qodercli`) and make sure it is on `PATH` and signed in (`qodercli login`). Startup, permission and follow-up paths were exercised with qodercli 1.0.18; steering requires this adapter's stable-release baseline of 1.1.49 or newer (see compatibility notes below). Official references: [Input Modes](https://docs.qoder.com/cli/sdk/input-modes) (the streaming `priority` / `shouldQuery` contract), [Run in Scripts](https://docs.qoder.com/cli/run-in-scripts) (`--input-format stream-json`), [Permissions](https://docs.qoder.com/cli/permissions), the [CLI reference](https://docs.qoder.com/cli/cli-reference) and the [Settings reference](https://docs.qoder.com/cli/settings-reference). The wire shapes were cross-checked against the published [`@qoder-ai/qoder-agent-sdk`](https://www.npmjs.com/package/@qoder-ai/qoder-agent-sdk) 1.0.39.
 
 ## Tools
 
@@ -37,7 +37,7 @@ For the Qoder agent, install the Qoder CLI (`qodercli`) and make sure it is on `
 | `pi` | pi itself (child process) | yolo | Executor with fully configurable `--model` | ✅ via `--mode rpc` |
 | `reasonix` | DeepSeek-native | yolo (deny rules + OS sandbox still apply) | Executor / reviewer | ✅ via ACP vendor extension |
 | `codebuddy` | Tencent | yolo | Fast executor / repo exploration | ✅ via ACP step-boundary injection |
-| `qoder` | Alibaba | yolo | Executor / independent reviewer | ✅ via `--input-format stream-json` (`priority: next`) |
+| `qoder` | Alibaba | yolo | Executor / independent reviewer | follow-up ✅; steer ✅ when the announced CLI meets the 1.1.49 baseline |
 | `kimi` | Moonshot | yolo only (its headless mode rejects permission flags) | Executor | ❌ |
 | `claude` | Anthropic | readonly | Analysis / planning | ❌ |
 
@@ -47,7 +47,7 @@ For the Qoder agent, install the Qoder CLI (`qodercli`) and make sure it is on `
 
 - **No hard timeout**: tasks run to completion. A stall watchdog (default 15m quiet) notifies the host model, which decides whether to stop the task. `external_agent_wait` exists for when you need the answer inside the current turn.
 
-- **Persistent sessions mean follow-up**: for agents with a session transport, completion means the turn ended, not that the process exited. The process stays alive for 30 minutes, which is what lets `external_agent_follow_up` ask a second question with the full conversation intact. Mid-run steering is a separate capability that all five session agents (`codex`, `pi`, `reasonix`, `codebuddy`, `qoder`) support.
+- **Persistent sessions mean follow-up**: for agents with a session transport, completion means the turn ended, not that the process exited. The process stays alive for 30 minutes, which is what lets `external_agent_follow_up` ask a second question with the full conversation intact. Mid-run steering is a separate capability supported by `codex`, `pi`, `reasonix` and `codebuddy`; Qoder additionally requires a compatible announced CLI version.
 
 - **Honest receipts**: every dispatch returns a receipt recording the exact argv, effective permission policy, and whether model/effort overrides were actually forwarded — unsupported overrides are reported as not forwarded instead of silently dropped.
 
@@ -59,7 +59,7 @@ For the Qoder agent, install the Qoder CLI (`qodercli`) and make sure it is on `
 
 - **Qoder `write` / `yolo`**: `write` maps to `--permission-mode accept_edits` (in-directory edits auto-approved; every other operation that would prompt is refused, never auto-allowed) and `yolo` to `bypass_permissions`. Both inherit Qoder's configured permission rules and hooks and are **not** an OS sandbox. Non-default modes only take effect in a trusted startup directory; otherwise Qoder falls back to `default` (where headless asks are denied). Verified on qodercli 1.0.18: `accept_edits` created a fixture file.
 
-- **Qoder steering and its transport**: Qoder is driven over its documented streaming input channel — `qodercli -p --output-format stream-json --input-format stream-json`, the exact argv the official SDK builds in `buildArgs()` — instead of `--acp`. The ACP page documents only editor integration and exposes no steering metadata there, so a second `session/prompt` under ACP would prove queueing, not step-boundary steering.
+- **Qoder steering and its transport**: Qoder is driven over its documented streaming input channel — `qodercli -p --output-format stream-json --input-format stream-json`, the same streaming flags used by the official SDK — instead of `--acp`. The ACP page documents only editor integration and exposes no steering metadata there, so a second `session/prompt` under ACP would prove queueing, not step-boundary steering.
 
   Wire shape, all cross-checked against `@qoder-ai/qoder-agent-sdk` 1.0.39 and the CLI docs:
 
@@ -67,16 +67,16 @@ For the Qoder agent, install the Qoder CLI (`qodercli`) and make sure it is on `
   - Boot sends the SDK's `initialize` control request as soon as the process is up, then waits for **either** its `control_response` **or** the CLI's `system`/`init` record before sending the first user message. Neither signal can be required on its own: an authenticated qodercli 1.0.18 answers `initialize` and does not announce `system`/`init` until later, while an unauthenticated one announces `system`/`init` and never answers. A failure frame (synthetic API error, failed result, unanswerable control request) that arrives with the handshake makes `start()` throw instead of opening a turn on a dead session.
   - `result` ends exactly one turn; a result record without a `subtype` is incomplete and is ignored rather than settling the turn with an empty answer.
   - A steer is one user message with `priority: "next"` (the documented "next suitable opportunity", i.e. a step boundary) and `shouldQuery: false` (the message joins the active turn without starting a turn of its own), so it never interrupts and is never promoted into an independent turn of its own. Because of that the steer receipt says the guidance was **sent/queued**, not definitely applied: guidance that arrives after the turn's last step stays as context for the next user message. `priority: "now"` (an interrupt) is deliberately never used for steering.
-  - An assistant frame marked `aborted` (the stream was truncated) settles the turn as cancelled, not as a clean done, and a synthetic API-error assistant frame (`message.model === "<synthetic>"`) fails the turn with the unwrapped `[API Error: …]` text.
-  - Cancelling uses the SDK's `interrupt` control request. When the response reports a non-empty `still_queued`, a warning is surfaced and the queued command's own later `result` is reported as a later turn instead of being discarded — continued work after a cancel never goes invisible.
+  - An unrecovered, truncated main-assistant stream settles as cancelled rather than clean done; a synthetic main-assistant API error fails the turn with its message. Child-assistant errors do not independently fail or cancel the main turn.
+  - Cancelling uses the SDK's `interrupt` control request. A matched response reporting `still_queued` produces a warning; the hub's stop path then terminates the process. Leftover results do not invent new task turns.
   - Any inbound `can_use_tool` control request is answered (fail-closed `deny` for readonly/write, `allow` for yolo) with its own `request_id` echoed back, and a request that arrives without a usable id fails the turn instead of leaving the CLI blocked on a reply nobody sends.
   - `command_lifecycle` records are honoured when the CLI sends them: a `discarded`/`cancelled` state for a steer raises a warning rather than leaving the earlier "accepted" claim standing.
 
   **Steering is conditional.** A steer is only sent when the CLI announces a stable release at or above **1.1.49** — the version our documented SDK pairing (`@qoder-ai/qoder-agent-sdk` 1.0.39) targets. That is *our documented-contract baseline*, not a claim about the vendor's earliest supporting version. The announced `qodercli_version` (from the `system`/`init` record, or the same field in the `initialize` response when present) must be present, be a stable release number, and meet the baseline; a missing, malformed, prerelease or older version makes `external_agent_steer` refuse with the reported version and an upgrade note, writes no steer frame at all, and leaves start/status/follow-up/stop fully usable.
 
-  Why the gate exists: the local public binary's inbound user-message schema declares `priority: ["now","next","later"]` but not `shouldQuery`, and nothing in it reads `shouldQuery` off an inbound frame — so on an older CLI a steer would be an ordinary queued message whose delivery contract we cannot confirm. The per-command `command_lifecycle` ack is absent on 1.0.18 for the same reason (it exists from the 1.1.x generation), so nothing waits on it.
+  Why the gate exists: the local public binary's inbound user-message schema declares `priority: ["now","next","later"]` but not `shouldQuery`, and nothing in it reads `shouldQuery` off an inbound frame — so on an older CLI a steer would be an ordinary queued message whose delivery contract we cannot confirm. Per-command `command_lifecycle` records appear in SDK 1.0.39's protocol types but are absent from the local 1.0.18 binary; handling them is optional and never blocks steering.
 
-  **Live verification status:** the one approved live probe on this machine was stopped by an account entitlement rejection before any tool call, and an earlier no-model run showed the entitlement gate too. Qoder steering has therefore **not** been verified against a live model on any version — including 1.0.18 — and rests on the documented contract, the public SDK/binary evidence and offline protocol tests.
+  **Live verification status:** the read-only steering probe on this machine was stopped by an account entitlement rejection before any tool call. Separate no-model probes exercised startup only. Qoder steering has therefore **not** been verified against a live model on any version — including 1.0.18 — and rests on the documented contract, the public SDK/binary evidence and offline protocol tests.
 
 Per-CLI compatibility notes live as comments in `adapters.ts` and in the `effective policy` line of each dispatch receipt.
 

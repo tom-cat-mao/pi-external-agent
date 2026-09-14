@@ -1308,8 +1308,8 @@ export default function (pi: ExtensionAPI) {
 			"Each call is a fresh session for the other agent: it sees no pi conversation history, so the task text",
 			"must be self-contained (state the goal, name the files, say what to return).",
 			`pi, codex, reasonix, codebuddy and qoder run as persistent sessions: their conversation survives the answer, so`,
-			"you can continue the same session afterwards (external_agent_follow_up), and all five can additionally be steered",
-			"mid-run (external_agent_steer). The others are one-shot with no way back in.",
+			"you can continue the same session afterwards (external_agent_follow_up). Mid-run steering is also supported,",
+			"but Qoder requires an announced stable CLI meeting this adapter's 1.1.49 SDK-pairing baseline. The others are one-shot with no way back in.",
 		].join(" "),
 		promptSnippet: "Delegate a task to an external coding agent CLI (codex, qoder, kimi, codebuddy, claude, reasonix)",
 		promptGuidelines: [
