@@ -307,9 +307,12 @@ function copyDispatchReceipt(receipt: DispatchReceipt): DispatchReceipt {
 function dispatchSummary(receipt: DispatchReceipt, taskId?: string): string[] {
 	const persistent = receipt.transport === "persistent";
 	const canSteer = ADAPTERS[receipt.agent]?.session?.steer === true;
+	const steeringSupport = receipt.agent === "qoder"
+		? "follow-up; steering subject to CLI compatibility"
+		: canSteer ? "steer + follow-up" : "follow-up only";
 	const lines = [
 		`provider: ${escapeTerminalControls(receipt.provider)}`,
-		`transport: ${persistent ? (canSteer ? "persistent session (steer + follow-up)" : "persistent session (follow-up only)") : "one-shot process"}`,
+		`transport: ${persistent ? `persistent session (${steeringSupport})` : "one-shot process"}`,
 		`requested mode: ${receipt.requestedMode}`,
 		`effective policy: ${receipt.effectivePolicy === null ? "none" : escapeTerminalControls(receipt.effectivePolicy)}`,
 		`readonly: ${enforcementDisplay(receipt)}`,
@@ -948,11 +951,13 @@ function detailReport(task: Task, tailCount: number): string {
 	if (task.spawnError) lines.push(`spawn error: ${task.spawnError}`);
 	if (task.transport === "persistent") {
 		const canSteer = ADAPTERS[task.agent].session?.steer === true;
+		const blocked = task.driver?.steerUnavailableReason;
+		const steering = blocked
+			? `steering unavailable: ${blocked}`
+			: canSteer ? "external_agent_steer while running" : "no mid-run steer";
 		lines.push(
 			task.sessionAlive
-				? canSteer
-					? "session: alive (external_agent_steer while running, external_agent_follow_up once settled)"
-					: "session: alive (external_agent_follow_up once settled; no mid-run steer)"
+				? `session: alive (external_agent_follow_up once settled; ${steering})`
 				: "session: reclaimed — follow-ups are refused, dispatch a new task",
 		);
 	}
@@ -1488,11 +1493,12 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const persistent = task.transport === "persistent";
-			const canSteer = adapter.session?.steer === true;
+			const steerBlocked = task.driver?.steerUnavailableReason;
+			const canSteer = adapter.session?.steer === true && !steerBlocked;
 			const sessionNote = persistent
 				? canSteer
 					? `This session stays alive after it settles: steer it with external_agent_steer taskId="${task.id}" while it runs, or continue it with external_agent_follow_up taskId="${task.id}" (reclaimed after ${Math.round(IDLE_REAP_MS / 60_000)}m idle).`
-					: `This session stays alive after it settles: continue it with external_agent_follow_up taskId="${task.id}" (reclaimed after ${Math.round(IDLE_REAP_MS / 60_000)}m idle). It does not support mid-run steering.`
+					: `This session stays alive after it settles: continue it with external_agent_follow_up taskId="${task.id}" (reclaimed after ${Math.round(IDLE_REAP_MS / 60_000)}m idle). ${steerBlocked ? `Steering is not currently available: ${steerBlocked}.` : "It does not support mid-run steering."}`
 				: null;
 			return {
 				content: [
@@ -1861,14 +1867,15 @@ export default function (pi: ExtensionAPI) {
 				return { content: [{ type: "text", text: "A non-empty message is required." }], details: { continued: false } };
 			}
 			if (task.state === "running") {
-				const canSteer = ADAPTERS[task.agent].session?.steer === true;
+				const steerBlocked = task.driver?.steerUnavailableReason;
+				const canSteer = ADAPTERS[task.agent].session?.steer === true && !steerBlocked;
 				return {
 					content: [
 						{
 							type: "text",
 							text: canSteer
 								? `${task.id} is still running. Use external_agent_steer taskId="${task.id}" for mid-run guidance, or wait for it to settle.`
-								: `${task.id} is still running and ${task.agent} does not support mid-run steering. Wait for it to settle, then follow up.`,
+								: `${task.id} is still running. ${steerBlocked ? `Steering is unavailable: ${steerBlocked}.` : `${task.agent} does not support mid-run steering.`} Wait for it to settle, then follow up.`,
 						},
 					],
 					details: { continued: false, taskId: task.id, state: task.state },

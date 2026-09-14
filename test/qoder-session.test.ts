@@ -411,6 +411,8 @@ test("qoder stream-json: steering is refused when the announced version is missi
 		["missing", null],
 		["malformed", "1.1"],
 		["prerelease", "1.2.0-beta.1"],
+		["overflow", "999999999999999999999999999999999.1.49"],
+		["leading zero", "1.1.049"],
 	];
 	for (const [label, initVersion] of cases) {
 		const harness = await spawnQoder({ mode: "yolo", scenario: { initVersion, turns: [{ quiet: true }] } });

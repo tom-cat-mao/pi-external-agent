@@ -49,7 +49,7 @@ const logFile = process.env.QODER_MOCK_LOG_FILE;
 function record(entry) { if (logFile) fs.appendFileSync(logFile, JSON.stringify(entry) + "\\n"); }
 function send(value) { process.stdout.write(JSON.stringify(value) + "\\n"); }
 send({ type: "system", subtype: "init", protocol_version: "1.4.0", capabilities: [], commands: [],
-  session_id: "sess-" + Date.now(), model: "auto", permissionMode: "bypass_permissions", qodercli_version: "1.1.49" });
+  session_id: "sess-" + Date.now(), model: "auto", permissionMode: "bypass_permissions", qodercli_version: scenario.version === undefined ? "1.1.49" : scenario.version });
 let buffer = "";
 let index = 0;
 const heldForSteer = new Map();
@@ -263,10 +263,15 @@ test("hub: qoder steer reaches the running session at the next step boundary", a
 test("hub: running qoder follow-up points at the supported steer", async () => {
 	const dir = makeFixtureDir({ qodercli: QODER_HUB_MOCK });
 	const restorePath = usePath(dir);
-	const restoreScenario = withEnv({ QODER_MOCK_SCENARIO: JSON.stringify({ turns: [{ hold: true }] }) });
+	const logFile = path.join(dir, "log.jsonl");
+	const restoreScenario = withEnv({
+		QODER_MOCK_SCENARIO: JSON.stringify({ turns: [{ hold: true }] }),
+		QODER_MOCK_LOG_FILE: logFile,
+	});
 	try {
 		const started = await startQoder(dir);
 		const taskId = started.details.task.taskId;
+		await waitForLog(logFile, (lines) => lines.some((entry) => entry.kind === "turn-input"), "the first turn");
 		const followed = await call("external_agent_follow_up", { taskId, message: "second question" });
 		assert.equal(followed.details.continued, false);
 		const text = followed.content[0].text;
@@ -276,6 +281,38 @@ test("hub: running qoder follow-up points at the supported steer", async () => {
 		await call("external_agent_stop", { all: true });
 		restoreScenario();
 		restorePath();
+	}
+});
+
+test("hub: old or unknown Qoder versions report steering unavailable without sending guidance", async () => {
+	for (const version of ["1.0.18", null]) {
+		const dir = makeFixtureDir({ qodercli: QODER_HUB_MOCK });
+		const restorePath = usePath(dir);
+		const logFile = path.join(dir, "log.jsonl");
+		const restoreScenario = withEnv({
+			QODER_MOCK_SCENARIO: JSON.stringify({ version, turns: [{ hold: true }] }),
+			QODER_MOCK_LOG_FILE: logFile,
+		});
+		try {
+			const started = await startQoder(dir);
+			assert.match(started.content[0].text, /Steering is not currently available/);
+			const taskId = started.details.task.taskId;
+			await waitForLog(logFile, (lines) => lines.some((entry) => entry.kind === "turn-input"), "the first turn");
+			const status = await call("external_agent_status", { taskId });
+			assert.match(status.content[0].text, /steering unavailable:/);
+			assert.match(status.content[0].text, /1\.1\.49/);
+			const steered = await call("external_agent_steer", { taskId, message: "must not reach CLI" });
+			assert.equal(steered.details.steered, false);
+			const followed = await call("external_agent_follow_up", { taskId, message: "not yet" });
+			assert.equal(followed.details.continued, false);
+			assert.doesNotMatch(followed.content[0].text, /external_agent_steer/);
+			assert.equal(mockLog(logFile).filter((entry) => entry.kind === "steer").length, 0);
+			assert.equal(mockLog(logFile).filter((entry) => entry.kind === "turn-input").length, 1);
+		} finally {
+			await call("external_agent_stop", { all: true });
+			restoreScenario();
+			restorePath();
+		}
 	}
 });
 

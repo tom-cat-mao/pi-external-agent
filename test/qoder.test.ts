@@ -141,3 +141,33 @@ test("qoder steer message: priority next with shouldQuery false, never now; foll
 	assert.equal(sent[1].shouldQuery, undefined);
 	assert.equal(sent[1].message.content[0].text, "plain follow-up");
 });
+
+test("qoder child assistant errors and truncation do not settle the main turn", () => {
+	const driver = SESSION_DRIVERS.qoder!() as any;
+	const turns: Array<{ status: string }> = [];
+	driver.onTurnEnd((turn: { status: string }) => turns.push(turn));
+	driver.active = true;
+	driver.turnStarted = true;
+	driver.handleLine(JSON.stringify({
+		type: "assistant", parent_tool_use_id: "child-tool", aborted: true, isApiErrorMessage: true,
+		message: { model: "<synthetic>", content: [{ type: "text", text: "child failed" }] },
+	}));
+	assert.equal(turns.length, 0);
+	driver.handleLine(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "main completed" }));
+	assert.deepEqual(turns, [{ status: "done" }]);
+});
+
+test("qoder a later complete main assistant message clears earlier truncation", () => {
+	const driver = SESSION_DRIVERS.qoder!() as any;
+	const turns: Array<{ status: string }> = [];
+	driver.onTurnEnd((turn: { status: string }) => turns.push(turn));
+	driver.active = true;
+	driver.turnStarted = true;
+	driver.handleLine(JSON.stringify({ type: "assistant", parent_tool_use_id: null, aborted: true }));
+	driver.handleLine(JSON.stringify({
+		type: "assistant", parent_tool_use_id: null,
+		message: { content: [{ type: "text", text: "recovered" }] },
+	}));
+	driver.handleLine(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "recovered" }));
+	assert.deepEqual(turns, [{ status: "done" }]);
+});

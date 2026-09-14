@@ -74,6 +74,7 @@ export interface SessionDriver {
 	/** Whether the driver forwards cwd through the protocol rather than only inheriting it. */
 	readonly cwdForwardedToCli: boolean;
 	readonly stdinFormat?: "jsonrpc" | "stream-json";
+	readonly steerUnavailableReason?: string;
 	/** Truncated stderr, same cap as the one-shot path. */
 	readonly stderr: string;
 	/** True while the session process is up and able to take a follow-up. */
@@ -1038,9 +1039,10 @@ const QODER_STEER_REFUSAL =
 
 function qoderStableVersion(value: unknown): number[] | undefined {
 	if (typeof value !== "string") return undefined;
-	const match = value.trim().match(/^v?(\d+)\.(\d+)\.(\d+)$/);
+	const match = value.trim().match(/^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
 	if (!match) return undefined;
-	return [Number(match[1]), Number(match[2]), Number(match[3])];
+	const parts = [Number(match[1]), Number(match[2]), Number(match[3])];
+	return parts.every(Number.isSafeInteger) ? parts : undefined;
 }
 
 function qoderVersionAtLeast(parts: number[], baseline: number[]): boolean {
@@ -1092,6 +1094,10 @@ class QoderStreamJsonDriver extends StdioProcess implements SessionDriver {
 	private initResolve: (() => void) | undefined;
 	private initReject: ((err: Error) => void) | undefined;
 	private controlSeq = 0;
+
+	get steerUnavailableReason(): string | undefined {
+		return this.steerBlock();
+	}
 
 	onEvent(cb: (event: AgentEvent) => void): void {
 		this.eventCbs.push(cb);
@@ -1240,8 +1246,9 @@ class QoderStreamJsonDriver extends StdioProcess implements SessionDriver {
 			this.initResolve?.();
 			return;
 		}
-		if (obj.type === "assistant") {
+		if (obj.type === "assistant" && obj.parent_tool_use_id == null) {
 			if (obj.aborted === true) this.truncated = true;
+			else if (Array.isArray(obj.message?.content)) this.truncated = false;
 			if (obj.isApiErrorMessage === true || obj.message?.model === QODER_SYNTHETIC_MODEL) {
 				const detail = qoderApiErrorText(obj) ?? "qoder reported a model request failure";
 				if (!this.turnStarted) {
