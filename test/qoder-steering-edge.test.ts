@@ -245,7 +245,7 @@ test("qoder edge: a context-only late steer joins the active turn without starti
 	}
 });
 
-test("qoder edge: a result for a still-queued command after cancel is surfaced as its own turn", async () => {
+test("qoder edge: an interrupt that reports still-queued commands warns and ignores the leftover result", async () => {
 	const harness = await spawnEdge({
 		mode: "yolo",
 		scenario: {
@@ -266,14 +266,11 @@ test("qoder edge: a result for a still-queued command after cancel is surfaced a
 		await delay(150);
 		assert.deepEqual(
 			harness.turns,
-			[{ status: "cancelled" }, { status: "done" }],
-			"the interrupt response still_queued survivor and its later result are surfaced, so continued agent work after cancel is visible",
-		);
-		assert.deepEqual(
-			harness.events.filter((event) => event.kind === "message").map((event) => event.text),
-			["interrupted turn", "queued command result"],
+			[{ status: "cancelled" }],
+			"a cancelled turn is not re-settled by the leftover result of a still-queued command; the stop path reaps the session",
 		);
 		assert.equal(harness.events.some((event) => event.kind === "warning" && /still-queued/.test(event.text)), true);
+		assert.equal(harness.events.some((event) => event.text === "queued command result"), false);
 	} finally {
 		harness.driver.kill();
 	}

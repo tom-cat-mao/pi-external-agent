@@ -75,7 +75,7 @@ interface DispatchReceipt {
 	prompt: string;
 	cwd: string;
 	cwdForwardedToCli: boolean;
-	/** oneshot ignores stdin; persistent holds a live JSON-RPC channel on it. */
+	/** oneshot ignores stdin; persistent holds a live protocol channel on it. */
 	stdin: "ignored" | "jsonrpc" | "stream-json";
 	shell: false;
 	agent: AgentId;

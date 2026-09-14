@@ -8,11 +8,12 @@
  * signal moves from "process exited" to "turn ended" while the process stays up
  * for follow-ups.
  *
- * Three wire protocols, one interface:
+ * Four wire protocols, one interface:
  *
- *   PiRpcDriver          pi --mode rpc        — line JSON commands + events
- *   CodexAppServerDriver codex app-server     — JSON-RPC 2.0, experimental
- *   AcpDriver            reasonix / codebuddy — JSON-RPC 2.0 ACP over stdio
+ *   PiRpcDriver           pi --mode rpc        — line JSON commands + events
+ *   CodexAppServerDriver  codex app-server     — JSON-RPC 2.0, experimental
+ *   AcpDriver             reasonix / codebuddy — JSON-RPC 2.0 ACP over stdio
+ *   QoderStreamJsonDriver qoder                — LF stream-json over stdio
  *
  * Facts verified by hand on 2026-09-08 against the installed binaries
  * (pi 0.85.1, codex 0.153.4, reasonix v1.38.1, codebuddy 2.147.0), including
@@ -39,7 +40,7 @@
  *               session; it lands at the next model step boundary, or becomes a
  *               follow-up if the turn is stuck inside one long tool call.
  *
- * Steering is never an immediate interrupt. All four deliver at a step boundary
+ * Steering is never an immediate interrupt. All five deliver at a step boundary
  * (between tool calls), so a steer cannot cancel a bash command that is already
  * running — only change what the agent does next.
  */
@@ -159,6 +160,9 @@ abstract class StdioProcess {
 		proc.stderr?.on("data", (chunk: string) => {
 			if (this.stderrText.length < MAX_STDERR_CHARS) this.stderrText += chunk;
 		});
+
+		const ignoreClosedStdin = () => undefined;
+		proc.stdin?.on("error", ignoreClosedStdin);
 
 		proc.on("error", (err) => {
 			this.spawnErrorMessage = err.message;
@@ -1026,6 +1030,7 @@ const QODER_SYNTHETIC_MODEL = "<synthetic>";
 interface QoderControlWaiter {
 	resolve: (response: any) => void;
 	timer: ReturnType<typeof setTimeout>;
+	kind?: "interrupt";
 }
 
 function qoderApiErrorText(record: any): string | undefined {
@@ -1057,7 +1062,6 @@ class QoderStreamJsonDriver extends StdioProcess implements SessionDriver {
 	private turnStarted = false;
 	private bootFailure: string | undefined;
 	private truncated = false;
-	private queuedSurvivors = 0;
 	private mode: Mode = "yolo";
 	private initResolve: (() => void) | undefined;
 	private initReject: ((err: Error) => void) | undefined;
@@ -1104,6 +1108,8 @@ class QoderStreamJsonDriver extends StdioProcess implements SessionDriver {
 			.catch(() => undefined);
 		await ready;
 		if (this.bootFailure) throw new Error(`qoder failed before the first turn: ${this.bootFailure}`);
+		if (!this.alive) throw new Error(this.spawnError ?? "the qoder session exited before the first turn");
+		if (this.cancelRequested) return;
 		this.turnStarted = true;
 		this.markActive();
 		this.sendUserMessage(input.task);
@@ -1137,7 +1143,6 @@ class QoderStreamJsonDriver extends StdioProcess implements SessionDriver {
 		if (!this.alive) throw new Error("the qoder session process is gone");
 		if (this.active) throw new Error("a turn is still running; use external_agent_steer instead");
 		this.cancelRequested = false;
-		this.queuedSurvivors = 0;
 		this.markActive();
 		this.sendUserMessage(message);
 	}
@@ -1157,7 +1162,7 @@ class QoderStreamJsonDriver extends StdioProcess implements SessionDriver {
 	async cancel(): Promise<void> {
 		if (!this.alive) return;
 		this.cancelRequested = true;
-		await this.controlRequest({ type: "interrupt", subtype: "interrupt" }, QODER_CANCEL_TIMEOUT_MS).catch(() => undefined);
+		await this.controlRequest({ type: "interrupt", subtype: "interrupt" }, QODER_CANCEL_TIMEOUT_MS, "interrupt").catch(() => undefined);
 	}
 
 	protected override onProcessExit(): void {
@@ -1228,21 +1233,18 @@ class QoderStreamJsonDriver extends StdioProcess implements SessionDriver {
 		if (event) this.emit(event);
 	}
 
+	private isTerminalResult(obj: any): boolean {
+		if (obj.subtype === "success") return typeof obj.result === "string";
+		return obj.subtype === "error_during_execution" || obj.subtype === "error_max_turns" || obj.subtype === "error_max_budget_usd";
+	}
+
 	private handleResult(line: string, obj: any): void {
-		if (typeof obj.subtype !== "string") return;
+		if (!this.isTerminalResult(obj)) return;
 		const event = ADAPTERS.qoder.parseEvent(line);
 		const failed = event?.kind === "error";
 		if (!this.active) {
-			if (!this.turnStarted) {
-				if (failed) this.failBoot(event?.text ?? "qoder reported a failed result before the first turn");
-				return;
-			}
-			if (this.queuedSurvivors > 0) {
-				this.queuedSurvivors -= 1;
-				this.markActive();
-			} else {
-				return;
-			}
+			if (!this.turnStarted && failed) this.failBoot(event?.text ?? "qoder reported a failed result before the first turn");
+			return;
 		}
 		const cancelled = this.cancelRequested;
 		if (event?.text && !(cancelled && failed)) this.emit(event);
@@ -1297,7 +1299,7 @@ class QoderStreamJsonDriver extends StdioProcess implements SessionDriver {
 		return uuid;
 	}
 
-	private controlRequest(request: Record<string, unknown>, timeoutMs: number): Promise<any> {
+	private controlRequest(request: Record<string, unknown>, timeoutMs: number, kind?: "interrupt"): Promise<any> {
 		const requestId = `q${++this.controlSeq}`;
 		return new Promise((resolve, reject) => {
 			if (!this.alive && this.spawnError) {
@@ -1309,7 +1311,7 @@ class QoderStreamJsonDriver extends StdioProcess implements SessionDriver {
 				reject(new Error(`control request "${String(request.subtype ?? request.type)}" timed out after ${Math.round(timeoutMs / 1000)}s`));
 			}, timeoutMs);
 			timer.unref?.();
-			this.controlWaiters.set(requestId, { resolve, timer });
+			this.controlWaiters.set(requestId, { resolve, timer, kind });
 			this.writeLine({ type: "control_request", request_id: requestId, request });
 		});
 	}
@@ -1319,22 +1321,21 @@ class QoderStreamJsonDriver extends StdioProcess implements SessionDriver {
 		const rawId = response?.request_id;
 		const key = typeof rawId === "string" || typeof rawId === "number" ? String(rawId) : undefined;
 		const waiter = key === undefined ? undefined : this.controlWaiters.get(key);
-		this.noteStillQueued(response?.response);
 		if (!waiter || key === undefined) return;
 		this.controlWaiters.delete(key);
 		clearTimeout(waiter.timer);
+		if (waiter.kind === "interrupt") this.warnStillQueued(response?.response);
 		waiter.resolve(response);
 	}
 
-	private noteStillQueued(payload: any): void {
+	private warnStillQueued(payload: any): void {
 		const stillQueued = Array.isArray(payload?.still_queued)
 			? payload.still_queued.filter((id: unknown): id is string => typeof id === "string")
 			: [];
 		if (stillQueued.length === 0) return;
-		this.queuedSurvivors += stillQueued.length;
 		this.emit({
 			kind: "warning",
-			text: `the interrupt reported ${stillQueued.length} still-queued command(s); any work they resume is reported as a later turn`,
+			text: `the interrupt reported ${stillQueued.length} still-queued command(s); the session is being stopped`,
 		});
 	}
 
@@ -1349,9 +1350,13 @@ class QoderStreamJsonDriver extends StdioProcess implements SessionDriver {
 				this.failBoot(detail);
 				return;
 			}
-			if (!this.active) return;
+			if (!this.active) {
+				this.kill();
+				return;
+			}
 			this.emit({ kind: "error", text: detail });
 			this.settle({ status: "failed", error: detail });
+			this.kill();
 			return;
 		}
 		if (subtype === "can_use_tool") {

@@ -16,12 +16,14 @@ interface MockTurn {
 	completeOnSteer?: boolean;
 	hold?: boolean;
 	quiet?: boolean;
+	frames?: unknown[];
 	askPermission?: boolean;
 	toolName?: string;
 }
 
 interface MockScenario {
 	exitBeforeInit?: number;
+	initDelayMs?: number;
 	turns?: MockTurn[];
 	interrupt?: { stillQueued?: string[]; frames?: unknown[] };
 	steerFrames?: unknown[];
@@ -61,8 +63,10 @@ function finish(index, plan) {
   record({ kind: "result-sent", index: index });
 }
 if (scenario.exitBeforeInit !== undefined) process.exit(scenario.exitBeforeInit);
-send({ type: "system", subtype: "init", protocol_version: "1.4.0", capabilities: [],
-  commands: [], session_id: "sess-1", model: "auto", permissionMode: "bypass_permissions" });
+const initFrame = { type: "system", subtype: "init", protocol_version: "1.4.0", capabilities: [],
+  commands: [], session_id: "sess-1", model: "auto", permissionMode: "bypass_permissions" };
+if (scenario.initDelayMs) setTimeout(function () { send(initFrame); }, scenario.initDelayMs);
+else send(initFrame);
 let buffer = "";
 let turnIndex = 0;
 const heldForSteer = new Map();
@@ -73,6 +77,7 @@ function runTurn() {
   const plan = (scenario.turns || [])[index] || { answer: "OK" };
   record({ kind: "turn-started", index: index });
   if (plan.exitBeforeResult !== undefined) { process.exit(plan.exitBeforeResult); return; }
+  if (plan.frames) { for (const frame of plan.frames) send(frame); return; }
   if (plan.apiError !== undefined) {
     send({ type: "assistant", isApiErrorMessage: true,
       message: { model: "<synthetic>", content: [{ type: "text", text: "[API Error: " + plan.apiError + "]" }] },
@@ -171,6 +176,7 @@ interface Harness {
 	dir: string;
 	argv: () => string[][];
 	logs: () => any[];
+	startDeferred: () => Promise<void>;
 }
 
 async function spawnQoder(input: {
@@ -179,6 +185,7 @@ async function spawnQoder(input: {
 	effort?: Effort;
 	task?: string;
 	scenario?: MockScenario;
+	deferStart?: boolean;
 }): Promise<Harness> {
 	const dir = mkdtempSync(path.join(tmpdir(), "qoder-session-"));
 	const executable = path.join(dir, "qodercli");
@@ -202,18 +209,7 @@ async function spawnQoder(input: {
 	driver.onEvent((event) => events.push(event));
 	driver.onTurnEnd((outcome) => turns.push(outcome));
 	driver.onExit((code) => exits.push(code));
-	try {
-		await driver.start({
-			task: input.task ?? "do the thing",
-			cwd: dir,
-			mode: input.mode,
-			model: input.model,
-			effort: input.effort,
-		});
-	} catch (error) {
-		driver.kill();
-		throw error;
-	} finally {
+	const restoreEnv = () => {
 		if (previousPath === undefined) delete process.env.PATH;
 		else process.env.PATH = previousPath;
 		if (previousScenario === undefined) delete process.env.QODER_MOCK_SCENARIO;
@@ -222,8 +218,38 @@ async function spawnQoder(input: {
 		else process.env.QODER_MOCK_ARGV_FILE = previousArgv;
 		if (previousLog === undefined) delete process.env.QODER_MOCK_LOG_FILE;
 		else process.env.QODER_MOCK_LOG_FILE = previousLog;
+	};
+	const startDeferred = async () => {
+		try {
+			await driver.start({
+				task: input.task ?? "do the thing",
+				cwd: dir,
+				mode: input.mode,
+				model: input.model,
+				effort: input.effort,
+			});
+		} finally {
+			restoreEnv();
+		}
+	};
+	const harness: Harness = {
+		driver,
+		events,
+		turns,
+		exits,
+		dir,
+		argv: () => readJsonl(argvFile),
+		logs: () => readJsonl(logFile),
+		startDeferred,
+	};
+	if (input.deferStart) return harness;
+	try {
+		await startDeferred();
+	} catch (error) {
+		driver.kill();
+		throw error;
 	}
-	return { driver, events, turns, exits, dir, argv: () => readJsonl(argvFile), logs: () => readJsonl(logFile) };
+	return harness;
 }
 
 test("qoder stream-json: init handshake, one result per turn, answer not duplicated from assistant text", async () => {
@@ -329,6 +355,40 @@ test("qoder stream-json: steer uses priority next + shouldQuery false, joins the
 	}
 });
 
+test("qoder stream-json: a stop requested during startup prevents the first turn", async () => {
+	const harness = await spawnQoder({
+		mode: "yolo",
+		deferStart: true,
+		scenario: { initDelayMs: 80, turns: [{ answer: "SHOULD-NOT-RUN" }] },
+	});
+	try {
+		const started = harness.startDeferred();
+		void harness.driver.cancel();
+		await started;
+		await new Promise((resolve) => setTimeout(resolve, 150));
+		assert.equal(harness.logs().filter((entry) => entry.kind === "turn-input" || entry.kind === "turn-started").length, 0);
+		assert.deepEqual(harness.turns, []);
+	} finally {
+		harness.driver.kill();
+	}
+});
+
+test("qoder stream-json: a control request with no usable request_id fails the turn and stops the session", async () => {
+	const harness = await spawnQoder({
+		mode: "readonly",
+		scenario: { turns: [{ frames: [{ type: "control_request", request: { subtype: "can_use_tool", tool_name: "Bash" } }] }] },
+	});
+	try {
+		await waitFor(() => harness.turns.length === 1, "failed turn");
+		assert.equal(harness.turns[0].status, "failed");
+		assert.match(harness.turns[0].error ?? "", /usable request_id/);
+		await waitFor(() => !harness.driver.alive, "session to stop");
+		await assert.rejects(harness.driver.followUp("after the failure"));
+	} finally {
+		harness.driver.kill();
+	}
+});
+
 test("qoder stream-json: steer is refused once the turn has settled", async () => {
 	const harness = await spawnQoder({ mode: "yolo", scenario: { turns: [{ answer: "done" }] } });
 	try {
@@ -389,7 +449,7 @@ test("qoder stream-json: cancel sends the documented interrupt control request a
 	}
 });
 
-test("qoder stream-json: a queued command left behind by an interrupt is reported as its own later turn", async () => {
+test("qoder stream-json: an interrupt that reports still-queued commands warns and does not settle a second turn", async () => {
 	const harness = await spawnQoder({
 		mode: "yolo",
 		scenario: {
@@ -399,7 +459,7 @@ test("qoder stream-json: a queued command left behind by an interrupt is reporte
 				frames: [
 					rawResult("interrupted turn"),
 					{ type: "command_lifecycle", command_uuid: "cmd-q", state: "started", uuid: "cl-1", session_id: "sess-1" },
-					rawResult("queued command result"),
+					rawResult("result from a command that outlived the cancel"),
 				],
 			},
 		},
@@ -407,13 +467,12 @@ test("qoder stream-json: a queued command left behind by an interrupt is reporte
 	try {
 		await waitFor(() => harness.logs().some((entry) => entry.kind === "turn-started"), "turn to start");
 		await harness.driver.cancel();
-		await waitFor(() => harness.turns.length === 2, "survivor turn");
-		assert.deepEqual(harness.turns, [{ status: "cancelled" }, { status: "done" }]);
-		assert.deepEqual(
-			harness.events.filter((event) => event.kind === "message").map((event) => event.text),
-			["interrupted turn", "queued command result"],
-		);
+		await waitFor(() => harness.turns.length === 1, "cancelled turn");
+		assert.deepEqual(harness.turns, [{ status: "cancelled" }]);
 		assert.equal(harness.events.some((event) => event.kind === "warning" && /still-queued/.test(event.text)), true);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		assert.equal(harness.turns.length, 1);
+		assert.equal(harness.events.some((event) => /outlived the cancel/.test(event.text)), false);
 	} finally {
 		harness.driver.kill();
 	}
