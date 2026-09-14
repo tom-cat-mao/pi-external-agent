@@ -64,7 +64,7 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
   报文格式（均与 `@qoder-ai/qoder-agent-sdk` 1.0.39 及 CLI 文档交叉核对）：
 
   - 任务文本不作为 argv 参数，而是 stdin 上一行一个 JSON 对象（`{"type":"user","message":{"role":"user","content":[{"type":"text","text":…}]},"parent_tool_use_id":null,"uuid":…}`），uuid 用 `randomUUID`，因为协议以它作为命令标识。
-  - 启动时进程一起来就发送 SDK 的 `initialize` control request，然后等待 CLI 主动发出的 `system`/`init` 记录，之后才发送第一条用户消息。若失败帧与握手在同一批到达，`start()` 直接抛错，不会在一个已失败的会话上开一轮。
+  - 启动时进程一起来就发送 SDK 的 `initialize` control request，然后等待它的 `control_response` **或** CLI 的 `system`/`init` 记录（二者任一先到即可），之后才发送第一条用户消息。两个信号都不能单独作为唯一条件：已登录的 qodercli 1.0.18 会回答 `initialize`，但不会在此时主动发 `system`/`init`；未登录的则相反，只发 `system`/`init`、不回答。若失败帧（合成 API 错误、失败 result、无法回答的 control request）与握手一起到达，`start()` 直接抛错，不会在一个已失败的会话上开一轮。
   - `result` 恰好结束一轮；没有 `subtype` 的 result 属不完整记录，会被忽略，而不会以空答案 settle。
   - steer 是单条用户消息，带 `priority: "next"`（文档的"下一个合适时机"，即 step 边界）与 `shouldQuery: false`（消息进入当前轮上下文，但不会自己起一轮）：既不中断，也永远不会被提升为独立的一轮。因此 steer 回执只声明**已发送 / 已排队**，不声明"一定已生效"；错过本轮最后一个 step 的引导会作为下一次用户消息前的上下文保留。steer 绝不使用 `priority: "now"`（中断）。
   - 被标记 `aborted` 的 assistant 帧（流被截断）会把该轮 settle 为 cancelled，而不是干净的 done；合成的 API 错误 assistant 帧（`message.model === "<synthetic>"`）会以去掉 `[API Error: …]` 外壳后的文本把该轮判为失败。

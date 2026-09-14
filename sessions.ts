@@ -1094,6 +1094,13 @@ class QoderStreamJsonDriver extends StdioProcess implements SessionDriver {
 				},
 				QODER_INIT_TIMEOUT_MS,
 			)
+			.then((response: any) => {
+				if (response?.subtype === "error") {
+					if (this.initResolve) this.failBoot(`qoder rejected the initialize request: ${String(response.error ?? "unknown error")}`);
+					return;
+				}
+				this.initResolve?.();
+			})
 			.catch(() => undefined);
 		await ready;
 		if (this.bootFailure) throw new Error(`qoder failed before the first turn: ${this.bootFailure}`);
@@ -1159,8 +1166,16 @@ class QoderStreamJsonDriver extends StdioProcess implements SessionDriver {
 			waiter.resolve({ subtype: "error", error: this.spawnError ?? "session process exited" });
 			this.controlWaiters.delete(id);
 		}
-		this.initReject?.(new Error(this.spawnError ?? "the qoder session exited before the system/init handshake"));
-		this.settle({ status: "failed", error: this.spawnError ?? "the qoder session exited before the turn ended" });
+		const stderrDetail = this.stderr
+			.trim()
+			.split("\n")
+			.map((line) => line.trim())
+			.find(Boolean);
+		const message =
+			this.spawnError ??
+			`the qoder session exited before the handshake or the turn ended${stderrDetail ? `: ${stderrDetail.slice(0, 300)}` : ""}`;
+		this.initReject?.(new Error(message));
+		this.settle({ status: "failed", error: message });
 	}
 
 	protected handleLine(line: string): void {
