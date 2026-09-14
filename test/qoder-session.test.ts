@@ -7,19 +7,15 @@ import { SESSION_DRIVERS, type SessionDriver, type TurnOutcome } from "../sessio
 import type { AgentEvent, Effort, Mode } from "../adapters.ts";
 
 interface MockTurn {
-	/** Assistant text records. The driver must NOT surface these as the answer. */
 	chunks?: string[];
-	/** Explicit `result.result`; defaults to the joined chunks. */
 	answer?: string;
 	result?: "success" | "error";
 	errors?: string[];
-	/** Kill the process before any result is written. */
+	apiError?: string;
 	exitBeforeResult?: number;
-	/** Hold the turn open until a steer arrives (models step-boundary injection). */
 	completeOnSteer?: boolean;
-	/** Hold the turn open until the driver interrupts it. */
 	hold?: boolean;
-	/** Ask the host to approve a tool before finishing. */
+	quiet?: boolean;
 	askPermission?: boolean;
 	toolName?: string;
 }
@@ -27,7 +23,19 @@ interface MockTurn {
 interface MockScenario {
 	exitBeforeInit?: number;
 	turns?: MockTurn[];
+	interrupt?: { stillQueued?: string[]; frames?: unknown[] };
+	steerFrames?: unknown[];
 }
+
+const rawResult = (text: string) => ({
+	type: "result",
+	subtype: "success",
+	is_error: false,
+	result: text,
+	stop_reason: "end_turn",
+	uuid: `r-${text}`,
+	session_id: "sess-1",
+});
 
 const QODER_STREAM_MOCK = `#!/usr/bin/env node
 const fs = require("node:fs");
@@ -65,6 +73,14 @@ function runTurn() {
   const plan = (scenario.turns || [])[index] || { answer: "OK" };
   record({ kind: "turn-started", index: index });
   if (plan.exitBeforeResult !== undefined) { process.exit(plan.exitBeforeResult); return; }
+  if (plan.apiError !== undefined) {
+    send({ type: "assistant", isApiErrorMessage: true,
+      message: { model: "<synthetic>", content: [{ type: "text", text: "[API Error: " + plan.apiError + "]" }] },
+      parent_tool_use_id: null });
+    finish(index, { result: "success", chunks: [], answer: "SHOULD-NOT-SURFACE" });
+    return;
+  }
+  if (plan.quiet) { return; }
   if (plan.completeOnSteer) { heldForSteer.set("s" + index, { index: index, plan: plan }); return; }
   if (plan.hold) { heldForInterrupt.set("c" + index, { index: index, plan: plan }); return; }
   if (plan.askPermission) {
@@ -94,6 +110,9 @@ process.stdin.on("data", function (chunk) {
         const held = Array.from(heldForSteer.values());
         heldForSteer.clear();
         for (const entry of held) finish(entry.index, entry.plan);
+        for (const frame of scenario.steerFrames || []) {
+          send(JSON.parse(JSON.stringify(frame).split("__STEER_UUID__").join(msg.uuid || "")));
+        }
       } else {
         runTurn();
       }
@@ -102,12 +121,17 @@ process.stdin.on("data", function (chunk) {
     if (msg.type === "control_request") {
       const subtype = msg.request && (msg.request.subtype || msg.request.type);
       record({ kind: "control-request", subtype: subtype, requestId: msg.request_id });
-      if (subtype === "interrupt") {
+      if (subtype === "initialize") {
         send({ type: "control_response", response: { subtype: "success", request_id: msg.request_id,
-          response: { still_queued: [] } } });
+          response: { capabilities: [], commands: [] } } });
+      } else if (subtype === "interrupt") {
+        const plan = scenario.interrupt || {};
+        send({ type: "control_response", response: { subtype: "success", request_id: msg.request_id,
+          response: { still_queued: plan.stillQueued || [] } } });
         const held = Array.from(heldForInterrupt.values());
         heldForInterrupt.clear();
         for (const entry of held) finish(entry.index, entry.plan);
+        for (const frame of plan.frames || []) send(frame);
       } else {
         send({ type: "control_response", response: { subtype: "error", request_id: msg.request_id, error: "unsupported" } });
       }
@@ -205,11 +229,7 @@ async function spawnQoder(input: {
 test("qoder stream-json: init handshake, one result per turn, answer not duplicated from assistant text", async () => {
 	const harness = await spawnQoder({
 		mode: "yolo",
-		scenario: {
-			// The assistant records repeat the answer on purpose: the parser must
-			// take the turn's answer from `result` only, or every turn doubles.
-			turns: [{ chunks: ["PONG", "PONG"], answer: "PONG" }],
-		},
+		scenario: { turns: [{ chunks: ["PONG", "PONG"], answer: "PONG" }] },
 	});
 	try {
 		await waitFor(() => harness.turns.length === 1, "first turn");
@@ -220,7 +240,39 @@ test("qoder stream-json: init handshake, one result per turn, answer not duplica
 		assert.equal(inputs[0].text, "do the thing");
 		assert.equal(inputs[0].priority, undefined);
 		assert.equal(inputs[0].shouldQuery, undefined);
-		assert.match(inputs[0].uuid ?? "", /^pi-/);
+		assert.match(inputs[0].uuid ?? "", /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
+	} finally {
+		harness.driver.kill();
+	}
+});
+
+test("qoder stream-json: the initialize request is sent before the first user message", async () => {
+	const harness = await spawnQoder({ mode: "yolo", scenario: { turns: [{ answer: "OK" }] } });
+	try {
+		await waitFor(() => harness.turns.length === 1, "first turn");
+		const entries = harness.logs();
+		const initIndex = entries.findIndex((entry) => entry.kind === "control-request" && entry.subtype === "initialize");
+		const firstInputIndex = entries.findIndex((entry) => entry.kind === "turn-input");
+		assert.notEqual(initIndex, -1);
+		assert.notEqual(firstInputIndex, -1);
+		assert.ok(initIndex < firstInputIndex, "initialize must precede the first user message");
+	} finally {
+		harness.driver.kill();
+	}
+});
+
+test("qoder stream-json: a synthetic API error fails the turn and the trailing result does not surface an answer", async () => {
+	const harness = await spawnQoder({
+		mode: "yolo",
+		scenario: { turns: [{ apiError: "auth failed for this account" }] },
+	});
+	try {
+		await waitFor(() => harness.turns.length === 1, "api error turn");
+		assert.equal(harness.turns[0].status, "failed");
+		assert.match(harness.turns[0].error ?? "", /auth failed for this account/);
+		assert.deepEqual(harness.events, [{ kind: "error", text: "auth failed for this account" }]);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		assert.equal(harness.turns.length, 1);
 	} finally {
 		harness.driver.kill();
 	}
@@ -249,11 +301,7 @@ test("qoder stream-json: follow-up continues the session with an isolated answer
 test("qoder stream-json: steer uses priority next + shouldQuery false, joins the active turn, and settles it once", async () => {
 	const harness = await spawnQoder({
 		mode: "yolo",
-		scenario: {
-			// The turn only ends after the steer lands: this is the documented
-			// step-boundary injection, not an interrupt and not a new turn.
-			turns: [{ chunks: ["working"], answer: "steered result", completeOnSteer: true }],
-		},
+		scenario: { turns: [{ chunks: ["working"], answer: "steered result", completeOnSteer: true }] },
 	});
 	try {
 		await waitFor(() => harness.logs().some((entry) => entry.kind === "turn-started"), "turn to start");
@@ -269,8 +317,6 @@ test("qoder stream-json: steer uses priority next + shouldQuery false, joins the
 		assert.equal(steers[0].priority, "next");
 		assert.equal(steers[0].shouldQuery, false);
 
-		// Exactly one turn started and one result produced: the steer never
-		// became an independent turn, so nothing can settle early or arrive late.
 		assert.equal(harness.logs().filter((entry) => entry.kind === "turn-started").length, 1);
 		assert.equal(harness.logs().filter((entry) => entry.kind === "result-sent").length, 1);
 		assert.deepEqual(harness.events, [{ kind: "message", text: "steered result" }]);
@@ -336,9 +382,56 @@ test("qoder stream-json: cancel sends the documented interrupt control request a
 		await harness.driver.cancel();
 		await waitFor(() => harness.turns.length === 1, "cancelled turn");
 		assert.equal(harness.turns[0].status, "cancelled");
-		const requests = harness.logs().filter((entry) => entry.kind === "control-request");
+		const requests = harness.logs().filter((entry) => entry.kind === "control-request" && entry.subtype === "interrupt");
 		assert.equal(requests.length, 1);
-		assert.equal(requests[0].subtype, "interrupt");
+	} finally {
+		harness.driver.kill();
+	}
+});
+
+test("qoder stream-json: a queued command left behind by an interrupt is reported as its own later turn", async () => {
+	const harness = await spawnQoder({
+		mode: "yolo",
+		scenario: {
+			turns: [{ quiet: true }],
+			interrupt: {
+				stillQueued: ["cmd-q"],
+				frames: [
+					rawResult("interrupted turn"),
+					{ type: "command_lifecycle", command_uuid: "cmd-q", state: "started", uuid: "cl-1", session_id: "sess-1" },
+					rawResult("queued command result"),
+				],
+			},
+		},
+	});
+	try {
+		await waitFor(() => harness.logs().some((entry) => entry.kind === "turn-started"), "turn to start");
+		await harness.driver.cancel();
+		await waitFor(() => harness.turns.length === 2, "survivor turn");
+		assert.deepEqual(harness.turns, [{ status: "cancelled" }, { status: "done" }]);
+		assert.deepEqual(
+			harness.events.filter((event) => event.kind === "message").map((event) => event.text),
+			["interrupted turn", "queued command result"],
+		);
+		assert.equal(harness.events.some((event) => event.kind === "warning" && /still-queued/.test(event.text)), true);
+	} finally {
+		harness.driver.kill();
+	}
+});
+
+test("qoder stream-json: a discarded steer is reported as a warning", async () => {
+	const harness = await spawnQoder({
+		mode: "yolo",
+		scenario: {
+			turns: [{ completeOnSteer: true, answer: "turn result" }],
+			steerFrames: [{ type: "command_lifecycle", command_uuid: "__STEER_UUID__", state: "discarded", uuid: "cl-d", session_id: "sess-1" }],
+		},
+	});
+	try {
+		await waitFor(() => harness.logs().some((entry) => entry.kind === "turn-started"), "turn to start");
+		await harness.driver.steer("too late to matter");
+		await waitFor(() => harness.turns.length === 1, "turn to settle");
+		assert.equal(harness.events.some((event) => event.kind === "warning" && /discarded/.test(event.text)), true);
 	} finally {
 		harness.driver.kill();
 	}

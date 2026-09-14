@@ -57,7 +57,11 @@ process.stdin.on("data", function (chunk) {
     if (msg && msg.type === "control_request") {
       const subtype = msg.request && (msg.request.subtype || msg.request.type);
       rec({ kind: "control_request", subtype: subtype, requestId: msg.request_id, request: msg.request });
-      for (const frame of ((scenario.control || {})[subtype] || [])) send(frame);
+      for (const frame of ((scenario.control || {})[subtype] || [])) {
+        if (frame && typeof frame === "object" && typeof frame.$exit !== "number") {
+          send(JSON.parse(JSON.stringify(frame).split("__REQUEST_ID__").join(msg.request_id)));
+        } else send(frame);
+      }
       continue;
     }
     if (msg && msg.type === "control_response") {
@@ -160,7 +164,7 @@ async function spawnEdge(input: { mode: Mode; scenario?: EdgeScenario; task?: st
 	return { driver, events, turns, exits, logs: () => readJsonl(logFile), argv: () => readJsonl(argvFile) };
 }
 
-test("qoder edge DEFECT-RISK: boot must send the SDK initialize control request before the first user message", async () => {
+test("qoder edge: boot sends the SDK initialize control request before the first user message", async () => {
 	const harness = await spawnEdge({ mode: "yolo", scenario: { turns: [[RESULT_OK("hello")]] } });
 	try {
 		await waitFor(() => harness.turns.length === 1, "first turn");
@@ -168,14 +172,14 @@ test("qoder edge DEFECT-RISK: boot must send the SDK initialize control request 
 		assert.equal(
 			initializes.length,
 			1,
-			"DEFECT-RISK: the SDK sends an initialize control_request before the first user message; this driver sends none, so boot relies on the CLI self-initializing",
+			"the SDK sends an initialize control_request before the first user message",
 		);
 	} finally {
 		harness.driver.kill();
 	}
 });
 
-test("qoder edge DEFECT: an inbound control_request with a non-string request_id is answered instead of dropped (stall risk)", async () => {
+test("qoder edge: an inbound control_request with a non-string request_id is answered instead of dropped", async () => {
 	const harness = await spawnEdge({
 		mode: "readonly",
 		scenario: { turns: [[PERMISSION_REQUEST(42, "tu-1"), RESULT_OK("after")]] },
@@ -186,14 +190,14 @@ test("qoder edge DEFECT: an inbound control_request with a non-string request_id
 		assert.equal(
 			answers.length,
 			1,
-			"DEFECT: handleControlRequest returns early when request_id is not a string, so the CLI is left blocked on a permission reply it will never receive",
+			"a non-string request_id is echoed back so the CLI is never left blocked on a reply it will never receive",
 		);
 	} finally {
 		harness.driver.kill();
 	}
 });
 
-test("qoder edge DEFECT-RISK: steer uuid must be a UUID because the protocol keys commands by uuid", async () => {
+test("qoder edge: the steer uuid is a UUID because the protocol keys commands by uuid", async () => {
 	const harness = await spawnEdge({ mode: "yolo", scenario: { turns: [[]], steer: [RESULT_OK("steered")] } });
 	try {
 		await harness.driver.steer("narrow scope");
@@ -202,7 +206,7 @@ test("qoder edge DEFECT-RISK: steer uuid must be a UUID because the protocol key
 		assert.match(
 			steer.uuid ?? "",
 			UUID_RE,
-			"DEFECT-RISK: SDKUserMessage.uuid is typed UUID and command_lifecycle.command_uuid cancels by it; pi-N is not a UUID",
+			"SDKUserMessage.uuid is typed UUID and command_lifecycle.command_uuid cancels by it",
 		);
 	} finally {
 		harness.driver.kill();
@@ -241,14 +245,14 @@ test("qoder edge: a context-only late steer joins the active turn without starti
 	}
 });
 
-test("qoder edge DEFECT: a result for a still-queued command after cancel is surfaced instead of silently dropped", async () => {
+test("qoder edge: a result for a still-queued command after cancel is surfaced as its own turn", async () => {
 	const harness = await spawnEdge({
 		mode: "yolo",
 		scenario: {
 			turns: [[]],
 			control: {
 				interrupt: [
-					{ type: "control_response", response: { subtype: "success", request_id: "q1", response: { still_queued: ["cmd-q"] } } },
+					{ type: "control_response", response: { subtype: "success", request_id: "__REQUEST_ID__", response: { still_queued: ["cmd-q"] } } },
 					RESULT_OK("interrupted turn"),
 					{ type: "command_lifecycle", command_uuid: "cmd-q", state: "started", uuid: "cl-1", session_id: "sess-1" },
 					RESULT_OK("queued command result"),
@@ -259,20 +263,23 @@ test("qoder edge DEFECT: a result for a still-queued command after cancel is sur
 	try {
 		await waitFor(() => harness.logs().some((entry) => entry.kind === "input"), "task delivered");
 		await harness.driver.cancel();
-		await waitFor(() => harness.turns.length === 1, "cancelled turn");
-		assert.equal(harness.turns[0].status, "cancelled");
 		await delay(150);
-		assert.equal(
-			harness.turns.length,
-			2,
-			"DEFECT: the interrupt response still_queued survivor and its later result are discarded by the !active guard, so continued agent work after cancel is invisible",
+		assert.deepEqual(
+			harness.turns,
+			[{ status: "cancelled" }, { status: "done" }],
+			"the interrupt response still_queued survivor and its later result are surfaced, so continued agent work after cancel is visible",
 		);
+		assert.deepEqual(
+			harness.events.filter((event) => event.kind === "message").map((event) => event.text),
+			["interrupted turn", "queued command result"],
+		);
+		assert.equal(harness.events.some((event) => event.kind === "warning" && /still-queued/.test(event.text)), true);
 	} finally {
 		harness.driver.kill();
 	}
 });
 
-test("qoder edge DEFECT: a discarded steer must be surfaced, not silently reported as accepted", async () => {
+test("qoder edge: a discarded steer is surfaced instead of being reported as accepted", async () => {
 	const harness = await spawnEdge({
 		mode: "yolo",
 		scenario: {
@@ -290,14 +297,14 @@ test("qoder edge DEFECT: a discarded steer must be surfaced, not silently report
 		assert.equal(
 			surfaced,
 			true,
-			"DEFECT: command_lifecycle state=discarded is ignored, so external_agent_steer keeps claiming the guidance was accepted",
+			"command_lifecycle state=discarded is surfaced instead of leaving the steer receipt claiming acceptance",
 		);
 	} finally {
 		harness.driver.kill();
 	}
 });
 
-test("qoder edge DEFECT: an aborted/truncated assistant stream does not settle as a clean done", async () => {
+test("qoder edge: an aborted/truncated assistant stream does not settle as a clean done", async () => {
 	const harness = await spawnEdge({
 		mode: "yolo",
 		scenario: {
@@ -314,14 +321,14 @@ test("qoder edge DEFECT: an aborted/truncated assistant stream does not settle a
 		assert.notEqual(
 			harness.turns[0].status,
 			"done",
-			"DEFECT: SDKAssistantMessage.aborted is ignored, so a stream truncated by an interrupt still reports done with an empty answer",
+			"SDKAssistantMessage.aborted does not become a clean done with an empty answer",
 		);
 	} finally {
 		harness.driver.kill();
 	}
 });
 
-test("qoder edge DEFECT: a malformed result frame must not settle the turn with an empty answer", async () => {
+test("qoder edge: a malformed result frame does not settle the turn with an empty answer", async () => {
 	const harness = await spawnEdge({
 		mode: "yolo",
 		scenario: { turns: [[{ type: "result" }, RESULT_OK("GOOD")]] },
@@ -331,7 +338,7 @@ test("qoder edge DEFECT: a malformed result frame must not settle the turn with 
 		assert.deepEqual(
 			harness.events,
 			[{ kind: "message", text: "GOOD" }],
-			"DEFECT: an incomplete result record settles the turn as done with an empty message and the real result is then dropped as stale",
+			"an incomplete result record does not settle the turn, so the real result still lands",
 		);
 	} finally {
 		harness.driver.kill();
@@ -442,7 +449,7 @@ test("qoder edge: the interrupt request carries type interrupt and survives a mi
 			turns: [[]],
 			control: {
 				interrupt: [
-					{ type: "control_response", response: { subtype: "success", request_id: "q1", response: { still_queued: [] } } },
+					{ type: "control_response", response: { subtype: "success", request_id: "__REQUEST_ID__", response: { still_queued: [] } } },
 					RESULT_OK("interrupted"),
 				],
 			},

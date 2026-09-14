@@ -59,7 +59,20 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
 
 - **qoder 的 write / yolo**：`write` 映射到 `--permission-mode accept_edits`（目录内编辑自动放行；其余需要确认的操作一律拒绝，绝不自动 allow），`yolo` 映射到 `bypass_permissions`。两者都继承 Qoder 自身配置的权限规则与 hook，**不是** OS 沙箱。非默认模式仅在受信任的启动目录生效，否则回落到 `default`（headless 下需要确认的操作同样被拒绝）。已在 qodercli 1.0.18 实测：`accept_edits` 成功创建 fixture 文件。
 
-- **qoder 的 steer 与传输方式**：qoder 走官方文档的流式输入通道 `qodercli -p --output-format stream-json --input-format stream-json`（与官方 SDK 构造的 argv 完全一致），不再使用 `--acp`。ACP 文档只描述编辑器集成，没有暴露任何 steer 元数据，因此在 ACP 下再发一次 `session/prompt` 只能证明"排队"，不能证明"可引导当前轮"。steer 是单条用户消息，带 `priority: "next"`（文档的"下一个合适时机"，即 step 边界）与 `shouldQuery: false`（消息进入当前轮上下文，但不会自己起一轮）。这两者组合使 steer 永远不会被提升为独立的一轮，因此不可能晚于 settle 它的那条 `result` 存活——不会提前 settle、不会重复答案、也不会出现迟到的游离响应。steer 绝不使用 `priority: "now"`（中断）。取消使用 SDK 文档化的 `interrupt` control request；任何入站的 `can_use_tool` control request 都会以 fail-closed 的 `deny` 回复，而不是被忽略。
+- **qoder 的 steer 与传输方式**：qoder 走官方文档的流式输入通道 `qodercli -p --output-format stream-json --input-format stream-json`（与官方 SDK `buildArgs()` 构造的 argv 完全一致），不再使用 `--acp`。ACP 文档只描述编辑器集成，没有暴露任何 steer 元数据，因此在 ACP 下再发一次 `session/prompt` 只能证明"排队"，不能证明"可引导当前轮"。
+
+  报文格式（均与 `@qoder-ai/qoder-agent-sdk` 1.0.39 及 CLI 文档交叉核对）：
+
+  - 任务文本不作为 argv 参数，而是 stdin 上一行一个 JSON 对象（`{"type":"user","message":{"role":"user","content":[{"type":"text","text":…}]},"parent_tool_use_id":null,"uuid":…}`），uuid 用 `randomUUID`，因为协议以它作为命令标识。
+  - 启动时进程一起来就发送 SDK 的 `initialize` control request，然后等待 CLI 主动发出的 `system`/`init` 记录，之后才发送第一条用户消息。若失败帧与握手在同一批到达，`start()` 直接抛错，不会在一个已失败的会话上开一轮。
+  - `result` 恰好结束一轮；没有 `subtype` 的 result 属不完整记录，会被忽略，而不会以空答案 settle。
+  - steer 是单条用户消息，带 `priority: "next"`（文档的"下一个合适时机"，即 step 边界）与 `shouldQuery: false`（消息进入当前轮上下文，但不会自己起一轮）：既不中断，也永远不会被提升为独立的一轮。因此 steer 回执只声明**已发送 / 已排队**，不声明"一定已生效"；错过本轮最后一个 step 的引导会作为下一次用户消息前的上下文保留。steer 绝不使用 `priority: "now"`（中断）。
+  - 被标记 `aborted` 的 assistant 帧（流被截断）会把该轮 settle 为 cancelled，而不是干净的 done；合成的 API 错误 assistant 帧（`message.model === "<synthetic>"`）会以去掉 `[API Error: …]` 外壳后的文本把该轮判为失败。
+  - 取消使用 SDK 的 `interrupt` control request。当响应里 `still_queued` 非空时会给出 warning，并把该排队命令自己的后续 `result` 作为"新的一轮"上报，而不是丢弃——取消之后的继续工作不会被隐藏。
+  - 任何入站 `can_use_tool` control request 都会被回答（readonly/write 为 fail-closed 的 `deny`，yolo 为 `allow`），并原样回填它自己的 `request_id`；若请求没有可用的 id，则将该轮判为失败，而不是让 CLI 干等一个永远不会来的回复。
+  - CLI 若发送 `command_lifecycle`，其 `discarded`/`cancelled` 状态会触发 warning，而不是让先前的"已接受"回执继续成立。
+
+  兼容性：`@qoder-ai/qoder-agent-sdk` 1.0.39 对应 qodercli 1.1.49，逐命令的 `command_lifecycle` 回执只存在于这一代；本地 qodercli 1.0.18 不会发送它，因此不会阻塞等待。1.0.18 的入站用户消息 schema 中确实有文档化的 `priority: ["now","next","later"]` 字段；`shouldQuery` 由 SDK 声明并在文档中规定，但 1.0.18 的入站 schema 未列出该字段，因此"steer 不会自成一 轮"这一保证只在真正支持该字段的 CLI 代际上确定成立。
 
 各 CLI 的兼容性结论写在 `adapters.ts` 注释以及每次派发回执的 `effective policy` 一行里。
 

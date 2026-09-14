@@ -708,12 +708,6 @@ const qoderAdapter: Adapter = {
 	defaultMode: "yolo",
 	maxMode: "yolo",
 	supportedEfforts: ["off", "low", "medium", "high", "xhigh", "max"],
-	// Documented streaming input (`--input-format stream-json`): a steer is a
-	// user message with priority "next" (next suitable opportunity) and
-	// shouldQuery false, so it joins the ACTIVE turn at a step boundary and can
-	// never become an independent turn. ACP is not used: qodercli --acp is
-	// documented as an editor integration with no steering metadata, so a second
-	// session/prompt there proves queueing, not step-boundary steering.
 	session: {
 		steer: true,
 		followUp: true,

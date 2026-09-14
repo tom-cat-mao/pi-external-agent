@@ -153,7 +153,6 @@ async function startQoder(dir: string, extra: Record<string, unknown> = {}): Pro
 	return await call("external_agent_start", { agent: "qoder", task: "do the thing", mode: "yolo", cwd: dir, notify: "off", ...extra });
 }
 
-/** Read a mock's JSONL log, tolerating a file that does not exist yet. */
 function mockLog(file: string): any[] {
 	if (!existsSync(file)) return [];
 	const text = readFileSync(file, "utf8").trim();
@@ -233,8 +232,6 @@ test("hub: qoder steer reaches the running session at the next step boundary", a
 	const dir = makeFixtureDir({ qodercli: QODER_HUB_MOCK });
 	const restorePath = usePath(dir);
 	const logFile = path.join(dir, "log.jsonl");
-	// The turn only finishes once the steer lands, so the answer proves the
-	// steer was injected into the active turn rather than queued behind it.
 	const restoreScenario = withEnv({
 		QODER_MOCK_SCENARIO: JSON.stringify({ turns: [{ chunks: ["WORKING"], answer: "STEERED", completeOnSteer: true }] }),
 		QODER_MOCK_LOG_FILE: logFile,
@@ -242,8 +239,6 @@ test("hub: qoder steer reaches the running session at the next step boundary", a
 	try {
 		const started = await startQoder(dir);
 		const taskId = started.details.task.taskId;
-		// The session handshake and first turn start asynchronously, so wait for
-		// the turn to reach the CLI before steering it.
 		await waitForLog(logFile, (lines) => lines.some((entry) => entry.kind === "turn-input"), "the first turn to start");
 
 		const steered = await call("external_agent_steer", { taskId, message: "change course" });
