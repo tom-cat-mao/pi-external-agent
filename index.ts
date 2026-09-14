@@ -1498,7 +1498,7 @@ export default function (pi: ExtensionAPI) {
 			const sessionNote = persistent
 				? canSteer
 					? `This session stays alive after it settles: steer it with external_agent_steer taskId="${task.id}" while it runs, or continue it with external_agent_follow_up taskId="${task.id}" (reclaimed after ${Math.round(IDLE_REAP_MS / 60_000)}m idle).`
-					: `This session stays alive after it settles: continue it with external_agent_follow_up taskId="${task.id}" (reclaimed after ${Math.round(IDLE_REAP_MS / 60_000)}m idle). ${steerBlocked ? `Steering is not currently available: ${steerBlocked}.` : "It does not support mid-run steering."}`
+					: `This session stays alive after it settles: continue it with external_agent_follow_up taskId="${task.id}" (reclaimed after ${Math.round(IDLE_REAP_MS / 60_000)}m idle). ${steerBlocked ? "Steering compatibility is pending initialization; inspect external_agent_status after startup for the result." : "It does not support mid-run steering."}`
 				: null;
 			return {
 				content: [

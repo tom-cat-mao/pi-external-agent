@@ -175,6 +175,8 @@ test("hub: qoder start/wait/status expose a settled receipt, answer, and omitted
 	try {
 		const started = await startQoder(dir, { mode: "readonly" });
 		assert.equal(started.details.kind, "external-agent-start");
+		assert.match(started.content[0].text, /Steering compatibility is pending initialization/);
+		assert.doesNotMatch(started.content[0].text, /Steering is not currently available/);
 		const snapshot = started.details.task;
 		assert.equal(snapshot.agent, "qoder");
 		assert.equal(snapshot.dispatch.effort.forwarded, false);
@@ -190,6 +192,8 @@ test("hub: qoder start/wait/status expose a settled receipt, answer, and omitted
 		assert.equal(status.details.kind, "external-agent-status");
 		assert.match(status.content[0].text, new RegExp(taskId));
 		assert.equal(status.details.task.state, "done");
+		assert.match(status.content[0].text, /external_agent_steer while running/);
+		assert.doesNotMatch(status.content[0].text, /steering unavailable:/);
 		assert.match(status.details.task.dispatch.effectivePolicy, /dont_ask.*disableAllHooks/);
 		assert.equal(status.details.task.dispatch.stdin, "stream-json");
 		assert.deepEqual(status.details.task.dispatch.argv.slice(0, 5), ["-p", "--output-format", "stream-json", "--input-format", "stream-json"]);
@@ -295,7 +299,7 @@ test("hub: old or unknown Qoder versions report steering unavailable without sen
 		});
 		try {
 			const started = await startQoder(dir);
-			assert.match(started.content[0].text, /Steering is not currently available/);
+			assert.match(started.content[0].text, /Steering compatibility is pending initialization/);
 			const taskId = started.details.task.taskId;
 			await waitForLog(logFile, (lines) => lines.some((entry) => entry.kind === "turn-input"), "the first turn");
 			const status = await call("external_agent_status", { taskId });

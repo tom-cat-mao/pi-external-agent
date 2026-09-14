@@ -1431,6 +1431,7 @@ class QoderStreamJsonDriver extends StdioProcess implements SessionDriver {
 	private markActive(): void {
 		this.active = true;
 		this.truncated = false;
+		this.steers.clear();
 	}
 
 	private settle(outcome: TurnOutcome): void {

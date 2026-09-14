@@ -142,6 +142,29 @@ test("qoder steer message: priority next with shouldQuery false, never now; foll
 	assert.equal(sent[1].message.content[0].text, "plain follow-up");
 });
 
+test("qoder steer delivery warnings do not leak into a later user turn", async () => {
+	const driver = SESSION_DRIVERS.qoder!() as any;
+	const sent: any[] = [];
+	const events: any[] = [];
+	driver.writeLine = (obj: unknown) => sent.push(obj);
+	driver.onEvent((event: unknown) => events.push(event));
+	driver.proc = { stdin: {} };
+	driver.initVersion = "1.1.49";
+	driver.active = true;
+	await driver.steer("first steer");
+	await driver.steer("second steer");
+	assert.equal(driver.steers.size, 2);
+	driver.settle({ status: "done" });
+	driver.handleLine(JSON.stringify({ type: "command_lifecycle", command_uuid: sent[0].uuid, state: "discarded" }));
+	assert.equal(events.length, 1);
+	assert.equal(events[0].kind, "warning");
+	assert.equal(driver.steers.size, 1);
+	await driver.followUp("new user turn");
+	assert.equal(driver.steers.size, 0);
+	driver.handleLine(JSON.stringify({ type: "command_lifecycle", command_uuid: sent[1].uuid, state: "discarded" }));
+	assert.equal(events.length, 1);
+});
+
 test("qoder child assistant errors and truncation do not settle the main turn", () => {
 	const driver = SESSION_DRIVERS.qoder!() as any;
 	const turns: Array<{ status: string }> = [];
