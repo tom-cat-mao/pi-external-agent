@@ -1029,6 +1029,27 @@ class AcpDriver extends BaseSessionDriver implements SessionDriver {
 const QODER_INIT_TIMEOUT_MS = 120_000;
 const QODER_CANCEL_TIMEOUT_MS = 5_000;
 const QODER_SYNTHETIC_MODEL = "<synthetic>";
+const QODER_STEER_BASELINE = "1.1.49";
+const QODER_STEER_BASELINE_PARTS = [1, 1, 49];
+const QODER_STEER_REFUSAL =
+	"Mid-run steering is refused rather than sent, because this CLI generation may not honour the shouldQuery contract a steer relies on. " +
+	"The baseline is the release our documented SDK pairing targets, not a vendor-stated minimum. " +
+	"Follow-up, status and stop still work; install a newer qodercli and dispatch a new task to steer.";
+
+function qoderStableVersion(value: unknown): number[] | undefined {
+	if (typeof value !== "string") return undefined;
+	const match = value.trim().match(/^v?(\d+)\.(\d+)\.(\d+)$/);
+	if (!match) return undefined;
+	return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+function qoderVersionAtLeast(parts: number[], baseline: number[]): boolean {
+	for (let index = 0; index < baseline.length; index += 1) {
+		const value = parts[index] ?? 0;
+		if (value !== baseline[index]) return value > baseline[index];
+	}
+	return true;
+}
 
 interface QoderControlWaiter {
 	resolve: (response: any) => void;
@@ -1065,6 +1086,8 @@ class QoderStreamJsonDriver extends StdioProcess implements SessionDriver {
 	private turnStarted = false;
 	private bootFailure: string | undefined;
 	private truncated = false;
+	private initVersion: string | undefined;
+	private initializeVersion: string | undefined;
 	private mode: Mode = "yolo";
 	private initResolve: (() => void) | undefined;
 	private initReject: ((err: Error) => void) | undefined;
@@ -1106,6 +1129,8 @@ class QoderStreamJsonDriver extends StdioProcess implements SessionDriver {
 					if (this.initResolve) this.failBoot(`qoder rejected the initialize request: ${String(response.error ?? "unknown error")}`);
 					return;
 				}
+				const announced = response?.response?.qodercli_version;
+				if (typeof announced === "string") this.initializeVersion = announced;
 				this.initResolve?.();
 			})
 			.catch(() => undefined);
@@ -1153,6 +1178,8 @@ class QoderStreamJsonDriver extends StdioProcess implements SessionDriver {
 	async steer(message: string): Promise<SteerResult> {
 		if (!this.active) return { accepted: false, reason: "no turn is currently running" };
 		if (!this.alive) return { accepted: false, reason: "the qoder session process is gone" };
+		const blocked = this.steerBlock();
+		if (blocked) return { accepted: false, reason: `${blocked}. ${QODER_STEER_REFUSAL}` };
 		this.steers.add(this.sendUserMessage(message, { priority: "next", shouldQuery: false }));
 		return {
 			accepted: true,
@@ -1160,6 +1187,19 @@ class QoderStreamJsonDriver extends StdioProcess implements SessionDriver {
 				"sent with priority next and shouldQuery false: queued for the next step boundary of the active turn, not confirmed applied. " +
 				"It never interrupts and never starts a turn of its own, so guidance that misses this turn stays as context for the next user message.",
 		};
+	}
+
+	private steerBlock(): string | undefined {
+		const announced = this.initializeVersion ?? this.initVersion;
+		if (announced === undefined) {
+			return `qoder announced no qodercli_version in its system/init record or initialize response, so the ${QODER_STEER_BASELINE} steering baseline cannot be confirmed`;
+		}
+		const parts = qoderStableVersion(announced);
+		if (!parts) {
+			return `qoder announced version "${announced}", which is not a stable release number, so the ${QODER_STEER_BASELINE} steering baseline cannot be confirmed`;
+		}
+		if (qoderVersionAtLeast(parts, QODER_STEER_BASELINE_PARTS)) return undefined;
+		return `qoder announced version "${announced}", below the ${QODER_STEER_BASELINE} steering baseline`;
 	}
 
 	async cancel(): Promise<void> {
@@ -1196,6 +1236,7 @@ class QoderStreamJsonDriver extends StdioProcess implements SessionDriver {
 		if (!obj || typeof obj !== "object") return;
 
 		if (obj.type === "system" && obj.subtype === "init") {
+			if (typeof obj.qodercli_version === "string") this.initVersion = obj.qodercli_version;
 			this.initResolve?.();
 			return;
 		}

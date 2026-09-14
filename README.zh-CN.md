@@ -72,7 +72,11 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
   - 任何入站 `can_use_tool` control request 都会被回答（readonly/write 为 fail-closed 的 `deny`，yolo 为 `allow`），并原样回填它自己的 `request_id`；若请求没有可用的 id，则将该轮判为失败，而不是让 CLI 干等一个永远不会来的回复。
   - CLI 若发送 `command_lifecycle`，其 `discarded`/`cancelled` 状态会触发 warning，而不是让先前的"已接受"回执继续成立。
 
-  兼容性：`@qoder-ai/qoder-agent-sdk` 1.0.39 对应 qodercli 1.1.49，逐命令的 `command_lifecycle` 回执只存在于这一代；本地 qodercli 1.0.18 不会发送它，因此不会阻塞等待。1.0.18 的入站用户消息 schema 中确实有文档化的 `priority: ["now","next","later"]` 字段；`shouldQuery` 由 SDK 声明并在文档中规定，但 1.0.18 的入站 schema 未列出该字段，因此"steer 不会自成一 轮"这一保证只在真正支持该字段的 CLI 代际上确定成立。
+  **steer 是有条件的。** 只有当 CLI 声明了**不低于 1.1.49 的稳定版本**时才会发送 steer——1.1.49 是我们文档化 SDK 配对（`@qoder-ai/qoder-agent-sdk` 1.0.39）所对应的版本。这是我们**文档契约的基线**，不是对厂商最早支持版本的断言。CLI 声明的 `qodercli_version`（来自 `system`/`init` 记录，或 `initialize` 响应中的同名字段）必须存在、必须是稳定版本号、且达到该基线；缺失、格式异常、预发布或更旧的版本会让 `external_agent_steer` 直接拒绝并回显所报版本与升级提示，完全不写出 steer 帧，同时 start/status/follow-up/stop 均不受影响。
+
+  设置该门槛的原因：本地公开二进制的入站用户消息 schema 声明了 `priority: ["now","next","later"]`，但没有 `shouldQuery`，且二进制中没有任何地方从入站帧读取 `shouldQuery`——因此在旧版 CLI 上 steer 只是一条普通的排队消息，其投递契约无法确认。逐命令的 `command_lifecycle` 回执在 1.0.18 上同样缺失（从 1.1.x 代际才有），因此不会阻塞等待它。
+
+  **实机验证状态：**本机唯一一次获批的实机探测在任何工具调用之前就被账号权益（entitlement）拒绝而终止，更早的一次无模型运行也遇到了同样的权益门槛。因此 Qoder steer **在任何版本上都还没有经过实机模型验证**（包括 1.0.18），目前的依据是文档契约、公开 SDK/二进制证据与离线协议测试。
 
 各 CLI 的兼容性结论写在 `adapters.ts` 注释以及每次派发回执的 `effective policy` 一行里。
 

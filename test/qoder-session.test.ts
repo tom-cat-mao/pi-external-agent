@@ -24,6 +24,7 @@ interface MockTurn {
 interface MockScenario {
 	exitBeforeInit?: number;
 	initDelayMs?: number;
+	initVersion?: string | null;
 	turns?: MockTurn[];
 	interrupt?: { stillQueued?: string[]; frames?: unknown[] };
 	steerFrames?: unknown[];
@@ -65,6 +66,8 @@ function finish(index, plan) {
 if (scenario.exitBeforeInit !== undefined) process.exit(scenario.exitBeforeInit);
 const initFrame = { type: "system", subtype: "init", protocol_version: "1.4.0", capabilities: [],
   commands: [], session_id: "sess-1", model: "auto", permissionMode: "bypass_permissions" };
+if (scenario.initVersion === null) delete initFrame.qodercli_version;
+else initFrame.qodercli_version = scenario.initVersion || "1.1.49";
 if (scenario.initDelayMs) setTimeout(function () { send(initFrame); }, scenario.initDelayMs);
 else send(initFrame);
 let buffer = "";
@@ -386,6 +389,55 @@ test("qoder stream-json: a control request with no usable request_id fails the t
 		await assert.rejects(harness.driver.followUp("after the failure"));
 	} finally {
 		harness.driver.kill();
+	}
+});
+
+test("qoder stream-json: steering is refused when the announced release is below the documented baseline", async () => {
+	const harness = await spawnQoder({ mode: "yolo", scenario: { initVersion: "1.0.18", turns: [{ quiet: true }] } });
+	try {
+		await waitFor(() => harness.logs().some((entry) => entry.kind === "turn-started"), "turn to start");
+		const result = await harness.driver.steer("narrow scope");
+		assert.equal(result.accepted, false);
+		assert.match(result.accepted ? "" : result.reason, /below the 1\.1\.49 steering baseline/);
+		assert.match(result.accepted ? "" : result.reason, /documented SDK pairing/);
+		assert.equal(harness.logs().some((entry) => entry.kind === "steer"), false);
+	} finally {
+		harness.driver.kill();
+	}
+});
+
+test("qoder stream-json: steering is refused when the announced version is missing, malformed or a prerelease", async () => {
+	const cases: Array<[string, string | null]> = [
+		["missing", null],
+		["malformed", "1.1"],
+		["prerelease", "1.2.0-beta.1"],
+	];
+	for (const [label, initVersion] of cases) {
+		const harness = await spawnQoder({ mode: "yolo", scenario: { initVersion, turns: [{ quiet: true }] } });
+		try {
+			await waitFor(() => harness.logs().some((entry) => entry.kind === "turn-started"), `${label} turn to start`);
+			const result = await harness.driver.steer("narrow scope");
+			assert.equal(result.accepted, false, label);
+			assert.match(result.accepted ? "" : result.reason, /baseline cannot be confirmed/, label);
+			assert.equal(harness.logs().some((entry) => entry.kind === "steer"), false, label);
+		} finally {
+			harness.driver.kill();
+		}
+	}
+});
+
+test("qoder stream-json: steering is accepted when the announced release meets the documented baseline", async () => {
+	for (const announced of ["1.1.49", "1.2.0"]) {
+		const harness = await spawnQoder({ mode: "yolo", scenario: { initVersion: announced, turns: [{ quiet: true }] } });
+		try {
+			await waitFor(() => harness.logs().some((entry) => entry.kind === "turn-started"), "turn to start");
+			const result = await harness.driver.steer("narrow scope");
+			assert.equal(result.accepted, true, announced);
+			await waitFor(() => harness.logs().some((entry) => entry.kind === "steer"), "steer frame");
+			assert.equal(harness.logs().filter((entry) => entry.kind === "steer").length, 1);
+		} finally {
+			harness.driver.kill();
+		}
 	}
 });
 

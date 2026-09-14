@@ -27,7 +27,7 @@ function send(frame) {
   process.stdout.write(JSON.stringify(frame) + "\\n");
 }
 if (typeof scenario.bootExit === "number") process.exit(scenario.bootExit);
-for (const frame of (scenario.boot || [{ type: "system", subtype: "init", session_id: "sess-1", capabilities: ["interrupt_cancel_queued_v1"] }])) send(frame);
+for (const frame of (scenario.boot || [{ type: "system", subtype: "init", session_id: "sess-1", capabilities: ["interrupt_cancel_queued_v1"], qodercli_version: "1.1.49" }])) send(frame);
 let buffer = "";
 let turnIndex = 0;
 let lastSteerUuid = "";

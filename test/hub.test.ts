@@ -49,7 +49,7 @@ const logFile = process.env.QODER_MOCK_LOG_FILE;
 function record(entry) { if (logFile) fs.appendFileSync(logFile, JSON.stringify(entry) + "\\n"); }
 function send(value) { process.stdout.write(JSON.stringify(value) + "\\n"); }
 send({ type: "system", subtype: "init", protocol_version: "1.4.0", capabilities: [], commands: [],
-  session_id: "sess-" + Date.now(), model: "auto", permissionMode: "bypass_permissions" });
+  session_id: "sess-" + Date.now(), model: "auto", permissionMode: "bypass_permissions", qodercli_version: "1.1.49" });
 let buffer = "";
 let index = 0;
 const heldForSteer = new Map();

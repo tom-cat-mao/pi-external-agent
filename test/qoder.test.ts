@@ -120,6 +120,7 @@ test("qoder steer message: priority next with shouldQuery false, never now; foll
 	driver.writeLine = (obj: unknown) => sent.push(obj);
 	driver.active = true;
 	driver.proc = { stdin: {} };
+	driver.initVersion = "1.1.49";
 
 	const steered = await driver.steer("focus on the failing tests");
 	assert.equal(steered.accepted, true);

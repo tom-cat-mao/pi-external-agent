@@ -711,7 +711,9 @@ const qoderAdapter: Adapter = {
 	session: {
 		steer: true,
 		followUp: true,
-		steerNote: "documented stream-json priority \"next\" + shouldQuery false; injected at the next step boundary of the active turn, never an interrupt",
+		steerNote:
+			"documented stream-json priority \"next\" + shouldQuery false, injected at the next step boundary of the active turn, never an interrupt; " +
+			"steering needs an announced stable qodercli >= 1.1.49 (our documented-SDK pairing baseline) and is otherwise refused with the reported version",
 	},
 	sessionPolicy: qoderEffectivePolicy,
 	enforcesReadOnly: true,
