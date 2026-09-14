@@ -8,11 +8,13 @@
  * signal moves from "process exited" to "turn ended" while the process stays up
  * for follow-ups.
  *
- * Three wire protocols, one interface:
+ * Four wire protocols, one interface:
  *
- *   PiRpcDriver          pi --mode rpc        — line JSON commands + events
- *   CodexAppServerDriver codex app-server     — JSON-RPC 2.0, experimental
- *   AcpDriver            reasonix / codebuddy — JSON-RPC 2.0 ACP over stdio
+ *   PiRpcDriver           pi --mode rpc        — line JSON commands + events
+ *   CodexAppServerDriver  codex app-server     — JSON-RPC 2.0, experimental
+ *   AcpDriver             reasonix / codebuddy — JSON-RPC 2.0 ACP over stdio
+ *   QoderStreamJsonDriver qoder                — LF-delimited JSON, documented
+ *                                               --input-format stream-json
  *
  * Facts verified by hand on 2026-09-08 against the installed binaries
  * (pi 0.85.1, codex 0.153.4, reasonix v1.38.1, codebuddy 2.147.0), including
@@ -38,8 +40,22 @@
  *   codebuddy-> plain ACP: steering is a second session/prompt on the active
  *               session; it lands at the next model step boundary, or becomes a
  *               follow-up if the turn is stuck inside one long tool call.
+ *   qoder    -> NOT ACP. ACP (`qodercli --acp`) is documented only as an editor
+ *               integration and exposes no steering metadata, so a second
+ *               session/prompt there proves queueing, not step-boundary
+ *               steering. Qoder instead documents a streaming input channel on
+ *               the CLI itself (`--input-format stream-json`), where each user
+ *               message carries `priority` (`now` interrupts, `next` is the
+ *               default and lands at the next suitable opportunity, `later`
+ *               waits for the response to finish) and `shouldQuery` (false adds
+ *               the message to the conversation without starting a turn of its
+ *               own). Steering uses `priority: next` + `shouldQuery: false`, so
+ *               a steer is injected at the next step boundary of the ACTIVE
+ *               turn and can never be promoted into an independent turn that
+ *               would outlive the settle signal. `result` ends one turn; the
+ *               process stays up for the next message.
  *
- * Steering is never an immediate interrupt. All four deliver at a step boundary
+ * Steering is never an immediate interrupt. All five deliver at a step boundary
  * (between tool calls), so a steer cannot cancel a bash command that is already
  * running — only change what the agent does next.
  */
@@ -71,6 +87,12 @@ export interface SessionDriver {
 	readonly argv: string[];
 	/** Whether the driver forwards cwd through the protocol rather than only inheriting it. */
 	readonly cwdForwardedToCli: boolean;
+	/**
+	 * Framing this driver speaks on stdin, for the dispatch receipt. Only the
+	 * Qoder stream-json driver names it; every JSON-RPC/JSONL driver keeps the
+	 * historical "jsonrpc" label.
+	 */
+	readonly stdinFormat?: "jsonrpc" | "stream-json";
 	/** Truncated stderr, same cap as the one-shot path. */
 	readonly stderr: string;
 	/** True while the session process is up and able to take a follow-up. */
@@ -1018,6 +1040,278 @@ class AcpDriver extends BaseSessionDriver implements SessionDriver {
 }
 
 // ---------------------------------------------------------------------------
+// qodercli --print --input-format stream-json --output-format stream-json
+// ---------------------------------------------------------------------------
+
+/**
+ * Handshake budget. The official SDK waits up to 120s for the `system`/`init`
+ * record (its INITIALIZE_TIMEOUT_MS), so a cold CLI start is not mistaken for a
+ * failure here either.
+ */
+const QODER_INIT_TIMEOUT_MS = 120_000;
+const QODER_CANCEL_TIMEOUT_MS = 5_000;
+
+interface QoderControlWaiter {
+	resolve: (response: any) => void;
+	timer: ReturnType<typeof setTimeout>;
+}
+
+/**
+ * The documented Qoder CLI streaming channel.
+ *
+ * Wire facts taken from the published `@qoder-ai/qoder-agent-sdk` (1.0.39) and
+ * the Qoder CLI docs, not guessed:
+ *
+ *   argv      the SDK's own buildArgs() spawns
+ *             `--print --output-format stream-json --input-format stream-json`
+ *             with NO positional prompt; the task arrives on stdin.
+ *   stdin     one JSON object per LF, exactly the SDKUserMessage the SDK
+ *             forwards (`transport.write(JSON.stringify(msg) + "\n")`). The
+ *             `uuid` the SDK stamps on every outbound message is reproduced
+ *             here so a steer stays individually identifiable.
+ *   stdout    one JSON object per LF, the same claude-family stream the
+ *             one-shot adapter already parses, including `system`/`init`.
+ *   control   `{type:"control_request", request_id, request}` inbound and
+ *             `{type:"control_response", response:{subtype, request_id, ...}}`
+ *             outbound. cancel is the SDK's `interrupt()` request; an inbound
+ *             `can_use_tool` is answered `deny` for readonly/write (the SDK
+ *             requires a deny to carry a `message`) and `allow` for yolo,
+ *             which is what bypass_permissions already means.
+ *
+ * Steering is the documented `priority: "next"` with `shouldQuery: false`:
+ * `next` is "the next suitable opportunity" (a step boundary, never an
+ * interrupt) and `shouldQuery: false` keeps the steer from being promoted into
+ * an independent turn, so a steer can never outlive the `result` that settles
+ * the turn it was injected into.
+ */
+class QoderStreamJsonDriver extends StdioProcess implements SessionDriver {
+	readonly cwdForwardedToCli = false;
+	readonly stdinFormat = "stream-json";
+
+	private readonly eventCbs: Array<(event: AgentEvent) => void> = [];
+	private readonly turnEndCbs: Array<(outcome: TurnOutcome) => void> = [];
+	private readonly controlWaiters = new Map<string, QoderControlWaiter>();
+	private active = false;
+	private cancelRequested = false;
+	private mode: Mode = "yolo";
+	private initResolve: (() => void) | undefined;
+	private initReject: ((err: Error) => void) | undefined;
+	private controlSeq = 0;
+	private uuidSeq = 0;
+
+	onEvent(cb: (event: AgentEvent) => void): void {
+		this.eventCbs.push(cb);
+	}
+
+	onTurnEnd(cb: (outcome: TurnOutcome) => void): void {
+		this.turnEndCbs.push(cb);
+	}
+
+	buildArgv(input: SessionStartInput): string[] {
+		// No positional prompt: `-p` plus stream-json input means the task is
+		// sent over stdin, which is what keeps the session alive between turns.
+		const argv = ["-p", "--output-format", "stream-json", "--input-format", "stream-json", ...qoderPermissionArgs(input.mode)];
+		if (input.model) argv.push("--model", input.model);
+		if (input.effort) argv.push("--reasoning-effort", input.effort);
+		return argv;
+	}
+
+	async start(input: SessionStartInput): Promise<void> {
+		this.mode = input.mode;
+		const init = new Promise<void>((resolve, reject) => {
+			this.initResolve = resolve;
+			this.initReject = reject;
+		});
+		const timer = setTimeout(() => {
+			this.initReject?.(new Error(`qoder stream-json: no system/init handshake within ${Math.round(QODER_INIT_TIMEOUT_MS / 1000)}s`));
+		}, QODER_INIT_TIMEOUT_MS);
+		timer.unref?.();
+		this.spawnProcess(ADAPTERS.qoder.bin, this.buildArgv(input), input.cwd);
+		try {
+			await init;
+		} finally {
+			clearTimeout(timer);
+			this.initResolve = undefined;
+			this.initReject = undefined;
+		}
+		this.markActive();
+		this.sendUserMessage(input.task);
+	}
+
+	async followUp(message: string): Promise<void> {
+		if (!this.alive) throw new Error("the qoder session process is gone");
+		if (this.active) throw new Error("a turn is still running; use external_agent_steer instead");
+		this.cancelRequested = false;
+		this.markActive();
+		this.sendUserMessage(message);
+	}
+
+	async steer(message: string): Promise<SteerResult> {
+		if (!this.active) return { accepted: false, reason: "no turn is currently running" };
+		if (!this.alive) return { accepted: false, reason: "the qoder session process is gone" };
+		this.sendUserMessage(message, { priority: "next", shouldQuery: false });
+		return {
+			accepted: true,
+			note: "priority next with shouldQuery false: injected at the next step boundary of the active turn, never an interrupt and never an independent turn",
+		};
+	}
+
+	async cancel(): Promise<void> {
+		if (!this.alive) return;
+		this.cancelRequested = true;
+		// Documented control request behind the SDK's interrupt(): stops the
+		// response without closing the session. Best effort — the caller still
+		// SIGTERMs as a backstop, and the turn settles when its result arrives.
+		await this.controlRequest({ type: "interrupt", subtype: "interrupt" }, QODER_CANCEL_TIMEOUT_MS).catch(() => undefined);
+	}
+
+	protected override onProcessExit(): void {
+		for (const [id, waiter] of this.controlWaiters) {
+			clearTimeout(waiter.timer);
+			waiter.resolve({ subtype: "error", error: this.spawnError ?? "session process exited" });
+			this.controlWaiters.delete(id);
+		}
+		this.initReject?.(new Error(this.spawnError ?? "the qoder session exited before the init handshake"));
+		this.settle({ status: "failed", error: this.spawnError ?? "the qoder session exited before the turn ended" });
+	}
+
+	protected handleLine(line: string): void {
+		let obj: any;
+		try {
+			obj = JSON.parse(line);
+		} catch {
+			return;
+		}
+		if (!obj || typeof obj !== "object") return;
+
+		if (obj.type === "system" && obj.subtype === "init") {
+			this.initResolve?.();
+			return;
+		}
+		if (obj.type === "control_request") {
+			this.handleControlRequest(obj);
+			return;
+		}
+		if (obj.type === "control_response") {
+			this.handleControlResponse(obj);
+			return;
+		}
+		if (obj.type === "control_cancel_request") return;
+
+		if (obj.type === "result") {
+			// One result per turn (the SDK consumes until an SDKResultMessage,
+			// and the docs say a Python receive_response() call is one turn).
+			// A result with no turn in flight is a stale record from a turn
+			// that was already settled, so it must not re-enter the answer.
+			if (!this.active) return;
+			// The adapter's own parser decides success vs. failure, so the
+			// outcome and the emitted error event can never disagree.
+			const event = ADAPTERS.qoder.parseEvent(line);
+			const cancelled = this.cancelRequested;
+			// A cancel we asked for must not also report Qoder's own
+			// interruption error: the turn was cancelled, not failed.
+			if (event && !(cancelled && event.kind === "error")) {
+				for (const cb of this.eventCbs) cb(event);
+			}
+			if (cancelled) {
+				this.settle({ status: "cancelled" });
+				return;
+			}
+			this.settle(event?.kind === "error" ? { status: "failed", error: event.text } : { status: "done" });
+			return;
+		}
+
+		const event = ADAPTERS.qoder.parseEvent(line);
+		if (event) for (const cb of this.eventCbs) cb(event);
+	}
+
+	/** A plain message opens/continues a turn; options turn it into a steer. */
+	private sendUserMessage(text: string, options?: { priority: "next"; shouldQuery: boolean }): void {
+		const message: Record<string, unknown> = {
+			type: "user",
+			message: { role: "user", content: [{ type: "text", text }] },
+			parent_tool_use_id: null,
+			uuid: `pi-${++this.uuidSeq}`,
+		};
+		if (options) {
+			message.priority = options.priority;
+			message.shouldQuery = options.shouldQuery;
+		}
+		this.writeLine(message);
+	}
+
+	private controlRequest(request: Record<string, unknown>, timeoutMs: number): Promise<any> {
+		const requestId = `q${++this.controlSeq}`;
+		return new Promise((resolve, reject) => {
+			if (!this.alive && this.spawnError) {
+				reject(new Error(this.spawnError));
+				return;
+			}
+			const timer = setTimeout(() => {
+				this.controlWaiters.delete(requestId);
+				reject(new Error(`control request "${String(request.subtype ?? request.type)}" timed out after ${Math.round(timeoutMs / 1000)}s`));
+			}, timeoutMs);
+			timer.unref?.();
+			this.controlWaiters.set(requestId, { resolve, timer });
+			this.writeLine({ type: "control_request", request_id: requestId, request });
+		});
+	}
+
+	private handleControlResponse(obj: any): void {
+		const response = obj.response;
+		const requestId = typeof response?.request_id === "string" ? response.request_id : undefined;
+		const waiter = requestId ? this.controlWaiters.get(requestId) : undefined;
+		if (!waiter || !requestId) return;
+		this.controlWaiters.delete(requestId);
+		clearTimeout(waiter.timer);
+		waiter.resolve(response);
+	}
+
+	/**
+	 * Answer every inbound control request. `can_use_tool` cannot normally
+	 * arrive — `--permission-prompt-tool` is never passed, so Qoder resolves
+	 * permissions itself — but if it does, a deny keeps the run fail-closed
+	 * instead of leaving the CLI blocked on a reply nobody sends.
+	 */
+	private handleControlRequest(obj: any): void {
+		const requestId = typeof obj.request_id === "string" ? obj.request_id : undefined;
+		if (!requestId) return;
+		const request = obj.request && typeof obj.request === "object" ? obj.request : {};
+		const subtype = typeof request.subtype === "string" ? request.subtype : typeof request.type === "string" ? request.type : "unknown";
+		if (subtype === "can_use_tool") {
+			// yolo is bypass_permissions, so nothing should reach here; if it
+			// does, keep the tier's meaning instead of silently tightening it.
+			// readonly/write are answered deny — never auto-allowed.
+			const response =
+				this.mode === "yolo"
+					? { behavior: "allow", updatedInput: request.input ?? {}, ...(typeof request.tool_use_id === "string" ? { toolUseID: request.tool_use_id } : {}) }
+					: {
+							behavior: "deny",
+							message: `${this.mode} mode does not auto-allow this tool, and pi-external-agent exposes no permission prompt channel.`,
+							...(typeof request.tool_use_id === "string" ? { toolUseID: request.tool_use_id } : {}),
+						};
+			this.writeLine({ type: "control_response", response: { subtype: "success", request_id: requestId, response } });
+			return;
+		}
+		this.writeLine({
+			type: "control_response",
+			response: { subtype: "error", request_id: requestId, error: `unsupported control request: ${subtype}` },
+		});
+	}
+
+	private markActive(): void {
+		this.active = true;
+	}
+
+	private settle(outcome: TurnOutcome): void {
+		if (!this.active) return;
+		this.active = false;
+		this.cancelRequested = false;
+		for (const cb of this.turnEndCbs) cb(outcome);
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Factories
 // ---------------------------------------------------------------------------
 
@@ -1056,17 +1350,9 @@ export const SESSION_DRIVERS: Partial<Record<AgentId, () => SessionDriver>> = {
 				return argv;
 			},
 		}),
-	qoder: () =>
-		new AcpDriver({
-			id: "qoder",
-			failClosedPermissionModes: ["readonly", "write"],
-			baseArgv: (input) => {
-				const argv = qoderPermissionArgs(input.mode);
-				if (input.model) argv.push("--model", input.model);
-				if (input.effort) argv.push("--reasoning-effort", input.effort);
-				return argv;
-			},
-		}),
+	// qoder is NOT ACP: see QoderStreamJsonDriver for why ACP's second
+	// session/prompt proves queueing rather than step-boundary steering.
+	qoder: () => new QoderStreamJsonDriver(),
 };
 
 export const SESSION_AGENT_IDS = Object.keys(SESSION_DRIVERS) as AgentId[];

@@ -1,7 +1,7 @@
 import { afterEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
-import { chmodSync, mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -43,11 +43,33 @@ hub.default({
 afterEach(() => lifecycle.get("session_shutdown")!({ reason: "quit" }));
 
 const QODER_HUB_MOCK = `#!/usr/bin/env node
+const fs = require("node:fs");
 const scenario = process.env.QODER_MOCK_SCENARIO ? JSON.parse(process.env.QODER_MOCK_SCENARIO) : {};
+const logFile = process.env.QODER_MOCK_LOG_FILE;
+function record(entry) { if (logFile) fs.appendFileSync(logFile, JSON.stringify(entry) + "\\n"); }
+function send(value) { process.stdout.write(JSON.stringify(value) + "\\n"); }
+send({ type: "system", subtype: "init", protocol_version: "1.4.0", capabilities: [], commands: [],
+  session_id: "sess-" + Date.now(), model: "auto", permissionMode: "bypass_permissions" });
 let buffer = "";
 let index = 0;
-const held = new Map();
-function send(value) { process.stdout.write(JSON.stringify(value) + "\\n"); }
+const heldForSteer = new Map();
+const heldForInterrupt = new Map();
+function finish(turnIndex, plan) {
+  for (const text of plan.chunks || []) {
+    send({ type: "assistant", message: { model: "auto", content: [{ type: "text", text }] }, parent_tool_use_id: null });
+  }
+  const text = plan.answer !== undefined ? plan.answer : (plan.chunks || []).join(" ");
+  send({ type: "result", subtype: "success", is_error: false, result: text || "OK", duration_ms: 1, duration_api_ms: 1,
+    num_turns: 1, stop_reason: "end_turn", total_cost_usd: 0, usage: {}, modelUsage: {}, permission_denials: [],
+    uuid: "r" + turnIndex, session_id: "sess-1" });
+}
+function runTurn() {
+  const turnIndex = index++;
+  const plan = (scenario.turns || [])[turnIndex] || { answer: "OK" };
+  if (plan.completeOnSteer) { heldForSteer.set("s" + turnIndex, { turnIndex: turnIndex, plan: plan }); return; }
+  if (plan.hold) { heldForInterrupt.set("c" + turnIndex, { turnIndex: turnIndex, plan: plan }); return; }
+  finish(turnIndex, plan);
+}
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => {
 	buffer += chunk;
@@ -57,21 +79,32 @@ process.stdin.on("data", (chunk) => {
 		if (!line.trim()) continue;
 		let msg;
 		try { msg = JSON.parse(line); } catch { continue; }
-		if (msg.method === "initialize") {
-			send({ jsonrpc: "2.0", id: msg.id, result: { agentCapabilities: { _meta: {} } } });
-		} else if (msg.method === "session/new") {
-			send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "sess-" + Date.now() } });
-		} else if (msg.method === "session/prompt") {
-			const plan = (scenario.prompts || [])[index] || { chunks: ["OK"] };
-			const current = index++;
-			const finish = () => {
-				for (const text of plan.chunks || []) {
-					send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: msg.params.sessionId, update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } } });
-				}
-				send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: plan.stopReason || "end_turn", _meta: {} } });
-				if (plan.exit !== undefined) setTimeout(() => process.exit(plan.exit), 100);
-			};
-			if (plan.hold) held.set(current, finish); else finish();
+		if (msg.type === "user") {
+			const parts = msg.message && Array.isArray(msg.message.content) ? msg.message.content : [];
+			const text = parts.map(function (b) { return b.text || ""; }).join("");
+			const steer = msg.shouldQuery === false;
+			record({ kind: steer ? "steer" : "turn-input", text: text, priority: msg.priority, shouldQuery: msg.shouldQuery });
+			if (steer) {
+				const held = Array.from(heldForSteer.values());
+				heldForSteer.clear();
+				for (const entry of held) finish(entry.turnIndex, entry.plan);
+			} else {
+				runTurn();
+			}
+			continue;
+		}
+		if (msg.type === "control_request") {
+			const subtype = msg.request && (msg.request.subtype || msg.request.type);
+			record({ kind: "control-request", subtype: subtype });
+			if (subtype === "interrupt") {
+				send({ type: "control_response", response: { subtype: "success", request_id: msg.request_id, response: { still_queued: [] } } });
+				const held = Array.from(heldForInterrupt.values());
+				heldForInterrupt.clear();
+				for (const entry of held) finish(entry.turnIndex, entry.plan);
+			} else {
+				send({ type: "control_response", response: { subtype: "error", request_id: msg.request_id, error: "unsupported" } });
+			}
+			continue;
 		}
 	}
 });
@@ -120,10 +153,26 @@ async function startQoder(dir: string, extra: Record<string, unknown> = {}): Pro
 	return await call("external_agent_start", { agent: "qoder", task: "do the thing", mode: "yolo", cwd: dir, notify: "off", ...extra });
 }
 
+/** Read a mock's JSONL log, tolerating a file that does not exist yet. */
+function mockLog(file: string): any[] {
+	if (!existsSync(file)) return [];
+	const text = readFileSync(file, "utf8").trim();
+	return text ? text.split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
+}
+
+async function waitForLog(file: string, predicate: (lines: any[]) => boolean, label: string, timeoutMs = 8_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		if (predicate(mockLog(file))) return;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	throw new Error(`timed out waiting for ${label}`);
+}
+
 test("hub: qoder start/wait/status expose a settled receipt, answer, and omitted effort", async () => {
 	const dir = makeFixtureDir({ qodercli: QODER_HUB_MOCK });
 	const restorePath = usePath(dir);
-	const restoreScenario = withEnv({ QODER_MOCK_SCENARIO: JSON.stringify({ prompts: [{ chunks: ["ANSWER-1"], exit: 0 }] }) });
+	const restoreScenario = withEnv({ QODER_MOCK_SCENARIO: JSON.stringify({ turns: [{ chunks: ["ANSWER-1"], answer: "ANSWER-1" }] }) });
 	try {
 		const started = await startQoder(dir, { mode: "readonly" });
 		assert.equal(started.details.kind, "external-agent-start");
@@ -143,7 +192,9 @@ test("hub: qoder start/wait/status expose a settled receipt, answer, and omitted
 		assert.match(status.content[0].text, new RegExp(taskId));
 		assert.equal(status.details.task.state, "done");
 		assert.match(status.details.task.dispatch.effectivePolicy, /dont_ask.*disableAllHooks/);
-		assert.equal(status.details.task.dispatch.argv[0], "--acp");
+		assert.equal(status.details.task.dispatch.stdin, "stream-json");
+		assert.deepEqual(status.details.task.dispatch.argv.slice(0, 5), ["-p", "--output-format", "stream-json", "--input-format", "stream-json"]);
+		assert.equal(status.details.task.dispatch.argv.includes("--acp"), false);
 		assert.equal(status.details.task.dispatch.argv.includes("--reasoning-effort"), false);
 	} finally {
 		await call("external_agent_stop", { all: true });
@@ -156,7 +207,7 @@ test("hub: qoder follow-up continues the settled session", async () => {
 	const dir = makeFixtureDir({ qodercli: QODER_HUB_MOCK });
 	const restorePath = usePath(dir);
 	const restoreScenario = withEnv({
-		QODER_MOCK_SCENARIO: JSON.stringify({ prompts: [{ chunks: ["FIRST"] }, { chunks: ["SECOND"], exit: 0 }] }),
+		QODER_MOCK_SCENARIO: JSON.stringify({ turns: [{ answer: "FIRST" }, { chunks: ["ignored"], answer: "SECOND" }] }),
 	});
 	try {
 		const started = await startQoder(dir, { mode: "readonly" });
@@ -178,16 +229,35 @@ test("hub: qoder follow-up continues the settled session", async () => {
 	}
 });
 
-test("hub: qoder steer is refused for a follow-up-only agent", async () => {
+test("hub: qoder steer reaches the running session at the next step boundary", async () => {
 	const dir = makeFixtureDir({ qodercli: QODER_HUB_MOCK });
 	const restorePath = usePath(dir);
-	const restoreScenario = withEnv({ QODER_MOCK_SCENARIO: JSON.stringify({ prompts: [{ hold: true }] }) });
+	const logFile = path.join(dir, "log.jsonl");
+	// The turn only finishes once the steer lands, so the answer proves the
+	// steer was injected into the active turn rather than queued behind it.
+	const restoreScenario = withEnv({
+		QODER_MOCK_SCENARIO: JSON.stringify({ turns: [{ chunks: ["WORKING"], answer: "STEERED", completeOnSteer: true }] }),
+		QODER_MOCK_LOG_FILE: logFile,
+	});
 	try {
 		const started = await startQoder(dir);
 		const taskId = started.details.task.taskId;
+		// The session handshake and first turn start asynchronously, so wait for
+		// the turn to reach the CLI before steering it.
+		await waitForLog(logFile, (lines) => lines.some((entry) => entry.kind === "turn-input"), "the first turn to start");
+
 		const steered = await call("external_agent_steer", { taskId, message: "change course" });
-		assert.equal(steered.details.steered, false);
-		assert.match(steered.content[0].text, /does not support mid-run steering/i);
+		assert.equal(steered.details.steered, true);
+		assert.match(steered.details.note, /priority next/);
+
+		const waited = await call("external_agent_wait", { taskIds: [taskId], timeout: 5 });
+		assert.match(waited.content[0].text, /STEERED/);
+
+		const steer = mockLog(logFile).find((entry) => entry.kind === "steer");
+		assert.ok(steer, "steer reached the session");
+		assert.equal(steer.priority, "next");
+		assert.equal(steer.shouldQuery, false);
+		assert.equal(steer.text, "change course");
 	} finally {
 		await call("external_agent_stop", { all: true });
 		restoreScenario();
@@ -195,17 +265,17 @@ test("hub: qoder steer is refused for a follow-up-only agent", async () => {
 	}
 });
 
-test("hub: running qoder follow-up does not suggest unsupported steer", async () => {
+test("hub: running qoder follow-up points at the supported steer", async () => {
 	const dir = makeFixtureDir({ qodercli: QODER_HUB_MOCK });
 	const restorePath = usePath(dir);
-	const restoreScenario = withEnv({ QODER_MOCK_SCENARIO: JSON.stringify({ prompts: [{ hold: true }] }) });
+	const restoreScenario = withEnv({ QODER_MOCK_SCENARIO: JSON.stringify({ turns: [{ hold: true }] }) });
 	try {
 		const started = await startQoder(dir);
 		const taskId = started.details.task.taskId;
 		const followed = await call("external_agent_follow_up", { taskId, message: "second question" });
 		assert.equal(followed.details.continued, false);
 		const text = followed.content[0].text;
-		assert.doesNotMatch(text, /external_agent_steer/);
+		assert.match(text, /external_agent_steer/);
 		assert.match(text, /still running/i);
 	} finally {
 		await call("external_agent_stop", { all: true });
@@ -233,7 +303,7 @@ test("hub: one-shot task follow-up is refused", async () => {
 test("hub: stop terminates a running qoder task", async () => {
 	const dir = makeFixtureDir({ qodercli: QODER_HUB_MOCK });
 	const restorePath = usePath(dir);
-	const restoreScenario = withEnv({ QODER_MOCK_SCENARIO: JSON.stringify({ prompts: [{ hold: true }] }) });
+	const restoreScenario = withEnv({ QODER_MOCK_SCENARIO: JSON.stringify({ turns: [{ hold: true }] }) });
 	try {
 		const started = await startQoder(dir);
 		const taskId = started.details.task.taskId;
@@ -250,7 +320,7 @@ test("hub: stop terminates a running qoder task", async () => {
 test("hub: unsupported qoder effort minimal is refused and explicit high is forwarded", async () => {
 	const dir = makeFixtureDir({ qodercli: QODER_HUB_MOCK });
 	const restorePath = usePath(dir);
-	const restoreScenario = withEnv({ QODER_MOCK_SCENARIO: JSON.stringify({ prompts: [{ chunks: ["OK"], exit: 0 }] }) });
+	const restoreScenario = withEnv({ QODER_MOCK_SCENARIO: JSON.stringify({ turns: [{ answer: "OK" }] }) });
 	try {
 		const refused = await startQoder(dir, { mode: "readonly", effort: "minimal" });
 		assert.equal(refused.details.refused, true);

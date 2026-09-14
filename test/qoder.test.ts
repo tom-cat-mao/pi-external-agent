@@ -10,16 +10,17 @@ test("qoder adapter basics", () => {
 	assert.equal(a.defaultMode, "yolo");
 	assert.equal(a.maxMode, "yolo");
 	assert.equal(a.enforcesReadOnly, true);
-	assert.equal(a.session?.steer, false);
+	assert.equal(a.session?.steer, true);
 	assert.equal(a.session?.followUp, true);
+	assert.match(a.session?.steerNote ?? "", /priority "next"/);
 	assert.deepEqual(a.supportedEfforts, ["off", "low", "medium", "high", "xhigh", "max"]);
 	assert.equal((a.supportedEfforts as readonly string[]).includes("minimal"), false);
 	assert.match(a.sessionPolicy!("readonly"), /dont_ask/);
 	assert.match(a.sessionPolicy!("write"), /accept_edits/);
 });
 
-test("qoder is follow-up only in the capability lists", () => {
-	assert.equal(STEER_AGENT_IDS.includes("qoder"), false);
+test("qoder is steerable and follow-up capable in the capability lists", () => {
+	assert.equal(STEER_AGENT_IDS.includes("qoder"), true);
 	assert.equal(FOLLOWUP_AGENT_IDS.includes("qoder"), true);
 	assert.equal(STEER_AGENT_IDS.includes("codebuddy"), true);
 	assert.equal(FOLLOWUP_AGENT_IDS.includes("codebuddy"), true);
@@ -83,10 +84,13 @@ test("qoder parser: init noise, assistant text skip, tool_use, result, error", (
 	assert.equal(parse("not json"), null);
 });
 
-test("qoder ACP session driver argv", () => {
+test("qoder session driver argv is the documented stream-json channel, not ACP", () => {
 	const driver = SESSION_DRIVERS.qoder!();
+	assert.equal(driver.stdinFormat, "stream-json");
 	const ro = driver.buildArgv({ task: "t", cwd: "/tmp", mode: "readonly", model: "lite", effort: "high" });
-	assert.equal(ro[0], "--acp");
+	assert.deepEqual(ro.slice(0, 5), ["-p", "--output-format", "stream-json", "--input-format", "stream-json"]);
+	assert.equal(ro.includes("--acp"), false);
+	assert.equal(ro.includes("t"), false);
 	assert.equal(ro[ro.indexOf("--permission-mode") + 1], "dont_ask");
 	assert.equal(ro[ro.indexOf("--tools") + 1], "Read,Grep,Glob,WebSearch,WebFetch");
 	assert.equal(ro[ro.indexOf("--disallowed-tools") + 1], "mcp__*,Agent");
@@ -110,34 +114,29 @@ test("qoderPermissionArgs mode mapping", () => {
 	assert.deepEqual(qoderPermissionArgs("yolo"), ["--permission-mode", "bypass_permissions"]);
 });
 
-test("qoder ACP permission requests fail closed for readonly and write", () => {
+test("qoder steer message: priority next with shouldQuery false, never now; follow-up is a plain new turn", async () => {
 	const driver = SESSION_DRIVERS.qoder!() as any;
-	assert.deepEqual(driver.dialect.failClosedPermissionModes, ["readonly", "write"]);
-	const calls: any[] = [];
-	driver.respond = (id: number, result: unknown) => calls.push({ id, result });
-	driver.respondError = (id: number, message: string) => calls.push({ id, error: message });
-	const request = (id: number, options: unknown[]) => {
-		driver.autoPermission = "reject";
-		driver.handleRequest({ id, method: "session/request_permission", params: { options } });
-		return calls[calls.length - 1];
-	};
+	const sent: any[] = [];
+	driver.writeLine = (obj: unknown) => sent.push(obj);
+	driver.active = true;
+	driver.proc = { stdin: {} };
 
-	assert.equal(request(1, [{ optionId: "allow_once", kind: "allow_once" }]).result.outcome.outcome, "cancelled");
-	const decoy = request(2, [{ optionId: "never_reject", kind: "allow_once" }]);
-	assert.equal(decoy.result.outcome.outcome, "cancelled");
-	assert.equal(decoy.result.outcome.optionId, undefined);
-	assert.equal(request(3, [{ optionId: "reject_once" }]).result.outcome.outcome, "cancelled");
-	assert.equal(request(4, [{ kind: "reject_once" }]).result.outcome.outcome, "cancelled");
-	assert.equal(request(5, [{ optionId: "", kind: "reject_once" }]).result.outcome.outcome, "cancelled");
-	assert.equal(request(6, [{}]).result.outcome.outcome, "cancelled");
-	assert.equal(request(7, [{ optionId: "reject_once", kind: "reject_once" }]).result.outcome.optionId, "reject_once");
-	assert.equal(request(8, [{ optionId: "reject_always", kind: "reject_always" }]).result.outcome.optionId, "reject_always");
+	const steered = await driver.steer("focus on the failing tests");
+	assert.equal(steered.accepted, true);
+	assert.equal(sent.length, 1);
+	assert.equal(sent[0].type, "user");
+	assert.equal(sent[0].priority, "next");
+	assert.equal(sent[0].shouldQuery, false);
+	assert.notEqual(sent[0].priority, "now");
+	assert.equal(sent[0].parent_tool_use_id, null);
+	assert.equal(sent[0].message.role, "user");
+	assert.equal(sent[0].message.content[0].text, "focus on the failing tests");
+	assert.equal(typeof sent[0].uuid, "string");
 
-	driver.autoPermission = "allow";
-	driver.handleRequest({
-		id: 9,
-		method: "session/request_permission",
-		params: { options: [{ optionId: "allow_once", kind: "allow_once" }] },
-	});
-	assert.equal(calls[calls.length - 1].result.outcome.optionId, "allow_once");
+	driver.active = false;
+	await driver.followUp("plain follow-up");
+	assert.equal(sent.length, 2);
+	assert.equal(sent[1].priority, undefined);
+	assert.equal(sent[1].shouldQuery, undefined);
+	assert.equal(sent[1].message.content[0].text, "plain follow-up");
 });

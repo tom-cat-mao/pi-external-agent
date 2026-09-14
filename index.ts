@@ -75,8 +75,8 @@ interface DispatchReceipt {
 	prompt: string;
 	cwd: string;
 	cwdForwardedToCli: boolean;
-	/** oneshot ignores stdin; persistent holds a live JSON-RPC channel on it. */
-	stdin: "ignored" | "jsonrpc";
+	/** oneshot ignores stdin; persistent holds a live protocol channel on it. */
+	stdin: "ignored" | "jsonrpc" | "stream-json";
 	shell: false;
 	agent: AgentId;
 	provider: string;
@@ -320,7 +320,7 @@ function dispatchSummary(receipt: DispatchReceipt, taskId?: string): string[] {
 		`watchdog: ${receipt.watchdogMs > 0 ? `stall notice after ${fmtDuration(receipt.watchdogMs)} quiet` : "disabled"} (Pi-only)`,
 		`environment: ${escapeTerminalControls(receipt.environment)}`,
 		persistent
-			? `stdio: stdin jsonrpc (bidirectional session); stdout/stderr piped; prompt sent over the protocol`
+			? `stdio: stdin ${receipt.stdin} (bidirectional session); stdout/stderr piped; prompt sent over the protocol`
 			: `stdio: stdin ${receipt.stdin}; stdout/stderr piped; shell ${receipt.shell ? "true" : "false"}`,
 	];
 	if (taskId) lines.unshift(`task id: ${escapeTerminalControls(taskId)}`);
@@ -651,7 +651,7 @@ function startPersistentTask(
 		prompt: taskText,
 		cwd,
 		cwdForwardedToCli: driver.cwdForwardedToCli,
-		stdin: "jsonrpc",
+		stdin: driver.stdinFormat ?? "jsonrpc",
 		shell: false,
 		agent,
 		provider: adapter.provider,
@@ -1027,7 +1027,7 @@ function isDispatchReceipt(value: unknown): value is DispatchReceipt {
 		typeof receipt.prompt === "string" &&
 		typeof receipt.cwd === "string" &&
 		typeof receipt.cwdForwardedToCli === "boolean" &&
-		(receipt.stdin === "ignored" || receipt.stdin === "jsonrpc") &&
+		(receipt.stdin === "ignored" || receipt.stdin === "jsonrpc" || receipt.stdin === "stream-json") &&
 		receipt.shell === false &&
 		typeof receipt.provider === "string" &&
 		typeof receipt.promptArgIndex === "number" &&
@@ -1165,7 +1165,7 @@ function receiptFromStartArgs(args: Record<string, unknown>, fallbackCwd: string
 			prompt: task,
 			cwd,
 			cwdForwardedToCli: driver.cwdForwardedToCli,
-			stdin: "jsonrpc",
+			stdin: driver.stdinFormat ?? "jsonrpc",
 			shell: false,
 			agent,
 			provider: adapter.provider,
@@ -1303,15 +1303,15 @@ export default function (pi: ExtensionAPI) {
 			"Each call is a fresh session for the other agent: it sees no pi conversation history, so the task text",
 			"must be self-contained (state the goal, name the files, say what to return).",
 			`pi, codex, reasonix, codebuddy and qoder run as persistent sessions: their conversation survives the answer, so`,
-			"you can continue the same session afterwards (external_agent_follow_up). pi, codex, reasonix and codebuddy can",
-			"additionally be steered mid-run (external_agent_steer); qoder is follow-up only. The others are one-shot with no way back in.",
+			"you can continue the same session afterwards (external_agent_follow_up), and all five can additionally be steered",
+			"mid-run (external_agent_steer). The others are one-shot with no way back in.",
 		].join(" "),
 		promptSnippet: "Delegate a task to an external coding agent CLI (codex, qoder, kimi, codebuddy, claude, reasonix)",
 		promptGuidelines: [
 			"Use external_agent_start with codex, pi, or kimi for code-writing and execution tasks; they run unsandboxed (yolo) by default. Pick pi when a specific model should do the work — the model parameter is forwarded to the child pi (e.g. deepseek-v4-flash). Kimi is yolo-only: readonly/write requests are refused — use codebuddy, qoder or claude for read-only exploration.",
 			"Use external_agent_start with reasonix when a DeepSeek-native harness (not a codex/pi fork) should attempt or review the work; its yolo stays bounded by deny rules and the OS bash sandbox.",
 			"Use external_agent_start with codebuddy for fast repository exploration that may turn into execution — it leans toward codebase understanding but runs yolo (bypassPermissions) by default like codex.",
-			"Use external_agent_start with qoder for an independent executor or reviewer on the Qoder CLI; all tiers are open and yolo is the default like codex, its readonly tier is harness-enforced by dont_ask plus a built-in tool allowlist, and it supports same-session follow-up but not mid-run steering.",
+			"Use external_agent_start with qoder for an independent executor or reviewer on the Qoder CLI; all tiers are open and yolo is the default like codex, its readonly tier is harness-enforced by dont_ask plus a built-in tool allowlist, and it supports same-session follow-up plus mid-run steering over Qoder's documented stream-json input channel.",
 			"Use external_agent_start when a second model's opinion is worth more than another pass by yourself, or when the user explicitly asks for a specific agent such as codex.",
 			"Prefer asking two different agents the same question and comparing their answers over chaining agents in a pipeline; disagreement is the useful signal.",
 			"Treat any external agent's answer as a claim, not verified fact: check its conclusions against the code yourself before acting on them.",
@@ -1772,7 +1772,7 @@ export default function (pi: ExtensionAPI) {
 			"call that is already executing finishes and before the next model call — so a long-running bash command",
 			"still completes. Use it to correct the approach, narrow the scope, add a constraint, or tell the agent to",
 			"wrap up early; do not expect it to cancel work in flight (use external_agent_stop for that).",
-			`Supported agents: ${STEER_AGENTS}. qoder is persistent but supports follow-up only, and other agents run as one-shot processes; neither can be steered.`,
+			`Supported agents: ${STEER_AGENTS}. The remaining agents run as one-shot processes and cannot be steered.`,
 			"Requires the task to still be running; for a task that has already settled, use external_agent_follow_up.",
 		].join(" "),
 		promptSnippet: "Redirect a running external agent task at its next step boundary",

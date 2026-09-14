@@ -16,7 +16,7 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
 
 Requires pi ≥ 0.85 and whichever agent CLIs you want to drive (they don't all need to be installed).
 
-For the Qoder agent, install the Qoder CLI (`qodercli`) and make sure it is on `PATH` and signed in (`qodercli login`). This integration is tested against qodercli 1.0.18; official references: [Run in Scripts](https://docs.qoder.com/cli/run-in-scripts), [Permissions](https://docs.qoder.com/cli/permissions), [ACP](https://docs.qoder.com/cli/acp) and the [Settings reference](https://docs.qoder.com/cli/settings-reference).
+For the Qoder agent, install the Qoder CLI (`qodercli`) and make sure it is on `PATH` and signed in (`qodercli login`). This integration is tested against qodercli 1.0.18; official references: [Input Modes](https://docs.qoder.com/cli/sdk/input-modes) (the streaming `priority` / `shouldQuery` contract), [Run in Scripts](https://docs.qoder.com/cli/run-in-scripts) (`--input-format stream-json`), [Permissions](https://docs.qoder.com/cli/permissions), the [CLI reference](https://docs.qoder.com/cli/cli-reference) and the [Settings reference](https://docs.qoder.com/cli/settings-reference). The wire shapes were cross-checked against the published [`@qoder-ai/qoder-agent-sdk`](https://www.npmjs.com/package/@qoder-ai/qoder-agent-sdk) 1.0.39.
 
 ## Tools
 
@@ -37,7 +37,7 @@ For the Qoder agent, install the Qoder CLI (`qodercli`) and make sure it is on `
 | `pi` | pi itself (child process) | yolo | Executor with fully configurable `--model` | ✅ via `--mode rpc` |
 | `reasonix` | DeepSeek-native | yolo (deny rules + OS sandbox still apply) | Executor / reviewer | ✅ via ACP vendor extension |
 | `codebuddy` | Tencent | yolo | Fast executor / repo exploration | ✅ via ACP step-boundary injection |
-| `qoder` | Alibaba | yolo | Executor / independent reviewer | follow-up ✅ via `--acp`; steer ❌ (queueing only, not verified) |
+| `qoder` | Alibaba | yolo | Executor / independent reviewer | ✅ via `--input-format stream-json` (`priority: next`) |
 | `kimi` | Moonshot | yolo only (its headless mode rejects permission flags) | Executor | ❌ |
 | `claude` | Anthropic | readonly | Analysis / planning | ❌ |
 
@@ -47,7 +47,7 @@ For the Qoder agent, install the Qoder CLI (`qodercli`) and make sure it is on `
 
 - **No hard timeout**: tasks run to completion. A stall watchdog (default 15m quiet) notifies the host model, which decides whether to stop the task. `external_agent_wait` exists for when you need the answer inside the current turn.
 
-- **Persistent sessions mean follow-up**: for agents with a session transport, completion means the turn ended, not that the process exited. The process stays alive for 30 minutes, which is what lets `external_agent_follow_up` ask a second question with the full conversation intact. Mid-run steering is a separate capability: `codex`, `pi`, `reasonix` and `codebuddy` support it too, while `qoder` is follow-up only.
+- **Persistent sessions mean follow-up**: for agents with a session transport, completion means the turn ended, not that the process exited. The process stays alive for 30 minutes, which is what lets `external_agent_follow_up` ask a second question with the full conversation intact. Mid-run steering is a separate capability that all five session agents (`codex`, `pi`, `reasonix`, `codebuddy`, `qoder`) support.
 
 - **Honest receipts**: every dispatch returns a receipt recording the exact argv, effective permission policy, and whether model/effort overrides were actually forwarded — unsupported overrides are reported as not forwarded instead of silently dropped.
 
@@ -57,7 +57,9 @@ For the Qoder agent, install the Qoder CLI (`qodercli`) and make sure it is on `
 
 - **Qoder `readonly` enforcement**: `--permission-mode dont_ask` (any operation that would prompt is denied in headless mode), a built-in tool allowlist (`--tools Read,Grep,Glob,WebSearch,WebFetch`), `--disallowed-tools mcp__*,Agent`, `--strict-mcp-config` with an empty server list, and a per-invocation `--settings {"disableAllHooks":true}` that disables user, project, local and plugin hooks — so a hook cannot short-circuit the pipeline. Edits, shell/Bash, MCP tools and subagent launches are thus refused by Qoder itself. Verified on qodercli 1.0.18: a readonly run refused to create a fixture file.
 
-- **Qoder `write` / `yolo`**: `write` maps to `--permission-mode accept_edits` (in-directory edits auto-approved; every ACP permission request is answered reject, or cancelled when no reject option exists — it is never auto-allowed) and `yolo` to `bypass_permissions`. Both inherit Qoder's configured permission rules and hooks and are **not** an OS sandbox. Non-default modes only take effect in a trusted startup directory; otherwise Qoder falls back to `default` (where headless asks are denied). Verified on qodercli 1.0.18: `accept_edits` created a fixture file.
+- **Qoder `write` / `yolo`**: `write` maps to `--permission-mode accept_edits` (in-directory edits auto-approved; every other operation that would prompt is refused, never auto-allowed) and `yolo` to `bypass_permissions`. Both inherit Qoder's configured permission rules and hooks and are **not** an OS sandbox. Non-default modes only take effect in a trusted startup directory; otherwise Qoder falls back to `default` (where headless asks are denied). Verified on qodercli 1.0.18: `accept_edits` created a fixture file.
+
+- **Qoder steering and its transport**: Qoder is driven over its documented streaming input channel — `qodercli -p --output-format stream-json --input-format stream-json`, the exact argv the official SDK builds — instead of `--acp`. The ACP page documents only editor integration and exposes no steering metadata there, so a second `session/prompt` under ACP would prove queueing, not step-boundary steering. A steer is one user message with `priority: "next"` (the documented "next suitable opportunity", i.e. a step boundary) and `shouldQuery: false` (the message joins the active turn without starting a turn of its own). That combination means a steer can never be promoted into an independent turn, so it can never outlive the `result` that settles the turn it was injected into — no early settle, no duplicate answer and no late stray response. `priority: "now"` (an interrupt) is deliberately never used for steering. Cancelling uses the SDK's documented `interrupt` control request; any inbound `can_use_tool` control request is answered with a fail-closed `deny` rather than being ignored.
 
 Per-CLI compatibility notes live as comments in `adapters.ts` and in the `effective policy` line of each dispatch receipt.
 
