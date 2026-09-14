@@ -161,8 +161,11 @@ abstract class StdioProcess {
 			if (this.stderrText.length < MAX_STDERR_CHARS) this.stderrText += chunk;
 		});
 
-		const ignoreClosedStdin = () => undefined;
-		proc.stdin?.on("error", ignoreClosedStdin);
+		proc.stdin?.on("error", (err) => {
+			this.spawnErrorMessage = `stdin: ${err.message}`;
+			this.kill();
+			this.finishExit(null);
+		});
 
 		proc.on("error", (err) => {
 			this.spawnErrorMessage = err.message;
