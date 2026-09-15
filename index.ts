@@ -15,8 +15,10 @@
  *
  *    Waiting itself has two supported shapes: end the turn and let settle/stall
  *    notifications re-invoke the model (default), or block inside the turn with
- *    external_agent_wait when the result is needed immediately. Sleep-polling
- *    is an anti-pattern both shapes exist to replace.
+ *    external_agent_wait when the result is needed immediately. A third,
+ *    external_agent_compare, blocks on the same task handed to several agents at
+ *    once and returns their answers side by side without judging them.
+ *    Sleep-polling is an anti-pattern all of them exist to replace.
  *
  * 2. Per-agent permission defaults, enforced by the *target* harness rather than
  *    by a prompt request. codex/pi are the workhorses and default to yolo
@@ -165,6 +167,37 @@ type ExternalAgentWaitDetails =
 		}
 	| Record<string, never>;
 
+/**
+ * One slot of a compare run, in request order. A refused spec never reaches
+ * dispatch and therefore has no taskId/state; every other field mirrors what a
+ * start receipt would have carried for that agent.
+ */
+interface CompareResult {
+	/** Position in the requested `agents` array, so results line up with inputs. */
+	index: number;
+	agent: string;
+	refused: boolean;
+	/** Refusal reason, or the failure detail of a dispatched task that did not answer. */
+	reason?: string;
+	taskId?: string;
+	state?: TaskState;
+	mode?: Mode;
+	cwd?: string;
+	/** Final answer text, trimmed like external_agent_wait does. */
+	answer?: string;
+	/** True when `answer` was cut at the preview bound. */
+	answerTruncated?: boolean;
+	/** The same honest-receipt payload a start call returns, for inspection. */
+	dispatch?: DispatchReceipt;
+}
+
+interface ExternalAgentCompareDetails {
+	kind: "external-agent-compare";
+	timedOut: boolean;
+	aborted: boolean;
+	results: CompareResult[];
+}
+
 interface ExternalAgentSteerDetails {
 	steered: boolean;
 	taskId?: string;
@@ -220,6 +253,15 @@ const MAX_WATCHDOG_NOTICES = 3; // per quiet streak; then it stays silent
 const WAIT_DEFAULT_TIMEOUT_S = 600;
 const WAIT_MAX_TIMEOUT_S = 3_600;
 const WAIT_ANSWER_PREVIEW_CHARS = 8_000;
+/** Compare bounds: below two there is nothing to compare, and each spec costs a process. */
+const COMPARE_MIN_AGENTS = 2;
+const COMPARE_MAX_AGENTS = 8;
+/**
+ * Compare blocks inside the turn, so its cost to the caller is pure latency and
+ * the scan is tighter than external_agent_wait's 2s one (that one is sized for a
+ * 10-minute wait): a batch that settles in 200ms should not report at 2s.
+ */
+const COMPARE_POLL_INTERVAL_MS = 500;
 /**
  * How long a settled persistent session is kept alive for a follow-up. The
  * process is the conversation: once it is gone, a follow-up would be a cold
@@ -939,6 +981,84 @@ function stopTask(task: Task): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Dispatch validation
+// ---------------------------------------------------------------------------
+
+type DispatchCheck = { ok: true } | { ok: false; reason: string };
+
+/**
+ * The refusal path every dispatch goes through, shared by external_agent_start
+ * and external_agent_compare so both refuse identically and for the same
+ * reasons — a compare spec must never be a way around a start-time guard.
+ *
+ * All three checks are fail-closed: a mode below the adapter's floor (kimi) has
+ * no enforcement behind it, a mode above its ceiling has nothing to bound it,
+ * and an effort override the target cannot forward would mislead the caller
+ * about the run's cost. The last check is the directory conflict: two mutating
+ * agents in one directory change files in ways neither the model nor the other
+ * agent can observe.
+ */
+function validateDispatch(agent: AgentId, mode: Mode, cwd: string, effort: Effort | undefined): DispatchCheck {
+	const adapter = ADAPTERS[agent];
+
+	// Fail closed below the adapter's floor too: an adapter with minMode
+	// (kimi) has no lower tier at all — accepting one would be a label
+	// with no enforcement behind it.
+	const minMode = adapter.minMode ?? "readonly";
+	if (MODE_RANK[mode] < MODE_RANK[minMode]) {
+		return {
+			ok: false,
+			reason:
+				`${agent} is ${minMode}-only (requested "${mode}"). ` +
+				`Pick an agent with a lower tier (${AGENT_IDS.filter((i) => (ADAPTERS[i].minMode ?? "readonly") === "readonly").join(", ")}).`,
+		};
+	}
+
+	// Fail closed: never exceed the adapter's mode ceiling. kimi's ceiling is
+	// read-only precisely because its harness has no sandbox to bound writes.
+	if (MODE_RANK[mode] > MODE_RANK[adapter.maxMode]) {
+		const reason = !adapter.enforcesReadOnly
+			? `${agent} has no harness-enforced sandbox, so ${mode} mode cannot be bounded. ` +
+				`Run it read-only and apply changes yourself, or pick an agent that enforces read-only ` +
+				`(${AGENT_IDS.filter((i) => ADAPTERS[i].enforcesReadOnly).join(", ")}).`
+			: `${agent} is capped at "${adapter.maxMode}" mode (requested "${mode}").`;
+		return { ok: false, reason };
+	}
+
+	// Effort is advisory only where the adapter has a real flag for it; a
+	// silently dropped override would mislead the caller about the run's cost.
+	if (effort) {
+		const supported = adapter.supportedEfforts;
+		if (!supported) {
+			return {
+				ok: false,
+				reason:
+					`${agent} has no reasoning-effort control. Drop the effort parameter or pick an agent ` +
+					`that supports one (${AGENT_IDS.filter((i) => ADAPTERS[i].supportedEfforts).join(", ")}).`,
+			};
+		}
+		if (!supported.includes(effort)) {
+			return { ok: false, reason: `${agent} supports effort levels ${supported.join(", ")} (requested "${effort}").` };
+		}
+	}
+
+	// Two mutating agents in one directory conflict in ways the model cannot see coming.
+	if (mode !== "readonly") {
+		const conflict = [...tasks.values()].find((t) => t.state === "running" && t.mode !== "readonly" && t.cwd === cwd);
+		if (conflict) {
+			return {
+				ok: false,
+				reason:
+					`${conflict.id} is already running a ${conflict.mode} task in ${escapeTerminalControls(cwd)}. ` +
+					`Stop it first (external_agent_stop) or dispatch to a different directory.`,
+			};
+		}
+	}
+
+	return { ok: true };
+}
+
+// ---------------------------------------------------------------------------
 // Reporting
 // ---------------------------------------------------------------------------
 
@@ -1215,6 +1335,144 @@ function receiptFromStartArgs(args: Record<string, unknown>, fallbackCwd: string
 }
 
 // ---------------------------------------------------------------------------
+// Compare
+// ---------------------------------------------------------------------------
+
+/**
+ * One requested spec after validation, kept in request order: the caller asked
+ * for [codex, kimi] and must get the answers back in exactly that order to read
+ * them side by side. `task` is absent exactly when the spec was refused.
+ */
+interface CompareSlot {
+	index: number;
+	agent: string;
+	task?: Task;
+	reason?: string;
+	mode?: Mode;
+	cwd?: string;
+}
+
+type DispatchedCompareSlot = CompareSlot & { task: Task };
+
+function compareSection(slot: CompareSlot): string[] {
+	const head = `[${slot.index + 1}] ${escapeTerminalControls(slot.agent)}`;
+	if (!slot.task) return [`${head} · refused`, `Refused: ${slot.reason ?? "unknown reason"}`];
+
+	const task = slot.task;
+	const lines = [
+		`${head} · ${task.id} · ${task.state} · ${fmtDuration((task.endedAt ?? Date.now()) - task.startedAt)} · ` +
+			`${modeDisplay(task.mode)} · ${escapeTerminalControls(task.cwd)}`,
+	];
+	if (task.state === "done") {
+		const answer = truncate(answerOf(task), WAIT_ANSWER_PREVIEW_CHARS);
+		lines.push(answer.text || `(no answer text was parsed — external_agent_status taskId="${task.id}")`);
+		if (answer.truncated) {
+			lines.push(
+				`[answer truncated at ${WAIT_ANSWER_PREVIEW_CHARS} chars — external_agent_status taskId="${task.id}" has the full text]`,
+			);
+		}
+		return lines;
+	}
+	if (task.state === "running") {
+		lines.push(`still running when the call returned (quiet for ${fmtDuration(Date.now() - task.lastEventAt)})`);
+		return lines;
+	}
+	const detail = [task.spawnError, errorsOf(task)].filter((text): text is string => Boolean(text)).join("; ");
+	lines.push(detail || `${task.state} with no error detail — inspect external_agent_status taskId="${task.id}"`);
+	return lines;
+}
+
+/** The structured half of the receipt: what the caller inspects programmatically. */
+function compareResults(slots: CompareSlot[]): CompareResult[] {
+	return slots.map((slot) => {
+		const task = slot.task;
+		if (!task) {
+			return {
+				index: slot.index,
+				agent: slot.agent,
+				refused: true,
+				reason: slot.reason,
+				mode: slot.mode,
+				cwd: slot.cwd,
+			};
+		}
+		const result: CompareResult = {
+			index: slot.index,
+			agent: slot.agent,
+			refused: false,
+			taskId: task.id,
+			state: task.state,
+			mode: task.mode,
+			cwd: task.cwd,
+			dispatch: copyDispatchReceipt(task.dispatch),
+		};
+		if (task.state === "done") {
+			const answer = truncate(answerOf(task), WAIT_ANSWER_PREVIEW_CHARS);
+			if (answer.text) {
+				result.answer = answer.text;
+				result.answerTruncated = answer.truncated;
+			}
+		} else if (task.state !== "running") {
+			result.reason =
+				[task.spawnError, errorsOf(task)].filter((text): text is string => Boolean(text)).join("; ") ||
+				`${task.state} with no error detail`;
+		}
+		return result;
+	});
+}
+
+/**
+ * The text half of the receipt. Answers are pasted verbatim and never compared:
+ * judging them (identical, divergent, better) is the caller's job, and an
+ * extension that scored them would be answering a question it was not asked.
+ */
+function compareReport(slots: CompareSlot[], timedOut: boolean, aborted: boolean, timeoutS: number): string {
+	const unsettled = slots.filter((slot): slot is DispatchedCompareSlot => slot.task?.state === "running");
+	const lines = [
+		`Compared ${slots.length} specs on one task with a sync blocking call. Answers below are verbatim and in ` +
+			"request order — which ones agree, which disagree and which is better is your judgement to make: this tool " +
+			"never diffs, scores or ranks them.",
+	];
+	for (const slot of slots) lines.push("", ...compareSection(slot));
+	if (aborted) lines.push("", "The call was aborted before every agent settled.");
+	else if (timedOut) lines.push("", `The ${fmtDuration(timeoutS * 1000)} deadline passed before every agent settled.`);
+	if (unsettled.length > 0) {
+		const ids = unsettled.map((slot) => slot.task.id);
+		lines.push(
+			`Still running: ${ids.join(", ")}. Finish them with external_agent_wait taskIds=${JSON.stringify(ids)}, or end your ` +
+				"turn: their completion and stall notifications were re-enabled, so settling will re-invoke you.",
+		);
+	}
+	const refused = slots.filter((slot) => !slot.task).length;
+	const counted = (state: TaskState) => slots.filter((slot) => slot.task?.state === state).length;
+	const counts = [
+		`${slots.length} specs`,
+		refused > 0 ? `${refused} refused` : null,
+		slots.length - refused > 0 ? `${slots.length - refused} dispatched` : null,
+		counted("done") > 0 ? `${counted("done")} done` : null,
+		counted("failed") > 0 ? `${counted("failed")} failed` : null,
+		counted("stopped") > 0 ? `${counted("stopped")} stopped` : null,
+		unsettled.length > 0 ? `${unsettled.length} still running` : null,
+	].filter((part): part is string => part !== null);
+	lines.push("", `summary: ${counts.join(" · ")}`);
+	return lines.join("\n");
+}
+
+/**
+ * Compare starts its tasks with notify "off": for a caller holding the receipt
+ * the answers are already in hand, and a callback per agent would be a second
+ * copy of what the tool just returned. That stops being true when the deadline
+ * or an abort ends the wait early — nobody is left holding those answers — so
+ * the still-running ones get the standard notifications back instead of going
+ * quiet forever (and the stall watchdog with them, since it skips notify off).
+ */
+function rearmCompareNotifications(slots: DispatchedCompareSlot[]): void {
+	for (const slot of slots) {
+		if (slot.task.state === "running") slot.task.notify = "steer";
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
 
@@ -1391,86 +1649,12 @@ export default function (pi: ExtensionAPI) {
 			const model = typeof params.model === "string" ? params.model : undefined;
 			const effort = isEffort(params.effort) ? params.effort : undefined;
 
-			// Fail closed below the adapter's floor too: an adapter with minMode
-			// (kimi) has no lower tier at all — accepting one would be a label
-			// with no enforcement behind it.
-			const minMode = adapter.minMode ?? "readonly";
-			if (MODE_RANK[mode] < MODE_RANK[minMode]) {
+			const checked = validateDispatch(agent, mode, cwd, effort);
+			if (!checked.ok) {
 				return {
-					content: [
-						{
-							type: "text",
-							text:
-								`Refused: ${agent} is ${minMode}-only (requested "${mode}"). ` +
-								`Pick an agent with a lower tier (${AGENT_IDS.filter((i) => (ADAPTERS[i].minMode ?? "readonly") === "readonly").join(", ")}).`,
-						},
-					],
+					content: [{ type: "text", text: `Refused: ${checked.reason}` }],
 					details: { refused: true },
 				};
-			}
-
-			// Fail closed: never exceed the adapter's mode ceiling. kimi's ceiling is
-			// read-only precisely because its harness has no sandbox to bound writes.
-			if (MODE_RANK[mode] > MODE_RANK[adapter.maxMode]) {
-				const reason = !adapter.enforcesReadOnly
-					? `${agent} has no harness-enforced sandbox, so ${mode} mode cannot be bounded. ` +
-						`Run it read-only and apply changes yourself, or pick an agent that enforces read-only ` +
-						`(${AGENT_IDS.filter((i) => ADAPTERS[i].enforcesReadOnly).join(", ")}).`
-					: `${agent} is capped at "${adapter.maxMode}" mode (requested "${mode}").`;
-				return {
-					content: [{ type: "text", text: `Refused: ${reason}` }],
-					details: { refused: true },
-				};
-			}
-
-			// Effort is advisory only where the adapter has a real flag for it; a
-			// silently dropped override would mislead the caller about the run's cost.
-			if (effort) {
-				const supported = adapter.supportedEfforts;
-				if (!supported) {
-					return {
-						content: [
-							{
-								type: "text",
-								text:
-									`Refused: ${agent} has no reasoning-effort control. Drop the effort parameter or pick an agent ` +
-									`that supports one (${AGENT_IDS.filter((i) => ADAPTERS[i].supportedEfforts).join(", ")}).`,
-							},
-						],
-						details: { refused: true },
-					};
-				}
-				if (!supported.includes(effort)) {
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Refused: ${agent} supports effort levels ${supported.join(", ")} (requested "${effort}").`,
-							},
-						],
-						details: { refused: true },
-					};
-				}
-			}
-
-			// Two mutating agents in one directory conflict in ways the model cannot see coming.
-			if (mode !== "readonly") {
-				const conflict = [...tasks.values()].find(
-					(t) => t.state === "running" && t.mode !== "readonly" && t.cwd === cwd,
-				);
-				if (conflict) {
-					return {
-						content: [
-							{
-								type: "text",
-								text:
-									`Refused: ${conflict.id} is already running a ${conflict.mode} task in ${escapeTerminalControls(cwd)}. ` +
-									`Stop it first (external_agent_stop) or dispatch to a different directory.`,
-							},
-						],
-						details: { refused: true },
-					};
-				}
 			}
 
 			const task = startTask(agent, params.task, cwd, mode, notify, watchdogMs, model, effort);
@@ -1766,6 +1950,223 @@ export default function (pi: ExtensionAPI) {
 				signal?.addEventListener("abort", onAbort);
 				check();
 			});
+		},
+	});
+
+	pi.registerTool({
+		name: "external_agent_compare",
+		label: "External Agent Compare",
+		description: [
+			"Ask several agent CLIs the same thing in one synchronous, blocking call: every valid spec is dispatched",
+			"in parallel on the same task, the call returns once they have all settled (or the timeout elapses), and",
+			"the answers come back side by side in one aggregated receipt. Judging them is yours — this tool never",
+			"diffs, scores or ranks answers, and it never picks a winner; disagreement between agents is the signal,",
+			"not something it resolves. Use it to put one question to several models, or to run the same task across",
+			"worktrees by giving each spec its own cwd.",
+			"Each spec runs through the same dispatch path as external_agent_start, with its own mode, model, effort",
+			"and cwd, and a spec that fails validation (unsupported mode or effort, or a write/yolo conflict in that",
+			"directory) is recorded as a refusal while the other specs still run — a refusal is an entry in the",
+			"receipt, not a failed call.",
+			"Effort is opt-in per spec: set it only when the user explicitly asks for a reasoning-effort or",
+			"thinking-level override, otherwise omit it so each target CLI/config default applies — never infer a",
+			"level from task complexity.",
+			`On timeout (default ${WAIT_DEFAULT_TIMEOUT_S}s, max ${WAIT_MAX_TIMEOUT_S}s) the receipt returns whatever settled`,
+			"plus the taskIds still running: finish them with external_agent_wait, or end your turn and their",
+			"completion and stall notifications will re-invoke you. Use external_agent_start instead when you want",
+			"to keep working while the agents run.",
+			`Agents: ${agentTable}.`,
+		].join(" "),
+		promptSnippet: "Ask several external agent CLIs the same task at once and collect their answers side by side",
+		promptGuidelines: [
+			"Use external_agent_compare when the same question should go to several agents at once — a second opinion, a cross-check, or one task in several worktrees — and you want the answers together; it blocks until they settle, so use external_agent_start instead when you can keep working meanwhile.",
+			"external_agent_compare returns the answers verbatim and does not diff or rank them: read them yourself, and treat each one as a claim to verify against the code rather than a verdict.",
+			"On external_agent_compare, set a spec's effort only when the user explicitly requests a reasoning-effort or thinking-level override for that agent; otherwise omit it so the target CLI/config default applies, and never infer a level from task complexity.",
+			"When external_agent_compare times out, collect the remaining answers with external_agent_wait or end your turn; the tasks it listed keep running either way.",
+		],
+		parameters: Type.Object({
+			task: Type.String({
+				description:
+					"Self-contained instruction sent to every agent. They have no access to this conversation, so state the goal, name the files and say what to return.",
+			}),
+			agents: Type.Array(
+				Type.Object({
+					agent: StringEnum(AGENT_IDS as unknown as readonly string[]),
+					cwd: Type.Optional(
+						Type.String({
+							description:
+								"Working directory for this agent. Defaults to the session cwd — give each spec its own worktree to run the same task across directories.",
+						}),
+					),
+					mode: Type.Optional(
+						StringEnum(["readonly", "write", "yolo"] as const, {
+							description:
+								"Permission mode for this agent. Defaults to that agent's own default. Non-readonly specs in a " +
+								"directory that already has a running non-readonly task are refused, exactly as external_agent_start refuses them.",
+						}),
+					),
+					model: Type.Optional(Type.String({ description: "Override this agent's model, if it supports one." })),
+					effort: Type.Optional(
+						StringEnum(EFFORT_LEVELS, {
+							description:
+								"Opt-in reasoning-effort override for this agent, where it supports one (same allowlist as " +
+								"external_agent_start: kimi has none and refuses the request). Set it only when the user explicitly " +
+								"requests an effort/thinking level; omit it to inherit the target CLI/config default, and never pick " +
+								"one from task complexity. Specifying off is an explicit override, not the same as omitting it.",
+						}),
+					),
+				}),
+				{
+					minItems: COMPARE_MIN_AGENTS,
+					maxItems: COMPARE_MAX_AGENTS,
+					description: `Two to ${COMPARE_MAX_AGENTS} agents to compare, each optionally overriding cwd, mode, model and effort.`,
+				},
+			),
+			timeout: Type.Optional(
+				Type.Number({
+					description: `Seconds to wait for the whole batch (default ${WAIT_DEFAULT_TIMEOUT_S}, max ${WAIT_MAX_TIMEOUT_S}).`,
+				}),
+			),
+		}),
+
+		async execute(_id, params, signal, onUpdate, ctx): Promise<AgentToolResult<ExternalAgentCompareDetails>> {
+			const taskText = typeof params.task === "string" ? params.task : "";
+			const specs = Array.isArray(params.agents) ? params.agents : [];
+			const noRun = (text: string): AgentToolResult<ExternalAgentCompareDetails> => ({
+				content: [{ type: "text", text }],
+				details: { kind: "external-agent-compare", timedOut: false, aborted: false, results: [] },
+			});
+			// The schema enforces these bounds too; a direct execute call (tests,
+			// interception) must not get further than the schema would have.
+			if (specs.length < COMPARE_MIN_AGENTS) {
+				return noRun(
+					`Refused: external_agent_compare needs at least ${COMPARE_MIN_AGENTS} agent specs (got ${specs.length}). ` +
+						"For a single agent use external_agent_start and external_agent_wait.",
+				);
+			}
+			if (specs.length > COMPARE_MAX_AGENTS) {
+				return noRun(
+					`Refused: external_agent_compare accepts at most ${COMPARE_MAX_AGENTS} agent specs (got ${specs.length}). ` +
+						"Compare them in batches instead.",
+				);
+			}
+
+			const timeoutS =
+				typeof params.timeout === "number" && Number.isFinite(params.timeout)
+					? Math.min(Math.max(params.timeout, 5), WAIT_MAX_TIMEOUT_S)
+					: WAIT_DEFAULT_TIMEOUT_S;
+
+			const slots: CompareSlot[] = [];
+			for (const [index, spec] of specs.entries()) {
+				// A malformed spec is one refused entry, not a thrown call: the other
+				// specs in the batch are still worth running.
+				const agent =
+					typeof spec?.agent === "string" && AGENT_IDS.includes(spec.agent as AgentId)
+						? (spec.agent as AgentId)
+						: undefined;
+				if (!agent) {
+					slots.push({
+						index,
+						agent: typeof spec?.agent === "string" ? spec.agent : "(missing)",
+						reason: `unknown agent. Known: ${AGENT_IDS.join(", ")}`,
+					});
+					continue;
+				}
+				const adapter = ADAPTERS[agent];
+				const mode = isMode(spec.mode) ? spec.mode : adapter.defaultMode;
+				const cwdInput = typeof spec.cwd === "string" ? spec.cwd.replace(/^@/, "") : ctx.cwd;
+				const cwd = resolve(ctx.cwd, cwdInput);
+				const model = typeof spec.model === "string" ? spec.model : undefined;
+				const effort = isEffort(spec.effort) ? spec.effort : undefined;
+
+				// One refused spec must not cost the caller the others: it is recorded
+				// with its reason and the loop keeps going.
+				const checked = validateDispatch(agent, mode, cwd, effort);
+				if (!checked.ok) {
+					slots.push({ index, agent, reason: checked.reason, mode, cwd });
+					continue;
+				}
+
+				// Same dispatch path as external_agent_start — persistent session
+				// driver when the adapter has one, one-shot process otherwise. notify
+				// is off because this receipt is the notification (see
+				// rearmCompareNotifications for the timeout case).
+				const task = startTask(agent, taskText, cwd, mode, "off", DEFAULT_WATCHDOG_MS, model, effort);
+				slots.push({ index, agent, task, mode, cwd });
+			}
+
+			const dispatched = slots.filter((slot): slot is DispatchedCompareSlot => slot.task !== undefined);
+			if (dispatched.length > 0) {
+				onUpdate?.({
+					content: [
+						{
+							type: "text",
+							text: `Comparing ${dispatched.map((slot) => slot.task.id).join(", ")} (timeout ${timeoutS}s)`,
+						},
+					],
+					details: { kind: "external-agent-compare", timedOut: false, aborted: false, results: compareResults(slots) },
+				});
+			}
+
+			let timedOut = false;
+			let aborted = false;
+			if (dispatched.length > 0) {
+				const deadline = Date.now() + timeoutS * 1000;
+				const outcome = await new Promise<{ timedOut: boolean; aborted: boolean }>((resolvePromise) => {
+					const finish = (nextTimedOut: boolean, nextAborted: boolean) => {
+						clearInterval(timer);
+						signal?.removeEventListener("abort", onAbort);
+						resolvePromise({ timedOut: nextTimedOut, aborted: nextAborted });
+					};
+					const check = () => {
+						if (dispatched.every((slot) => slot.task.state !== "running")) return finish(false, false);
+						if (Date.now() >= deadline) return finish(true, false);
+					};
+					const onAbort = () => finish(false, true);
+					// Ref'd on purpose, like external_agent_wait: an in-flight compare is
+					// active work and must keep the event loop alive.
+					const timer = setInterval(check, COMPARE_POLL_INTERVAL_MS);
+					signal?.addEventListener("abort", onAbort);
+					check();
+				});
+				timedOut = outcome.timedOut;
+				aborted = outcome.aborted;
+				if (timedOut || aborted) rearmCompareNotifications(dispatched);
+			}
+
+			return {
+				content: [{ type: "text", text: compareReport(slots, timedOut, aborted, timeoutS) }],
+				details: { kind: "external-agent-compare", timedOut, aborted, results: compareResults(slots) },
+			};
+		},
+
+		renderCall(args, theme, _context) {
+			const specs = Array.isArray(args.agents) ? (args.agents as Array<Record<string, unknown>>) : [];
+			const names = specs.map((spec) => (typeof spec?.agent === "string" ? spec.agent : "?")).join(" vs ");
+			const preview = typeof args.task === "string" ? taskPromptPreview(args.task, 60) : "";
+			return new Text(
+				theme.fg("toolTitle", theme.bold("external-agent compare ")) +
+					theme.fg("accent", `${names || "(no agents)"} · ${preview}`),
+				0,
+				0,
+			);
+		},
+
+		renderResult(result, { expanded }, theme, _context) {
+			const details = result.details as Partial<ExternalAgentCompareDetails> | undefined;
+			const results = Array.isArray(details?.results) ? details.results : [];
+			const unmet = details?.timedOut === true || details?.aborted === true || results.some((entry) => entry.refused || entry.state !== "done");
+			const output = resultText(result) || "(no output)";
+			if (!expanded || results.length === 0) {
+				return new Text(theme.fg(unmet ? "warning" : "success", output), 0, 0);
+			}
+			const receipts = results
+				.map((entry) =>
+					entry.dispatch && entry.taskId
+						? renderReceipt(entry.dispatch, entry.taskId, true, "actual process dispatch")
+						: `[${entry.index + 1}] ${escapeTerminalControls(entry.agent)} · refused: ${escapeTerminalControls(entry.reason ?? "unknown reason")}`,
+				)
+				.join("\n\n");
+			return new Text(theme.fg(unmet ? "warning" : "success", `${output}\n\n─── Dispatch receipts ───\n${receipts}`), 0, 0);
 		},
 	});
 

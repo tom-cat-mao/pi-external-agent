@@ -25,9 +25,36 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
 | `external_agent_start` | 后台派发任务，立即返回 taskId |
 | `external_agent_status` | 查看进度、最近事件和完整回答 |
 | `external_agent_wait` | 在轮内阻塞等待任务完成 |
+| `external_agent_compare` | 一次阻塞调用把同一任务发给多个 agent，并排收集答案 |
 | `external_agent_stop` | 终止任务（协议取消，再 SIGTERM/SIGKILL） |
 | `external_agent_steer` | 向运行中的任务注入引导（下一个 step 边界生效） |
 | `external_agent_follow_up` | 任务结束后在同一会话续问，保留完整上下文 |
+
+## 多 agent 对比
+
+`external_agent_compare` 一次调用把同一个任务交给多个 agent：每个通过校验的 spec 并行派发，调用阻塞到它们全部结束（或超时），答案以一份回执并排返回。扩展**从不**对比、打分或排序——如何判断是调用方的事；agent 之间的分歧正是这个工具要暴露的信号，而不是它去解决的问题。
+
+| 参数 | 说明 |
+|---|---|
+| `task` | 发给每个 agent 的指令（必填；与 `external_agent_start` 一样需自包含） |
+| `agents` | 2–8 个 spec：`{ agent, cwd?, mode?, model?, effort? }`。`mode` 默认取该 agent 自身默认值，`cwd` 默认会话目录 |
+| `timeout` | 整批的等待秒数（可选；默认 600，上限 3600） |
+
+每个 spec 走的是与 `external_agent_start` 完全相同的派发路径和校验，被拒绝的理由也完全相同——模式超出适配器范围、effort 不受支持，或该目录已有运行中的 write/yolo 任务。被拒绝的 spec 会带着原因记入回执，其余 spec 照常运行；只有 spec 数量不在 2–8 之间才会让整个调用失败。每个答案截断到 8000 字符（回执中给出可读全文的 taskId），`effort` 与 start 一致，按 spec 逐个显式指定。
+
+超时回执会返回已结束的部分，外加仍在运行的 taskId：用 `external_agent_wait` 收尾，或直接结束本轮——这些任务的完成/静默通知会被重新打开。阻塞期间它们不带回调运行，因为拿到的回执本身就是通知。
+
+```
+external_agent_compare {
+  task: "审查这个 worktree 的错误处理，列出风险最高的三条路径。",
+  agents: [
+    { agent: "codex", cwd: "/repo/wt-a", mode: "readonly" },
+    { agent: "codebuddy", cwd: "/repo/wt-b", mode: "readonly" },
+    { agent: "qoder", mode: "readonly" }
+  ],
+  timeout: 900
+}
+```
 
 ## Agent
 
