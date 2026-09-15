@@ -8,11 +8,12 @@
  * signal moves from "process exited" to "turn ended" while the process stays up
  * for follow-ups.
  *
- * Three wire protocols, one interface:
+ * Four wire protocols, one interface:
  *
- *   PiRpcDriver          pi --mode rpc        — line JSON commands + events
- *   CodexAppServerDriver codex app-server     — JSON-RPC 2.0, experimental
- *   AcpDriver            reasonix / codebuddy — JSON-RPC 2.0 ACP over stdio
+ *   PiRpcDriver           pi --mode rpc        — line JSON commands + events
+ *   CodexAppServerDriver  codex app-server     — JSON-RPC 2.0, experimental
+ *   AcpDriver             reasonix / codebuddy — JSON-RPC 2.0 ACP over stdio
+ *   QoderStreamJsonDriver qoder                — LF stream-json over stdio
  *
  * Facts verified by hand on 2026-09-08 against the installed binaries
  * (pi 0.85.1, codex 0.153.4, reasonix v1.38.1, codebuddy 2.147.0), including
@@ -39,13 +40,14 @@
  *               session; it lands at the next model step boundary, or becomes a
  *               follow-up if the turn is stuck inside one long tool call.
  *
- * Steering is never an immediate interrupt. All four deliver at a step boundary
+ * Steering is never an immediate interrupt. All five deliver at a step boundary
  * (between tool calls), so a steer cannot cancel a bash command that is already
  * running — only change what the agent does next.
  */
 
+import { randomUUID } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
-import { ADAPTERS, buildReadonlySettings, codexEffortToken, type AgentEvent, type AgentId, type Effort, type Mode } from "./adapters.ts";
+import { ADAPTERS, buildReadonlySettings, codexEffortToken, qoderPermissionArgs, type AgentEvent, type AgentId, type Effort, type Mode } from "./adapters.ts";
 
 const MAX_STDERR_CHARS = 8_000;
 const HANDSHAKE_TIMEOUT_MS = 30_000;
@@ -71,6 +73,8 @@ export interface SessionDriver {
 	readonly argv: string[];
 	/** Whether the driver forwards cwd through the protocol rather than only inheriting it. */
 	readonly cwdForwardedToCli: boolean;
+	readonly stdinFormat?: "jsonrpc" | "stream-json";
+	readonly steerUnavailableReason?: string;
 	/** Truncated stderr, same cap as the one-shot path. */
 	readonly stderr: string;
 	/** True while the session process is up and able to take a follow-up. */
@@ -156,6 +160,12 @@ abstract class StdioProcess {
 		proc.stderr?.setEncoding("utf8");
 		proc.stderr?.on("data", (chunk: string) => {
 			if (this.stderrText.length < MAX_STDERR_CHARS) this.stderrText += chunk;
+		});
+
+		proc.stdin?.on("error", (err) => {
+			this.spawnErrorMessage = `stdin: ${err.message}`;
+			this.kill();
+			this.finishExit(null);
 		});
 
 		proc.on("error", (err) => {
@@ -728,6 +738,7 @@ interface AcpDialect {
 	id: AgentId;
 	/** Extra argv appended after --acp. */
 	baseArgv: (input: SessionStartInput) => string[];
+	failClosedPermissionModes?: Mode[];
 }
 
 const ACP_FLAG = "--acp";
@@ -788,7 +799,7 @@ class AcpDriver extends BaseSessionDriver implements SessionDriver {
 		// the backstop for dialects without settings enforcement (and note that
 		// rejecting a codebuddy ACP request cancels the whole turn, which is
 		// exactly why readonly moved off plan mode).
-		this.autoPermission = input.mode === "readonly" ? "reject" : "allow";
+		this.autoPermission = (this.dialect.failClosedPermissionModes ?? ["readonly"]).includes(input.mode) ? "reject" : "allow";
 		this.spawnProcess(ADAPTERS[this.dialect.id].bin, this.buildArgv(input), input.cwd);
 		this.onNotification((method, params) => this.handleNotification(method, params));
 		this.onRequest((msg) => this.handleRequest(msg));
@@ -934,10 +945,23 @@ class AcpDriver extends BaseSessionDriver implements SessionDriver {
 			return;
 		}
 		const options: any[] = Array.isArray(msg.params?.options) ? msg.params.options : [];
-		const wanted = this.autoPermission;
+		if (this.autoPermission === "reject") {
+			const reject = options.find(
+				(o) =>
+					(o?.kind === "reject_once" || o?.kind === "reject_always") &&
+					typeof o?.optionId === "string" &&
+					o.optionId.length > 0,
+			);
+			if (reject) {
+				this.respond(msg.id, { outcome: { outcome: "selected", optionId: reject.optionId } });
+				return;
+			}
+			this.respond(msg.id, { outcome: { outcome: "cancelled" } });
+			return;
+		}
 		const chosen =
-			options.find((o) => typeof o?.kind === "string" && o.kind.startsWith(wanted)) ??
-			options.find((o) => typeof o?.optionId === "string" && o.optionId.toLowerCase().includes(wanted)) ??
+			options.find((o) => typeof o?.kind === "string" && o.kind.startsWith("allow")) ??
+			options.find((o) => typeof o?.optionId === "string" && o.optionId.toLowerCase().includes("allow")) ??
 			options[0];
 		if (!chosen) {
 			this.respondError(msg.id, "no permission option available");
@@ -1003,6 +1027,421 @@ class AcpDriver extends BaseSessionDriver implements SessionDriver {
 	}
 }
 
+const QODER_INIT_TIMEOUT_MS = 120_000;
+const QODER_CANCEL_TIMEOUT_MS = 5_000;
+const QODER_SYNTHETIC_MODEL = "<synthetic>";
+const QODER_STEER_BASELINE = "1.1.49";
+const QODER_STEER_BASELINE_PARTS = [1, 1, 49];
+const QODER_STEER_REFUSAL =
+	"Mid-run steering is refused rather than sent, because this CLI generation may not honour the shouldQuery contract a steer relies on. " +
+	"The baseline is the release our documented SDK pairing targets, not a vendor-stated minimum. " +
+	"Follow-up, status and stop still work; install a newer qodercli and dispatch a new task to steer.";
+
+function qoderStableVersion(value: unknown): number[] | undefined {
+	if (typeof value !== "string") return undefined;
+	const match = value.trim().match(/^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/);
+	if (!match) return undefined;
+	const parts = [Number(match[1]), Number(match[2]), Number(match[3])];
+	return parts.every(Number.isSafeInteger) ? parts : undefined;
+}
+
+function qoderVersionAtLeast(parts: number[], baseline: number[]): boolean {
+	for (let index = 0; index < baseline.length; index += 1) {
+		const value = parts[index] ?? 0;
+		if (value !== baseline[index]) return value > baseline[index];
+	}
+	return true;
+}
+
+interface QoderControlWaiter {
+	resolve: (response: any) => void;
+	timer: ReturnType<typeof setTimeout>;
+	kind?: "interrupt";
+}
+
+function qoderApiErrorText(record: any): string | undefined {
+	const content = record?.message?.content;
+	const text = Array.isArray(content)
+		? content
+				.filter((block: any) => block?.type === "text" && typeof block.text === "string")
+				.map((block: any) => block.text)
+				.join("\n")
+				.trim()
+		: typeof content === "string"
+			? content.trim()
+			: "";
+	if (!text) return undefined;
+	const wrapped = text.match(/^\[API Error:\s*([\s\S]*)\]$/);
+	return (wrapped?.[1] ?? text).trim() || undefined;
+}
+
+class QoderStreamJsonDriver extends StdioProcess implements SessionDriver {
+	readonly cwdForwardedToCli = false;
+	readonly stdinFormat = "stream-json";
+
+	private readonly eventCbs: Array<(event: AgentEvent) => void> = [];
+	private readonly turnEndCbs: Array<(outcome: TurnOutcome) => void> = [];
+	private readonly controlWaiters = new Map<string, QoderControlWaiter>();
+	private readonly steers = new Set<string>();
+	private active = false;
+	private cancelRequested = false;
+	private turnStarted = false;
+	private bootFailure: string | undefined;
+	private truncated = false;
+	private initVersion: string | undefined;
+	private initializeVersion: string | undefined;
+	private mode: Mode = "yolo";
+	private initResolve: (() => void) | undefined;
+	private initReject: ((err: Error) => void) | undefined;
+	private controlSeq = 0;
+
+	get steerUnavailableReason(): string | undefined {
+		return this.steerBlock();
+	}
+
+	onEvent(cb: (event: AgentEvent) => void): void {
+		this.eventCbs.push(cb);
+	}
+
+	onTurnEnd(cb: (outcome: TurnOutcome) => void): void {
+		this.turnEndCbs.push(cb);
+	}
+
+	buildArgv(input: SessionStartInput): string[] {
+		const argv = ["-p", "--output-format", "stream-json", "--input-format", "stream-json", ...qoderPermissionArgs(input.mode)];
+		if (input.model) argv.push("--model", input.model);
+		if (input.effort) argv.push("--reasoning-effort", input.effort);
+		return argv;
+	}
+
+	async start(input: SessionStartInput): Promise<void> {
+		this.mode = input.mode;
+		const ready = this.awaitInit();
+		this.spawnProcess(ADAPTERS.qoder.bin, this.buildArgv(input), input.cwd);
+		void this
+			.controlRequest(
+				{
+					type: "initialize",
+					subtype: "initialize",
+					modelPolicyProvider: false,
+					supportsCatalogReadyInitialize: false,
+					supportsAvailableModelsUpdate: false,
+					supportsCommandsChanged: false,
+				},
+				QODER_INIT_TIMEOUT_MS,
+			)
+			.then((response: any) => {
+				if (response?.subtype === "error") {
+					if (this.initResolve) this.failBoot(`qoder rejected the initialize request: ${String(response.error ?? "unknown error")}`);
+					return;
+				}
+				const announced = response?.response?.qodercli_version;
+				if (typeof announced === "string") this.initializeVersion = announced;
+				this.initResolve?.();
+			})
+			.catch(() => undefined);
+		await ready;
+		if (this.bootFailure) throw new Error(`qoder failed before the first turn: ${this.bootFailure}`);
+		if (!this.alive) throw new Error(this.spawnError ?? "the qoder session exited before the first turn");
+		if (this.cancelRequested) return;
+		this.turnStarted = true;
+		this.markActive();
+		this.sendUserMessage(input.task);
+	}
+
+	private awaitInit(): Promise<void> {
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const done = () => {
+			if (timer) clearTimeout(timer);
+			timer = undefined;
+			this.initResolve = undefined;
+			this.initReject = undefined;
+		};
+		return new Promise<void>((resolve, reject) => {
+			this.initResolve = () => {
+				done();
+				resolve();
+			};
+			this.initReject = (err: Error) => {
+				done();
+				reject(err);
+			};
+			timer = setTimeout(() => {
+				this.initReject?.(new Error(`qoder: no system/init handshake within ${Math.round(QODER_INIT_TIMEOUT_MS / 1000)}s`));
+			}, QODER_INIT_TIMEOUT_MS);
+			timer.unref?.();
+		});
+	}
+
+	async followUp(message: string): Promise<void> {
+		if (!this.alive) throw new Error("the qoder session process is gone");
+		if (this.active) throw new Error("a turn is still running; use external_agent_steer instead");
+		this.cancelRequested = false;
+		this.markActive();
+		this.sendUserMessage(message);
+	}
+
+	async steer(message: string): Promise<SteerResult> {
+		if (!this.active) return { accepted: false, reason: "no turn is currently running" };
+		if (!this.alive) return { accepted: false, reason: "the qoder session process is gone" };
+		const blocked = this.steerBlock();
+		if (blocked) return { accepted: false, reason: `${blocked}. ${QODER_STEER_REFUSAL}` };
+		this.steers.add(this.sendUserMessage(message, { priority: "next", shouldQuery: false }));
+		return {
+			accepted: true,
+			note:
+				"sent with priority next and shouldQuery false: queued for the next step boundary of the active turn, not confirmed applied. " +
+				"It never interrupts and never starts a turn of its own, so guidance that misses this turn stays as context for the next user message.",
+		};
+	}
+
+	private steerBlock(): string | undefined {
+		const announced = this.initializeVersion ?? this.initVersion;
+		if (announced === undefined) {
+			return `qoder announced no qodercli_version in its system/init record or initialize response, so the ${QODER_STEER_BASELINE} steering baseline cannot be confirmed`;
+		}
+		const parts = qoderStableVersion(announced);
+		if (!parts) {
+			return `qoder announced version "${announced}", which is not a stable release number, so the ${QODER_STEER_BASELINE} steering baseline cannot be confirmed`;
+		}
+		if (qoderVersionAtLeast(parts, QODER_STEER_BASELINE_PARTS)) return undefined;
+		return `qoder announced version "${announced}", below the ${QODER_STEER_BASELINE} steering baseline`;
+	}
+
+	async cancel(): Promise<void> {
+		if (!this.alive) return;
+		this.cancelRequested = true;
+		await this.controlRequest({ type: "interrupt", subtype: "interrupt" }, QODER_CANCEL_TIMEOUT_MS, "interrupt").catch(() => undefined);
+	}
+
+	protected override onProcessExit(): void {
+		for (const [id, waiter] of this.controlWaiters) {
+			clearTimeout(waiter.timer);
+			waiter.resolve({ subtype: "error", error: this.spawnError ?? "session process exited" });
+			this.controlWaiters.delete(id);
+		}
+		const stderrDetail = this.stderr
+			.trim()
+			.split("\n")
+			.map((line) => line.trim())
+			.find(Boolean);
+		const message =
+			this.spawnError ??
+			`the qoder session exited before the handshake or the turn ended${stderrDetail ? `: ${stderrDetail.slice(0, 300)}` : ""}`;
+		this.initReject?.(new Error(message));
+		this.settle({ status: "failed", error: message });
+	}
+
+	protected handleLine(line: string): void {
+		let obj: any;
+		try {
+			obj = JSON.parse(line);
+		} catch {
+			return;
+		}
+		if (!obj || typeof obj !== "object") return;
+
+		if (obj.type === "system" && obj.subtype === "init") {
+			if (typeof obj.qodercli_version === "string") this.initVersion = obj.qodercli_version;
+			this.initResolve?.();
+			return;
+		}
+		if (obj.type === "assistant" && obj.parent_tool_use_id == null) {
+			if (obj.aborted === true) this.truncated = true;
+			else if (Array.isArray(obj.message?.content)) this.truncated = false;
+			if (obj.isApiErrorMessage === true || obj.message?.model === QODER_SYNTHETIC_MODEL) {
+				const detail = qoderApiErrorText(obj) ?? "qoder reported a model request failure";
+				if (!this.turnStarted) {
+					this.failBoot(detail);
+					return;
+				}
+				if (!this.active) return;
+				this.emit({ kind: "error", text: detail });
+				this.settle({ status: "failed", error: detail });
+				return;
+			}
+		}
+		if (obj.type === "command_lifecycle") {
+			this.handleCommandLifecycle(obj);
+			return;
+		}
+		if (obj.type === "control_request") {
+			this.handleControlRequest(obj);
+			return;
+		}
+		if (obj.type === "control_response") {
+			this.handleControlResponse(obj);
+			return;
+		}
+		if (obj.type === "control_cancel_request") return;
+
+		if (obj.type === "result") {
+			this.handleResult(line, obj);
+			return;
+		}
+
+		const event = ADAPTERS.qoder.parseEvent(line);
+		if (event) this.emit(event);
+	}
+
+	private isTerminalResult(obj: any): boolean {
+		if (obj.subtype === "success") return typeof obj.result === "string";
+		return obj.subtype === "error_during_execution" || obj.subtype === "error_max_turns" || obj.subtype === "error_max_budget_usd";
+	}
+
+	private handleResult(line: string, obj: any): void {
+		if (!this.isTerminalResult(obj)) return;
+		const event = ADAPTERS.qoder.parseEvent(line);
+		const failed = event?.kind === "error";
+		if (!this.active) {
+			if (!this.turnStarted && failed) this.failBoot(event?.text ?? "qoder reported a failed result before the first turn");
+			return;
+		}
+		const cancelled = this.cancelRequested;
+		if (event?.text && !(cancelled && failed)) this.emit(event);
+		if (cancelled) {
+			this.settle({ status: "cancelled" });
+			return;
+		}
+		if (failed) {
+			this.settle({ status: "failed", error: event?.text ?? "qoder reported a failed result" });
+			return;
+		}
+		if (this.truncated) {
+			this.settle({ status: "cancelled" });
+			return;
+		}
+		this.settle({ status: "done" });
+	}
+
+	private handleCommandLifecycle(obj: any): void {
+		const commandUuid = typeof obj.command_uuid === "string" ? obj.command_uuid : undefined;
+		if (!commandUuid || !this.steers.has(commandUuid)) return;
+		if (obj.state === "discarded" || obj.state === "cancelled") {
+			this.steers.delete(commandUuid);
+			this.emit({ kind: "warning", text: `qoder ${obj.state} the steer ${commandUuid}` });
+			return;
+		}
+		if (obj.state === "completed") this.steers.delete(commandUuid);
+	}
+
+	private failBoot(detail: string): void {
+		this.bootFailure = detail;
+		this.initReject?.(new Error(detail));
+	}
+
+	private emit(event: AgentEvent): void {
+		for (const cb of this.eventCbs) cb(event);
+	}
+
+	private sendUserMessage(text: string, options?: { priority: "next"; shouldQuery: boolean }): string {
+		const uuid = randomUUID();
+		const message: Record<string, unknown> = {
+			type: "user",
+			message: { role: "user", content: [{ type: "text", text }] },
+			parent_tool_use_id: null,
+			uuid,
+		};
+		if (options) {
+			message.priority = options.priority;
+			message.shouldQuery = options.shouldQuery;
+		}
+		this.writeLine(message);
+		return uuid;
+	}
+
+	private controlRequest(request: Record<string, unknown>, timeoutMs: number, kind?: "interrupt"): Promise<any> {
+		const requestId = `q${++this.controlSeq}`;
+		return new Promise((resolve, reject) => {
+			if (!this.alive && this.spawnError) {
+				reject(new Error(this.spawnError));
+				return;
+			}
+			const timer = setTimeout(() => {
+				this.controlWaiters.delete(requestId);
+				reject(new Error(`control request "${String(request.subtype ?? request.type)}" timed out after ${Math.round(timeoutMs / 1000)}s`));
+			}, timeoutMs);
+			timer.unref?.();
+			this.controlWaiters.set(requestId, { resolve, timer, kind });
+			this.writeLine({ type: "control_request", request_id: requestId, request });
+		});
+	}
+
+	private handleControlResponse(obj: any): void {
+		const response = obj.response;
+		const rawId = response?.request_id;
+		const key = typeof rawId === "string" || typeof rawId === "number" ? String(rawId) : undefined;
+		const waiter = key === undefined ? undefined : this.controlWaiters.get(key);
+		if (!waiter || key === undefined) return;
+		this.controlWaiters.delete(key);
+		clearTimeout(waiter.timer);
+		if (waiter.kind === "interrupt") this.warnStillQueued(response?.response);
+		waiter.resolve(response);
+	}
+
+	private warnStillQueued(payload: any): void {
+		const stillQueued = Array.isArray(payload?.still_queued)
+			? payload.still_queued.filter((id: unknown): id is string => typeof id === "string")
+			: [];
+		if (stillQueued.length === 0) return;
+		this.emit({
+			kind: "warning",
+			text: `the interrupt reported ${stillQueued.length} still-queued command(s); the session is being stopped`,
+		});
+	}
+
+	private handleControlRequest(obj: any): void {
+		const rawId = obj.request_id;
+		const requestId = typeof rawId === "string" || typeof rawId === "number" ? rawId : undefined;
+		const request = obj.request && typeof obj.request === "object" ? obj.request : {};
+		const subtype = typeof request.subtype === "string" ? request.subtype : typeof request.type === "string" ? request.type : "unknown";
+		if (requestId === undefined) {
+			const detail = `qoder sent a ${subtype} control request without a usable request_id, so it cannot be answered`;
+			if (!this.turnStarted) {
+				this.failBoot(detail);
+				return;
+			}
+			if (!this.active) {
+				this.kill();
+				return;
+			}
+			this.emit({ kind: "error", text: detail });
+			this.settle({ status: "failed", error: detail });
+			this.kill();
+			return;
+		}
+		if (subtype === "can_use_tool") {
+			const response =
+				this.mode === "yolo"
+					? { behavior: "allow", updatedInput: request.input ?? {}, ...(typeof request.tool_use_id === "string" ? { toolUseID: request.tool_use_id } : {}) }
+					: {
+							behavior: "deny",
+							message: `${this.mode} mode does not auto-allow this tool, and pi-external-agent exposes no permission prompt channel.`,
+							...(typeof request.tool_use_id === "string" ? { toolUseID: request.tool_use_id } : {}),
+						};
+			this.writeLine({ type: "control_response", response: { subtype: "success", request_id: requestId, response } });
+			return;
+		}
+		this.writeLine({
+			type: "control_response",
+			response: { subtype: "error", request_id: requestId, error: `unsupported control request: ${subtype}` },
+		});
+	}
+
+	private markActive(): void {
+		this.active = true;
+		this.truncated = false;
+		this.steers.clear();
+	}
+
+	private settle(outcome: TurnOutcome): void {
+		if (!this.active) return;
+		this.active = false;
+		this.cancelRequested = false;
+		for (const cb of this.turnEndCbs) cb(outcome);
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Factories
 // ---------------------------------------------------------------------------
@@ -1042,9 +1481,13 @@ export const SESSION_DRIVERS: Partial<Record<AgentId, () => SessionDriver>> = {
 				return argv;
 			},
 		}),
+	qoder: () => new QoderStreamJsonDriver(),
 };
 
 export const SESSION_AGENT_IDS = Object.keys(SESSION_DRIVERS) as AgentId[];
+
+export const STEER_AGENT_IDS = SESSION_AGENT_IDS.filter((id) => ADAPTERS[id].session?.steer);
+export const FOLLOWUP_AGENT_IDS = SESSION_AGENT_IDS.filter((id) => ADAPTERS[id].session?.followUp);
 
 export function hasSessionDriver(agent: AgentId): boolean {
 	return SESSION_DRIVERS[agent] !== undefined;
