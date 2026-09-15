@@ -74,9 +74,9 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
 
   **steer 是有条件的。** 只有当 CLI 声明了**不低于 1.1.49 的稳定版本**时才会发送 steer——1.1.49 是我们文档化 SDK 配对（`@qoder-ai/qoder-agent-sdk` 1.0.39）所对应的版本。这是我们**文档契约的基线**，不是对厂商最早支持版本的断言。CLI 声明的 `qodercli_version`（来自 `system`/`init` 记录，或 `initialize` 响应中的同名字段）必须存在、必须是稳定版本号、且达到该基线；缺失、格式异常、预发布或更旧的版本会让 `external_agent_steer` 直接拒绝并回显所报版本与升级提示，完全不写出 steer 帧，同时 start/status/follow-up/stop 均不受影响。
 
-  设置该门槛的原因：本地公开二进制的入站用户消息 schema 声明了 `priority: ["now","next","later"]`，但没有 `shouldQuery`，且二进制中没有任何地方从入站帧读取 `shouldQuery`——因此在旧版 CLI 上 steer 只是一条普通的排队消息，其投递契约无法确认。SDK 1.0.39 的协议类型包含逐命令 `command_lifecycle` 记录，但本地 1.0.18 二进制中没有；该记录按可选事件处理，不会阻塞等待。
+  设置该门槛的原因：此前检查的 qodercli 1.0.18 二进制，其入站用户消息 schema 声明了 `priority: ["now","next","later"]`，但没有 `shouldQuery`，且二进制中没有任何地方从入站帧读取 `shouldQuery`——因此在旧版 CLI 上 steer 只是一条普通的排队消息，其投递契约无法确认。SDK 1.0.39 的协议类型包含逐命令 `command_lifecycle` 记录，但本地 1.0.18 二进制中没有；该记录按可选事件处理，不会阻塞等待。
 
-  **实机验证状态：**本机只读 steering 探测在任何工具调用之前就被账号权益（entitlement）拒绝而终止；独立的无模型探测只验证了启动流程。因此 Qoder steer **在任何版本上都还没有经过实机模型验证**（包括 1.0.18），目前的依据是文档契约、公开 SDK/二进制证据与离线协议测试。
+  **实机验证状态：**更新 CLI 后，使用 qodercli **1.1.52** 的只读探测已完成真实驱动握手，并通过 steering 版本检查，没有覆盖 model 或 effort。但测试账号额度耗尽，推理在任何工具调用前即被拒绝，因此没有发出 steering 消息。此前的 1.0.18 探测也受到账号限制；独立的无模型探测只验证启动流程。成功的实机模型 steering 及其后的续问仍然**未经验证**；当前实现依据是文档契约、公开 SDK/二进制证据与离线协议测试。
 
 各 CLI 的兼容性结论写在 `adapters.ts` 注释以及每次派发回执的 `effective policy` 一行里。
 
