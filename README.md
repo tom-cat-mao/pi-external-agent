@@ -25,9 +25,36 @@ For the Qoder agent, install the Qoder CLI (`qodercli`) and make sure it is on `
 | `external_agent_start` | Dispatch a task in the background, returns a taskId immediately |
 | `external_agent_status` | Inspect progress, recent events, and the full answer |
 | `external_agent_wait` | Block in-turn until tasks settle, when the result is needed now |
+| `external_agent_compare` | Send one task to several agents in one blocking call, collect the answers side by side |
 | `external_agent_stop` | Cancel a task (protocol cancel, then SIGTERM/SIGKILL) |
 | `external_agent_steer` | Inject guidance into a running task at its next step boundary |
 | `external_agent_follow_up` | Continue a settled task in the same session, with full context |
+
+## Comparing agents
+
+`external_agent_compare` hands the same task to several agents in one call: every valid spec is dispatched in parallel, the call blocks until they have all settled (or the timeout elapses), and the answers come back side by side in one receipt. The extension never diffs, scores or ranks them — judging them is the caller's job, and disagreement between agents is the signal the tool exists to surface, not something it resolves.
+
+| Parameter | Meaning |
+|---|---|
+| `task` | The instruction sent to every agent (required; self-contained, like `external_agent_start`) |
+| `agents` | 2–8 specs of `{ agent, cwd?, mode?, model?, effort? }`. `mode` defaults to that agent's own default, `cwd` to the session directory |
+| `timeout` | Seconds to wait for the whole batch (optional; default 600, max 3600) |
+
+Each spec runs through exactly the same dispatch path and validation as `external_agent_start`, so it is refused for the same reasons a start would be — a mode outside the adapter's range, an unsupported effort request, or a write/yolo conflict with a task already running in that directory. A refused spec is recorded in the receipt with its refusal reason and the other specs still run: only a spec count outside 2–8 fails the whole call. Answers are trimmed to 8000 characters each (the receipt names the taskId to read the full text from), and `effort` stays opt-in per spec, exactly as on start.
+
+On timeout the receipt returns whatever settled plus the taskIds still running: finish those with `external_agent_wait`, or end the turn — their normal completion and stall notifications are switched back on. While the call is blocking they run without callbacks, because the receipt you get back is the notification.
+
+```
+external_agent_compare {
+  task: "Review the error handling in this worktree and list the three riskiest paths.",
+  agents: [
+    { agent: "codex", cwd: "/repo/wt-a", mode: "readonly" },
+    { agent: "codebuddy", cwd: "/repo/wt-b", mode: "readonly" },
+    { agent: "qoder", mode: "readonly" }
+  ],
+  timeout: 900
+}
+```
 
 ## Agents
 
