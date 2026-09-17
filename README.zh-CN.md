@@ -55,6 +55,10 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
 - [docs/architecture.md](docs/architecture.md) — 派发流程、回执、传输层 · [docs/adapters.md](docs/adapters.md) — 各 CLI 能力矩阵
 - [docs/qoder.md](docs/qoder.md) — Qoder stream-json 契约 · [.agents/notes/](.agents/notes/) — 决策记录
 
+## 社区
+
+[LINUX DO](https://linux.do/)
+
 ## 许可证
 
 MIT

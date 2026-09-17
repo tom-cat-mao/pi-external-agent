@@ -55,6 +55,10 @@ Requires pi ≥ 0.85 and whichever agent CLIs you want to drive (they don't all 
 - [docs/architecture.md](docs/architecture.md) — dispatch flow, receipts, transports · [docs/adapters.md](docs/adapters.md) — per-CLI capability matrix
 - [docs/qoder.md](docs/qoder.md) — Qoder stream-json contract · [.agents/notes/](.agents/notes/) — decision records
 
+## Community
+
+[LINUX DO](https://linux.do/)
+
 ## License
 
 MIT
