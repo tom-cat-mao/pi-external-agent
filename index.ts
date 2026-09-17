@@ -1550,82 +1550,59 @@ export default function (pi: ExtensionAPI) {
 		name: "external_agent_start",
 		label: "External Agent",
 		description: [
-			"Dispatch a task to another coding agent CLI on this machine. Returns immediately with a taskId;",
-			"the agent keeps running in the background and notifies you when it settles, so you can start several",
-			"and keep working instead of waiting. There is no wall-clock timeout, but a stall watchdog notifies",
-			"you when a running task has been quiet for too long (default 15m), so ending your turn while",
-			"waiting is safe: both completion and stalls will re-invoke you. When you need the result inside",
-			"this turn, block on external_agent_wait instead of sleep-polling. Use external_agent_status to",
-			"inspect progress or read full answers.",
+			"Dispatch a task to another coding agent CLI. Returns a taskId immediately; the agent runs in the",
+			"background and notifies you when it settles, so you can start several and keep working. There is no",
+			"wall-clock timeout, but a stall watchdog (default 15m quiet) also notifies you, so ending your turn",
+			"while waiting is safe.",
 			`Agents: ${agentTable}.`,
-			"Modes: readonly, write (workspace edits), yolo (no sandbox; codex/pi/kimi/codebuddy/qoder). When mode is omitted",
-			"the agent's own default applies. Concurrent write/yolo tasks in the same directory are refused.",
-			"Effort is an opt-in reasoning-effort override: set it only when the user explicitly asks for a reasoning-effort",
-			"or thinking level. Otherwise omit it so the target CLI/config default applies — never infer a level from task",
-			"complexity. Per-agent support is listed in the effort parameter, and unsupported levels are refused.",
-			"Each call is a fresh session for the other agent: it sees no pi conversation history, so the task text",
-			"must be self-contained (state the goal, name the files, say what to return).",
-			`pi, codex, reasonix, codebuddy and qoder run as persistent sessions: their conversation survives the answer, so`,
-			"you can continue the same session afterwards (external_agent_follow_up). Mid-run steering is also supported,",
-			"but Qoder requires an announced stable CLI meeting this adapter's 1.1.49 SDK-pairing baseline. The others are one-shot with no way back in.",
+			"Task text must be self-contained: the agent sees none of this conversation, so state the goal, name the",
+			"files and what to return.",
+			"Concurrent write/yolo tasks in the same directory are refused, and effort is opt-in (see the effort",
+			"parameter).",
+			"pi, codex, reasonix, codebuddy and qoder are persistent sessions (the conversation survives the answer,",
+			"so it can be followed up or steered); the others are one-shot with no way back in.",
 		].join(" "),
-		promptSnippet: "Delegate a task to an external coding agent CLI (codex, qoder, kimi, codebuddy, claude, reasonix)",
+		promptSnippet: "Delegate a task to an external coding agent CLI",
 		promptGuidelines: [
-			"Use external_agent_start with codex, pi, or kimi for code-writing and execution tasks; they run unsandboxed (yolo) by default. Pick pi when a specific model should do the work — the model parameter is forwarded to the child pi (e.g. deepseek-v4-flash). Kimi is yolo-only: readonly/write requests are refused — use codebuddy, qoder or claude for read-only exploration.",
-			"Use external_agent_start with reasonix when a DeepSeek-native harness (not a codex/pi fork) should attempt or review the work; its yolo stays bounded by deny rules and the OS bash sandbox.",
-			"Use external_agent_start with codebuddy for fast repository exploration that may turn into execution — it leans toward codebase understanding but runs yolo (bypassPermissions) by default like codex.",
-			"Use external_agent_start with qoder for an independent executor or reviewer on the Qoder CLI; all tiers are open and yolo is the default like codex, its readonly tier is harness-enforced by dont_ask plus a built-in tool allowlist, and it supports same-session follow-up plus mid-run steering over Qoder's documented stream-json input channel — steering is conditional on the CLI announcing a stable release at or above our documented-SDK baseline (1.1.49), and is refused with the reported version otherwise, while follow-up, status and stop keep working.",
-			"Use external_agent_start when a second model's opinion is worth more than another pass by yourself, or when the user explicitly asks for a specific agent such as codex.",
-			"Prefer asking two different agents the same question and comparing their answers over chaining agents in a pipeline; disagreement is the useful signal.",
-			"Treat any external agent's answer as a claim, not verified fact: check its conclusions against the code yourself before acting on them.",
-			"On external_agent_start, set the effort parameter only when the user explicitly requests a reasoning-effort or thinking-level override; otherwise omit it entirely so the target CLI/config default applies. Never infer an effort level from task complexity (specifying off is an explicit request, not the same as omitting it).",
-			"Default async pattern: after dispatching external agents whose results are not needed in this turn, end your turn — completion and stall notifications will re-invoke you. Do not poll with bash sleep loops.",
-			"Use external_agent_wait when the user is waiting for the result in this turn, or your immediate next step depends on it.",
-			"Use external_agent_status only for sparse progress checks (at least 60s apart) or when a task was started with notify off.",
-			`Use external_agent_steer on a running ${STEER_AGENTS} task to redirect it: correct a wrong approach, narrow the scope, or tell it to stop early. It is NOT an interrupt — the message lands at the next step boundary, so a bash command already running still completes.`,
-			`Use external_agent_follow_up on a settled ${FOLLOWUP_AGENTS} task to ask a second question in the same session: it remembers what it just did, so you do not have to restate the task. Refused once the session process has been reclaimed (30m idle) — dispatch a new task instead.`,
+			"Default: after dispatching tasks whose results you do not need now, end your turn — completion and stall notifications re-invoke you. Never sleep-poll.",
+			"Use external_agent_wait only when the result is needed in this turn.",
+			"external_agent_steer is not an interrupt (it lands at the next step boundary); if it reports that the turn already ended, use external_agent_follow_up.",
+			"external_agent_follow_up continues the same session instead of re-dispatching work already done.",
+			"Treat external agent answers as claims to verify against the code, not as fact.",
 		],
 		parameters: Type.Object({
 			agent: StringEnum(AGENT_IDS as unknown as readonly string[]),
 			task: Type.String({
-				description: "Self-contained instruction. The external agent has no access to this conversation.",
+				description: "Self-contained task text.",
 			}),
 			cwd: Type.Optional(Type.String({ description: "Working directory. Defaults to the session cwd." })),
 			mode: Type.Optional(
 				StringEnum(["readonly", "write", "yolo"] as const, {
 					description:
-						"readonly forbids mutations (harness-enforced where the agent supports it). write allows workspace edits. " +
-						"yolo removes the sandbox entirely (codex; on pi, write and yolo are equivalent full-tool runs since pi has no sandbox; " +
-						"on reasonix, yolo stays bounded by deny rules and the OS bash sandbox). " +
-						"Defaults to the agent's own default: codex/pi/reasonix/kimi/codebuddy/qoder yolo, others readonly.",
+						"readonly forbids mutations; write allows workspace edits; yolo removes the sandbox. " +
+						"An omitted mode uses the agent's own default.",
 				}),
 			),
-			model: Type.Optional(Type.String({ description: "Override the external agent's model, if it supports one." })),
+			model: Type.Optional(Type.String({ description: "Override the agent's model, if it supports one." })),
 			effort: Type.Optional(
 				StringEnum(EFFORT_LEVELS, {
 					description:
-						"Opt-in reasoning-effort override, where the agent supports one. Set it only when the user explicitly requests an " +
-						"effort/thinking level; do not choose one from task complexity. " +
-						"pi: off..max; codebuddy: minimal..max; claude: low..max; codex: off..xhigh (off maps to 'none'); " +
-						"reasonix: off..max (mapped onto the DeepSeek vocabulary: off->disabled, minimal->low, medium->high, xhigh->max); " +
-						"qoder: off, low..max (Qoder's documented vocabulary is disabled|off|none|low|medium|high|xhigh|max, so minimal is not offered); " +
-						"kimi: unsupported — an effort request for kimi is refused. Omit it to inherit the target CLI/config default " +
-						"(specifying off is an explicit override, not the same as omitting)."
+						"Opt-in reasoning-effort override. Set it only when the user explicitly requests an effort/thinking level; " +
+						"never infer one from task complexity. Omit it to inherit the target CLI/config default — specifying off is " +
+						"an explicit override, not the same as omitting. Per-agent levels are in the agent table.",
 				}),
 			),
 			notify: Type.Optional(
 				StringEnum(["steer", "followUp", "nextTurn", "off"] as const, {
 					description:
-						"How to be told when the task settles. steer (default) interrupts you as soon as the current tool batch ends. " +
-						"followUp waits until you are otherwise idle. nextTurn stays silent until the user speaks again. " +
-						"off means no callback and you must poll external_agent_status yourself.",
+						"How you are told it settled: steer interrupts at the end of the current tool batch, followUp when you " +
+						"are idle, nextTurn on the user's next message, off never (poll external_agent_status).",
 				}),
 			),
 			watchdog: Type.Optional(
 				Type.Number({
 					description:
-						"Minutes of no activity before a stall notification is sent (default 15; fractions allowed). " +
-						"0 disables the watchdog. Ignored when notify is off.",
+						"Minutes of no activity before a stall notice (default 15; 0 disables; notify off disables it too).",
 				}),
 			),
 		}),
@@ -1747,15 +1724,14 @@ export default function (pi: ExtensionAPI) {
 		name: "external_agent_status",
 		label: "External Agent Status",
 		description: [
-			"Inspect background external agent tasks. Omit taskId to list all of them.",
-			"For a running task you get elapsed time, how long it has been quiet, and recent activity.",
-			"For a finished task you get its answer. Use the quiet duration to judge whether a task is stuck:",
-			"steady new activity means it is working, a long quiet stretch with no progress means consider stopping it.",
+			"Check background external agent tasks. Omit taskId to list all; for one task you get elapsed and quiet",
+			"time plus recent activity, and its answer once settled. Steady activity means it is working; a long quiet",
+			"stretch means consider stopping it.",
 		].join(" "),
-		promptSnippet: "Check on background external agent tasks and collect their answers",
+		promptSnippet: "Check background external agent tasks and their answers",
 		parameters: Type.Object({
 			taskId: Type.Optional(Type.String()),
-			tail: Type.Optional(Type.Number({ description: "How many recent events to show. Default 8." })),
+			tail: Type.Optional(Type.Number({ description: "Recent events to show. Default 8." })),
 		}),
 
 		async execute(_id, params) {
@@ -1829,18 +1805,13 @@ export default function (pi: ExtensionAPI) {
 		name: "external_agent_wait",
 		label: "External Agent Wait",
 		description: [
-			"Block until external agent tasks settle or a timeout elapses. This is the correct way to wait",
-			"inside the current turn: one call replaces sleep-poll loops. On settle it returns the task's",
-			"answer; on timeout it returns a still-running summary, and you may wait again, continue other",
-			"work, or end the turn and rely on completion/stall notifications instead.",
+			"Block until external agent tasks settle or the timeout elapses: how to wait inside the current turn. On",
+			"settle it returns the answer; on timeout a still-running summary, and you may wait again, do other work,",
+			"or end your turn and rely on notifications.",
 		].join(" "),
-		promptSnippet: "Block until external agent tasks finish or a timeout elapses",
-		promptGuidelines: [
-			"Use external_agent_wait (not bash sleep loops) when you must wait for external agent results inside the current turn.",
-			"Prefer ending the turn over external_agent_wait when the result is not needed immediately; completion and stall notifications will re-invoke you.",
-		],
+		promptSnippet: "Block until external agent tasks settle or time out",
 		parameters: Type.Object({
-			taskIds: Type.Array(Type.String(), { description: "Task ids to wait for (from external_agent_start)." }),
+			taskIds: Type.Array(Type.String(), { description: "Task ids from external_agent_start." }),
 			timeout: Type.Optional(
 				Type.Number({ description: `Seconds to wait at most (default ${WAIT_DEFAULT_TIMEOUT_S}, max ${WAIT_MAX_TIMEOUT_S}).` }),
 			),
@@ -1957,68 +1928,46 @@ export default function (pi: ExtensionAPI) {
 		name: "external_agent_compare",
 		label: "External Agent Compare",
 		description: [
-			"Ask several agent CLIs the same thing in one synchronous, blocking call: every valid spec is dispatched",
-			"in parallel on the same task, the call returns once they have all settled (or the timeout elapses), and",
-			"the answers come back side by side in one aggregated receipt. Judging them is yours — this tool never",
-			"diffs, scores or ranks answers, and it never picks a winner; disagreement between agents is the signal,",
-			"not something it resolves. Use it to put one question to several models, or to run the same task across",
-			"worktrees by giving each spec its own cwd.",
-			"Each spec runs through the same dispatch path as external_agent_start, with its own mode, model, effort",
-			"and cwd, and a spec that fails validation (unsupported mode or effort, or a write/yolo conflict in that",
-			"directory) is recorded as a refusal while the other specs still run — a refusal is an entry in the",
-			"receipt, not a failed call.",
-			"Effort is opt-in per spec: set it only when the user explicitly asks for a reasoning-effort or",
-			"thinking-level override, otherwise omit it so each target CLI/config default applies — never infer a",
-			"level from task complexity.",
-			`On timeout (default ${WAIT_DEFAULT_TIMEOUT_S}s, max ${WAIT_MAX_TIMEOUT_S}s) the receipt returns whatever settled`,
-			"plus the taskIds still running: finish them with external_agent_wait, or end your turn and their",
-			"completion and stall notifications will re-invoke you. Use external_agent_start instead when you want",
-			"to keep working while the agents run.",
-			`Agents: ${agentTable}.`,
+			"Put one task to several agent CLIs in one blocking call: every valid spec is dispatched in parallel with",
+			"its own mode, model, effort and cwd, and the answers come back side by side once they settle or the",
+			"timeout elapses. It never diffs, scores or ranks — judging is yours. A spec that fails validation",
+			"(unsupported mode or effort, write/yolo conflict in its cwd) is recorded as a refusal while the others",
+			"still run. On timeout the receipt lists the taskIds still running: finish them with external_agent_wait,",
+			"or end your turn and their notifications re-invoke you. Use external_agent_start when you want to keep",
+			"working meanwhile.",
 		].join(" "),
-		promptSnippet: "Ask several external agent CLIs the same task at once and collect their answers side by side",
+		promptSnippet: "Ask several external agent CLIs the same task at once",
 		promptGuidelines: [
-			"Use external_agent_compare when the same question should go to several agents at once — a second opinion, a cross-check, or one task in several worktrees — and you want the answers together; it blocks until they settle, so use external_agent_start instead when you can keep working meanwhile.",
-			"external_agent_compare returns the answers verbatim and does not diff or rank them: read them yourself, and treat each one as a claim to verify against the code rather than a verdict.",
-			"On external_agent_compare, set a spec's effort only when the user explicitly requests a reasoning-effort or thinking-level override for that agent; otherwise omit it so the target CLI/config default applies, and never infer a level from task complexity.",
-			"When external_agent_compare times out, collect the remaining answers with external_agent_wait or end your turn; the tasks it listed keep running either way.",
+			"Prefer external_agent_compare over chaining agents in a pipeline: disagreement between answers is the signal.",
 		],
 		parameters: Type.Object({
 			task: Type.String({
-				description:
-					"Self-contained instruction sent to every agent. They have no access to this conversation, so state the goal, name the files and say what to return.",
+				description: "Self-contained instruction sent to every agent.",
 			}),
 			agents: Type.Array(
 				Type.Object({
 					agent: StringEnum(AGENT_IDS as unknown as readonly string[]),
 					cwd: Type.Optional(
 						Type.String({
-							description:
-								"Working directory for this agent. Defaults to the session cwd — give each spec its own worktree to run the same task across directories.",
+							description: "Working directory for this agent. Defaults to the session cwd.",
 						}),
 					),
 					mode: Type.Optional(
 						StringEnum(["readonly", "write", "yolo"] as const, {
-							description:
-								"Permission mode for this agent. Defaults to that agent's own default. Non-readonly specs in a " +
-								"directory that already has a running non-readonly task are refused, exactly as external_agent_start refuses them.",
+							description: "Permission mode for this agent. An omitted mode uses its own default.",
 						}),
 					),
-					model: Type.Optional(Type.String({ description: "Override this agent's model, if it supports one." })),
+					model: Type.Optional(Type.String({ description: "Override this agent's model." })),
 					effort: Type.Optional(
 						StringEnum(EFFORT_LEVELS, {
-							description:
-								"Opt-in reasoning-effort override for this agent, where it supports one (same allowlist as " +
-								"external_agent_start: kimi has none and refuses the request). Set it only when the user explicitly " +
-								"requests an effort/thinking level; omit it to inherit the target CLI/config default, and never pick " +
-								"one from task complexity. Specifying off is an explicit override, not the same as omitting it.",
+							description: "Same opt-in effort rules as external_agent_start.",
 						}),
 					),
 				}),
 				{
 					minItems: COMPARE_MIN_AGENTS,
 					maxItems: COMPARE_MAX_AGENTS,
-					description: `Two to ${COMPARE_MAX_AGENTS} agents to compare, each optionally overriding cwd, mode, model and effort.`,
+					description: `Two to ${COMPARE_MAX_AGENTS} agents to compare.`,
 				},
 			),
 			timeout: Type.Optional(
@@ -2174,24 +2123,20 @@ export default function (pi: ExtensionAPI) {
 		name: "external_agent_steer",
 		label: "External Agent Steer",
 		description: [
-			"Send a mid-run guidance message to a running external agent task.",
-			"IMPORTANT: this is not an interrupt. The message is injected at the next step boundary — after the tool",
-			"call that is already executing finishes and before the next model call — so a long-running bash command",
-			"still completes. Use it to correct the approach, narrow the scope, add a constraint, or tell the agent to",
-			"wrap up early; do not expect it to cancel work in flight (use external_agent_stop for that).",
-			`Supported agents: ${STEER_AGENTS}. The remaining agents run as one-shot processes and cannot be steered. Qoder steering is conditional: it needs the CLI to announce a stable release at or above our documented-SDK baseline (1.1.49) and is otherwise refused with the reported version, which is not a claim about the vendor's own minimum.`,
-			"Requires the task to still be running; for a task that has already settled, use external_agent_follow_up.",
+			"Send a mid-run guidance message to a running external agent task: correct the approach, narrow the scope,",
+			"add a constraint, or tell it to wrap up early (to cancel it instead, use external_agent_stop). Supported:",
+			`${STEER_AGENTS}; the others are one-shot and cannot be steered. Qoder steering requires the announced qodercli stable`,
+			"version >= 1.1.49 and is refused with the reported version otherwise. For a settled task, use",
+			"external_agent_follow_up.",
 		].join(" "),
-		promptSnippet: "Redirect a running external agent task at its next step boundary",
+		promptSnippet: "Redirect a running external agent task mid-run",
 		promptGuidelines: [
-			`Use external_agent_steer while a ${STEER_AGENTS} task is running to correct its approach instead of stopping and re-dispatching.`,
-			"Steering is delivered at a step boundary, never mid-tool-call: do not expect it to abort a bash command that is already running.",
-			"If external_agent_steer reports the turn is no longer active, use external_agent_follow_up instead — the task has already settled.",
+			`Use external_agent_steer while a ${STEER_AGENTS} task is running to correct its approach instead of stopping and re-dispatching it.`,
 		],
 		parameters: Type.Object({
 			taskId: Type.String({ description: "Task id from external_agent_start." }),
 			message: Type.String({
-				description: "Guidance to inject. Keep it imperative and self-contained; it arrives as a new user message.",
+				description: "Guidance to inject; it arrives as a new user message.",
 			}),
 		}),
 
@@ -2241,21 +2186,15 @@ export default function (pi: ExtensionAPI) {
 		name: "external_agent_follow_up",
 		label: "External Agent Follow Up",
 		description: [
-			"Continue a settled external agent task with another message in the SAME session: the agent still has",
-			"everything it did and learned, so you can ask a second question without restating the task.",
-			"The task goes back to running and notifies you again when the new turn settles.",
-			`Supported agents: ${FOLLOWUP_AGENTS}. Requires the task to have settled (not running) and its session process`,
-			"to still be alive — sessions are reclaimed after 30 minutes idle, after which a follow-up is refused and",
-			`you should dispatch a new task instead. If the task is still running, wait for it to settle first — only ${STEER_AGENTS} also support mid-run steering.`,
+			"Continue a settled external agent task with another message in the SAME session: it still has everything",
+			"it did and learned, so you need not restate the task. It goes back to running and notifies you again when",
+			`the new turn settles. Supported: ${FOLLOWUP_AGENTS}. Reclaimed after 30 minutes idle; a follow-up is then refused, so`,
+			"dispatch a new task instead.",
 		].join(" "),
-		promptSnippet: "Ask a follow-up question in the same external agent session",
-		promptGuidelines: [
-			`Use external_agent_follow_up after a ${FOLLOWUP_AGENTS} task settles to ask a clarifying question or request a revision in the same session, instead of dispatching a fresh task that would repeat all the work.`,
-			"A refused follow-up means the session process is gone; dispatch a new task with a self-contained prompt rather than trying to restore it.",
-		],
+		promptSnippet: "Ask a follow-up in the same external agent session",
 		parameters: Type.Object({
 			taskId: Type.String({ description: "Task id from external_agent_start." }),
-			message: Type.String({ description: "The follow-up instruction or question for the same session." }),
+			message: Type.String({ description: "Follow-up message for the same session." }),
 		}),
 
 		async execute(_id, params): Promise<AgentToolResult<ExternalAgentFollowUpDetails>> {
@@ -2364,7 +2303,7 @@ export default function (pi: ExtensionAPI) {
 		name: "external_agent_stop",
 		label: "External Agent Stop",
 		description:
-			"Terminate a running external agent task by taskId, or all of them with all=true. Use this when a task has been quiet long enough that you judge it stuck, or when its answer is no longer needed.",
+			"Terminate a running external agent task by taskId, or every task with all=true — for a task you judge stuck or no longer need.",
 		promptSnippet: "Stop a background external agent task",
 		parameters: Type.Object({
 			taskId: Type.Optional(Type.String()),

@@ -72,23 +72,22 @@ test("metadata: external_agent_start surfaces do not recommend inferring effort 
 	}
 });
 
-test("metadata: effort is described as opt-in on description, schema, and the named guideline", () => {
-	assert.match(DESCRIPTION_SURFACE, /opt-in reasoning-effort override/i);
-	assert.match(DESCRIPTION_SURFACE, /never infer a level from task complexity/i);
-	assert.match(DESCRIPTION_SURFACE, /target CLI\/config default/i);
+test("metadata: the opt-in effort rule has exactly one home, the start effort schema", () => {
+	// The full rule lives in the effort parameter of external_agent_start and
+	// nowhere else; every other surface either points at it or stays silent.
+	assert.equal(INDEX_SOURCE.match(/opt-in reasoning-effort override/gi)?.length, 1);
 
 	assert.match(EFFORT_PARAM_SURFACE, /opt-in reasoning-effort override/i);
 	assert.match(EFFORT_PARAM_SURFACE, /explicitly requests an/i);
+	assert.match(EFFORT_PARAM_SURFACE, /never infer one from task complexity/i);
 	assert.match(EFFORT_PARAM_SURFACE, /Omit it to inherit the target CLI\/config default/i);
 
-	const effortGuideline = INDEX_SOURCE.split("\n").find((line) =>
-		line.includes("Never infer an effort level from task complexity"),
-	);
-	assert.ok(effortGuideline, "the opt-in effort promptGuideline is missing");
-	assert.match(effortGuideline, /external_agent_start/);
-	assert.match(effortGuideline, /explicitly requests a reasoning-effort/i);
-	assert.match(effortGuideline, /omit it entirely/i);
-	assert.match(effortGuideline, /target CLI\/config default/i);
+	// The description delegates instead of restating, and the guideline that
+	// used to repeat the rule is gone.
+	assert.match(DESCRIPTION_SURFACE, /see the effort parameter/i);
+	assert.doesNotMatch(DESCRIPTION_SURFACE, /explicitly requests an/i);
+	assert.doesNotMatch(DESCRIPTION_SURFACE, /target CLI\/config default/i);
+	assert.doesNotMatch(GUIDELINES_SURFACE, /effort/i);
 });
 
 test("one-shot: omitting effort adds no effort argument and invents no default", () => {
