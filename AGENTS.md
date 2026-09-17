@@ -1,0 +1,32 @@
+# AGENTS.md
+
+Working rules for agents editing this repository.
+
+## Layout
+
+- `index.ts` — hub: tool registration, dispatch validation, task registry, stall watchdog, notifications.
+- `adapters.ts` — per-CLI one-shot adapters: argv spelling and stdout parsing, plus the `ADAPTERS` registry.
+- `sessions.ts` — persistent session drivers for steer / follow-up.
+- `hooks/` — `codebuddy-readonly.js`, the PreToolUse Bash hook loaded by codebuddy's readonly `--settings`.
+- `test/` — `node:test` suites; pi packages are stubbed via `registerHooks`.
+
+## Commands
+
+- `node --test "test/**/*.test.ts"` — full suite.
+- `npx tsc --noEmit` — typecheck.
+
+Run only the test file relevant to your change locally; run the full suite before committing.
+
+## Invariants
+
+- **No wall-clock kill.** Tasks run to completion. The stall watchdog notifies the model when a running task goes quiet (default 15m); the model decides whether to stop. See [.agents/notes/implemented/2026-08-17-no-wall-clock-timeout.md](.agents/notes/implemented/2026-08-17-no-wall-clock-timeout.md).
+- **Permission tiers are enforced by the target CLI harness**, never by a prompt-level request. See [docs/adapters.md](docs/adapters.md).
+- **One tool surface.** `agent` is an enum rather than one tool per CLI, because tool descriptions cost context in every request. See [.agents/notes/implemented/2026-08-17-single-tool-surface.md](.agents/notes/implemented/2026-08-17-single-tool-surface.md).
+- **Non-trivial changes ship with a note** in `.agents/notes/` in the same commit.
+
+## Documentation rules
+
+- [docs/](docs/) holds present-tense facts about the current system — no change-of-state or revision history, in English or Chinese. History belongs to git and notes.
+- [.agents/notes/](.agents/notes/) holds decision records. Template: Problem / Decision / Alternatives considered / Consequences. Every alternative states its strongest reason and why it was rejected. No `INDEX.md` — the folder is the status.
+- Word budgets are enforced by test: `AGENTS.md` ≤ 550 words, each `docs/*.md` ≤ 650 words, each note ≤ 120 lines.
+- Index: [docs/architecture.md](docs/architecture.md) (dispatch flow, receipts, transports) · [docs/adapters.md](docs/adapters.md) (capability matrix) · [docs/qoder.md](docs/qoder.md) (Qoder stream-json contract).
