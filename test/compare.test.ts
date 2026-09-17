@@ -82,6 +82,10 @@ if (process.env.COMPARE_MOCK_HOLD === "1") {
 `,
 	// codex is driven over `codex app-server` (JSON-RPC), i.e. the persistent
 	// session arm of the compare dispatch rather than the one-shot arm.
+	// COMPARE_MOCK_COALESCE writes the turn/start response and both completion
+	// notifications as ONE chunk, the arrival order a fast turn produces when
+	// the reader is busy; the default is three writes, which usually arrive as
+	// three separate reads. Both orders must settle.
 	codex: `#!/usr/bin/env node
 const fs = require("node:fs");
 const turnFile = process.env.COMPARE_MOCK_TURN_FILE;
@@ -100,9 +104,16 @@ process.stdin.on("data", function (chunk) {
 			process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { thread: { id: "thread-1" } } }) + "\\n");
 		} else if (msg.method === "turn/start") {
 			if (turnFile) fs.appendFileSync(turnFile, JSON.stringify(msg.params) + "\\n");
-			process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { turn: { id: "turn-1" } } }) + "\\n");
-			process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "item/completed", params: { item: { type: "agentMessage", text: "CODEX-ANSWER" } } }) + "\\n");
-			process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "turn/completed", params: { turn: { status: "completed" } } }) + "\\n");
+			const reply = JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { turn: { id: "turn-1" } } }) + "\\n";
+			const item = JSON.stringify({ jsonrpc: "2.0", method: "item/completed", params: { item: { type: "agentMessage", text: "CODEX-ANSWER" } } }) + "\\n";
+			const done = JSON.stringify({ jsonrpc: "2.0", method: "turn/completed", params: { turn: { status: "completed" } } }) + "\\n";
+			if (process.env.COMPARE_MOCK_COALESCE === "1") {
+				process.stdout.write(reply + item + done);
+			} else {
+				process.stdout.write(reply);
+				process.stdout.write(item);
+				process.stdout.write(done);
+			}
 		}
 	}
 });
@@ -446,6 +457,49 @@ test("compare: a persistent-session agent rides its session driver in the same b
 
 		const text = compared.content[0].text;
 		assert.match(text, /summary: 2 specs · 2 dispatched · 2 done/);
+	} finally {
+		await call("external_agent_stop", { all: true });
+		restoreEnv();
+		restorePath();
+	}
+});
+
+/**
+ * Regression for a driver race, not a test artifact: `codex app-server` may
+ * write the turn/start response and the turn's completion notifications in one
+ * chunk, so the completion is read in the same synchronous batch as the
+ * response — before the awaited response continuation would have marked the
+ * turn active. The driver used to drop that completion, leaving the task
+ * running until the batch deadline. COMPARE_MOCK_COALESCE makes that ordering
+ * deterministic; the default three-write fixture only hits it ~50% of the time
+ * and never when the test runs alone.
+ */
+test("compare: a codex turn whose completion shares the turn/start response chunk still settles", async () => {
+	const dir = makeFixtureDir(COMPARE_MOCKS);
+	const turnFile = path.join(dir, "turn-start.jsonl");
+	const restorePath = usePath(dir);
+	const restoreEnv = withEnv({ COMPARE_MOCK_TURN_FILE: turnFile, COMPARE_MOCK_COALESCE: "1" });
+	try {
+		const compared = await compare(
+			{
+				task: "name the transport this agent uses",
+				agents: [
+					{ agent: "codex", mode: "yolo" },
+					{ agent: "claude", mode: "readonly" },
+				],
+			},
+			dir,
+		);
+
+		const [session, oneshot] = compared.details.results;
+		assert.equal(session.refused, false);
+		assert.equal(session.state, "done");
+		assert.equal(session.answer, "CODEX-ANSWER");
+		assert.equal(session.dispatch.transport, "persistent");
+		assert.equal(oneshot.state, "done");
+		assert.equal(mockLog(turnFile).length, 1);
+		assert.equal(compared.details.timedOut, false);
+		assert.match(compared.content[0].text, /summary: 2 specs · 2 dispatched · 2 done/);
 	} finally {
 		await call("external_agent_stop", { all: true });
 		restoreEnv();

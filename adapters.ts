@@ -4,50 +4,29 @@
  * Each adapter knows two things and nothing else:
  *   - buildDispatch: how to spell and describe a headless, structured-output invocation
  *   - parseEvent: how to turn one stdout line into a normalized event
- *
  * Everything else (spawn, monitoring, abort, bookkeeping) is shared in index.ts.
  *
- * Verified by hand on 2026-08-17 against the installed binaries (codex 0.147.0,
- * pi 0.84.2, kimi-code 0.36.1, codebuddy 2.117.1, claude 2.1.165,
- * reasonix 1.21.0 — all dispatched end-to-end with exit 0). Adapter facts below
- * are observations, not assumptions:
- *   codex     -> OpenAI, `--sandbox read-only` enforced by its own harness
- *   kimi      -> Moonshot, yolo-only workhorse: -p rejects all permission
- *                flags (--auto/--yolo/--plan), so headless runs inherit
- *                config.toml's default_permission_mode
- *   codebuddy -> Tencent, Claude-Code-compatible CLI surface incl.
- *                bypassPermissions (headless-verified 2.143.1)
- *   claude    -> shares pi's own configured gateway; HTTP 524 observed 2026-07-27,
- *                verified healthy again 2026-08-17
- *   reasonix  -> DeepSeek-native harness (v1.21.0), prefix-cache tuned
+ * Capabilities as currently wired:
+ *   codex     -> OpenAI; yolo workhorse with its own sandbox tiers (read-only / workspace-write / danger-full-access)
+ *   kimi      -> Moonshot; yolo-only because -p rejects every permission flag, so a
+ *                headless run inherits config.toml's default_permission_mode and readonly/write are refused.
+ *                Why: .agents/notes/implemented/2026-09-07-kimi-yolo-only.md
+ *   codebuddy -> Tencent; Claude-Code-compatible surface, yolo default (all tiers open);
+ *                readonly runs default mode with a runtime-built --settings hook.
+ *                Why: .agents/notes/implemented/2026-09-07-codebuddy-readonly-hook.md
+ *   claude    -> readonly default, capped at write; shares pi's own gateway
+ *   reasonix  -> DeepSeek-native harness (prefix-cache tuned), yolo default
+ *   qoder     -> yolo default, stream-json driven; steering is version-gated.
+ *                Why: .agents/notes/implemented/2026-09-15-qoder-steering-version-gate.md
  *
- * zcode was removed on 2026-09-08 (user decision: not needed anymore).
- *
- * Dispatch policy: codex is the workhorse and
- * default to yolo (unsandboxed); claude stays read-only by default and is rarely
- * used. codebuddy joined the yolo-default workhorses on 2026-09-07 (user
- * decision): it still leans toward exploration, but every tier is open — yolo
- * maps to --permission-mode bypassPermissions, verified headless on 2.143.1
- * (Write ran unprompted, permission_denials empty).
- * kimi joined the workhorses on 2026-09-07 as YOLO-ONLY (user decision):
- * kimi-code 0.41.0 rejects every permission flag with -p ("Cannot combine
- * --prompt with --auto/--yolo/--plan"), so a headless run always executes under
- * default_permission_mode in ~/.kimi-code/config.toml (currently "yolo"). A
- * readonly/write tier would be a label with no enforcement behind it, so both
- * are refused at dispatch via minMode.
- *
- * Reasoning-effort flags verified against each binary's --help on 2026-08-03:
- *   pi          -> --thinking <off|minimal|low|medium|high|xhigh|max>
- *   codebuddy   -> --effort <minimal|low|medium|high|xhigh|max>
- *   claude      -> --effort <low|medium|high|xhigh|max>
- *   codex -> -c model_reasoning_effort="<level>" (no dedicated flag; the
- *                  extension's "off" maps to codex's "none"; codex silently
- *                  tolerates unknown values, so the allowlist lives here)
- *   kimi        -> no reasoning-effort control exists; requests are refused
- *   reasonix    -> --effort <LEVEL>; the adapter maps to the configured DeepSeek
- *                    vocabulary itself (off->disabled, minimal->low, medium->high,
- *                    xhigh->max — the same mapping pi's own thinkingLevelMap uses
- *                    for the og/deepseek-v4-flash relay model)
+ * Effort flags as currently supported (index.ts refuses anything else):
+ *   pi        -> --thinking <off|minimal|low|medium|high|xhigh|max>
+ *   codebuddy -> --effort <minimal|low|medium|high|xhigh|max>
+ *   claude    -> --effort <low|medium|high|xhigh|max>
+ *   codex     -> -c model_reasoning_effort="<off|minimal|low|medium|high|xhigh>" (no dedicated flag; "off" -> "none")
+ *   kimi      -> none; requests are refused
+ *   reasonix  -> --effort <LEVEL> mapped onto the relay's vocabulary disabled|low|high|max
+ *   qoder     -> --reasoning-effort <off|low|medium|high|xhigh|max> (no "minimal")
  */
 
 import { fileURLToPath } from "node:url";
