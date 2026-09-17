@@ -1,34 +1,22 @@
 /**
- * External Agent Hub
+ * External Agent Hub: lets pi dispatch work to other coding agent CLIs installed on
+ * this machine and monitor them while they run.
  *
- * Lets pi dispatch work to other coding agent CLIs installed on this machine and
- * monitor them while they run.
+ * 1. No wall-clock kill. Tasks run in the background until they finish, the model
+ *    stops them, or the session ends; the stall watchdog (15m quiet) reports in and
+ *    the model decides whether to stop. Waiting is turn-end plus settle/stall
+ *    notifications, blocking external_agent_wait, or external_agent_compare
+ *    (side by side, no judging). Why: .agents/notes/implemented/2026-08-17-no-wall-clock-timeout.md
  *
- * Design decisions worth knowing before editing:
+ * 2. Permission tiers are enforced by the target harness, never by a prompt
+ *    request, and defaults are per-adapter: codex/pi/kimi/codebuddy/reasonix/qoder
+ *    yolo, claude readonly. kimi is yolo-only (headless mode rejects permission
+ *    flags), so readonly/write are refused; concurrent write/yolo tasks in the same
+ *    directory are refused outright. Why: .agents/notes/implemented/2026-09-07-kimi-yolo-only.md
  *
- * 1. No hard timeout. Tasks start in the background and keep running until they
- *    finish, until the model stops them, or until the session ends. A stall
- *    watchdog notifies the model when a running task has been quiet for too long
- *    (default 15m), so ending the turn while waiting is safe; the model only
- *    decides whether to stop a task after being told it went quiet. A wall-clock
- *    kill would just be a guess dressed up as policy.
- *
- *    Waiting itself has two supported shapes: end the turn and let settle/stall
- *    notifications re-invoke the model (default), or block inside the turn with
- *    external_agent_wait when the result is needed immediately. A third,
- *    external_agent_compare, blocks on the same task handed to several agents at
- *    once and returns their answers side by side without judging them.
- *    Sleep-polling is an anti-pattern all of them exist to replace.
- *
- * 2. Per-agent permission defaults, enforced by the *target* harness rather than
- *    by a prompt request. codex/pi are the workhorses and default to yolo
- *    (unsandboxed) because they run real implementation work; everything else
- *    defaults to read-only. Adapters that cannot enforce read-only (kimi) are
- *    capped at it, and concurrent write/yolo tasks in the same directory are
- *    refused outright: a concurrent unobservable mutation is not a judgement call.
- *
- * 3. One tool surface, many agents. `agent` is an enum rather than one tool per
- *    CLI, because tool descriptions cost context in every request.
+ * 3. One tool surface: `agent` is an enum rather than one tool per CLI, because
+ *    tool descriptions cost context in every request.
+ *    Why: .agents/notes/implemented/2026-08-17-single-tool-surface.md
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
