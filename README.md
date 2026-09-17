@@ -9,14 +9,11 @@ A [pi](https://github.com/earendil-works/pi) extension that lets pi dispatch cod
 ```bash
 # Pin a version (recommended; pi update leaves pinned installs alone)
 pi install git:github.com/tom-cat-mao/pi-external-agent@v0.2.0
-
 # Or track main
 pi install git:github.com/tom-cat-mao/pi-external-agent
 ```
 
-Requires pi ≥ 0.85 and whichever agent CLIs you want to drive (they don't all need to be installed).
-
-For the Qoder agent, install the Qoder CLI (`qodercli`) and make sure it is on `PATH` and signed in (`qodercli login`). Startup, permission and follow-up paths were exercised with qodercli 1.0.18; steering requires this adapter's stable-release baseline of 1.1.49 or newer (see compatibility notes below). Official references: [Input Modes](https://docs.qoder.com/cli/sdk/input-modes) (the streaming `priority` / `shouldQuery` contract), [Run in Scripts](https://docs.qoder.com/cli/run-in-scripts) (`--input-format stream-json`), [Permissions](https://docs.qoder.com/cli/permissions), the [CLI reference](https://docs.qoder.com/cli/cli-reference) and the [Settings reference](https://docs.qoder.com/cli/settings-reference). The wire shapes were cross-checked against the published [`@qoder-ai/qoder-agent-sdk`](https://www.npmjs.com/package/@qoder-ai/qoder-agent-sdk) 1.0.39.
+Requires pi ≥ 0.85 and whichever agent CLIs you want to drive (they don't all need to be installed). Qoder needs `qodercli` on `PATH`, signed in; steering additionally needs an announced stable qodercli ≥ 1.1.49 — see [docs/qoder.md](docs/qoder.md).
 
 ## Tools
 
@@ -32,7 +29,7 @@ For the Qoder agent, install the Qoder CLI (`qodercli`) and make sure it is on `
 
 ## Comparing agents
 
-`external_agent_compare` hands the same task to several agents in one call: every valid spec is dispatched in parallel, the call blocks until they have all settled (or the timeout elapses), and the answers come back side by side in one receipt. The extension never diffs, scores or ranks them — judging them is the caller's job, and disagreement between agents is the signal the tool exists to surface, not something it resolves.
+`external_agent_compare` hands the same task to several agents in one call and returns their answers side by side, without diffing, scoring or ranking them — disagreement is the signal the tool exists to surface. Each spec runs through the same dispatch path and validation as `external_agent_start` (a refused spec is recorded in the receipt while the rest still run), and on timeout the receipt returns what settled plus the taskIds still running.
 
 | Parameter | Meaning |
 |---|---|
@@ -40,85 +37,23 @@ For the Qoder agent, install the Qoder CLI (`qodercli`) and make sure it is on `
 | `agents` | 2–8 specs of `{ agent, cwd?, mode?, model?, effort? }`. `mode` defaults to that agent's own default, `cwd` to the session directory |
 | `timeout` | Seconds to wait for the whole batch (optional; default 600, max 3600) |
 
-Each spec runs through exactly the same dispatch path and validation as `external_agent_start`, so it is refused for the same reasons a start would be — a mode outside the adapter's range, an unsupported effort request, or a write/yolo conflict with a task already running in that directory. A refused spec is recorded in the receipt with its refusal reason and the other specs still run: only a spec count outside 2–8 fails the whole call. Answers are trimmed to 8000 characters each (the receipt names the taskId to read the full text from), and `effort` stays opt-in per spec, exactly as on start.
-
-On timeout the receipt returns whatever settled plus the taskIds still running: finish those with `external_agent_wait`, or end the turn — their normal completion and stall notifications are switched back on. While the call is blocking they run without callbacks, because the receipt you get back is the notification.
-
-```
-external_agent_compare {
-  task: "Review the error handling in this worktree and list the three riskiest paths.",
-  agents: [
-    { agent: "codex", cwd: "/repo/wt-a", mode: "readonly" },
-    { agent: "codebuddy", cwd: "/repo/wt-b", mode: "readonly" },
-    { agent: "qoder", mode: "readonly" }
-  ],
-  timeout: 900
-}
-```
-
 ## Agents
 
-| Agent | Vendor | Default mode | Role | Steer / follow-up |
-|---|---|---|---|---|
-| `codex` | OpenAI | yolo | Primary executor | ✅ via `app-server` |
-| `pi` | pi itself (child process) | yolo | Executor with fully configurable `--model` | ✅ via `--mode rpc` |
-| `reasonix` | DeepSeek-native | yolo (deny rules + OS sandbox still apply) | Executor / reviewer | ✅ via ACP vendor extension |
-| `codebuddy` | Tencent | yolo | Fast executor / repo exploration | ✅ via ACP step-boundary injection |
-| `qoder` | Alibaba | yolo | Executor / independent reviewer | follow-up ✅; steer ✅ when the announced CLI meets the 1.1.49 baseline |
-| `kimi` | Moonshot | yolo only (its headless mode rejects permission flags) | Executor | ❌ |
-| `claude` | Anthropic | readonly | Analysis / planning | ❌ |
+| Agent | Vendor | Default mode | Steer / follow-up |
+|---|---|---|---|
+| `codex` | OpenAI | yolo | ✅ via `app-server` |
+| `pi` | pi itself (child process) | yolo | ✅ via `--mode rpc` |
+| `reasonix` | DeepSeek-native | yolo (deny rules + OS sandbox still apply) | ✅ via ACP vendor extension |
+| `codebuddy` | Tencent | yolo | ✅ via ACP step-boundary injection |
+| `qoder` | Alibaba | yolo | follow-up ✅; steer ✅ when the announced CLI meets the 1.1.49 baseline |
+| `kimi` | Moonshot | yolo only (its headless mode rejects permission flags) | ❌ |
+| `claude` | Anthropic | readonly | ❌ |
 
-## Behavior
+## Documentation
 
-- **Modes**: `readonly` / `write` / `yolo`, mapped to each CLI's real sandbox or permission flags — not prompt-level requests. Where a CLI has no OS sandbox, `write`/`yolo` are permission-rule tiers only, not an OS sandbox. Concurrent write/yolo tasks in the same directory are refused.
-
-- **No hard timeout**: tasks run to completion. A stall watchdog (default 15m quiet) notifies the host model, which decides whether to stop the task. `external_agent_wait` exists for when you need the answer inside the current turn.
-
-- **Persistent sessions mean follow-up**: for agents with a session transport, completion means the turn ended, not that the process exited. The process stays alive for 30 minutes, which is what lets `external_agent_follow_up` ask a second question with the full conversation intact. Mid-run steering is a separate capability supported by `codex`, `pi`, `reasonix` and `codebuddy`; Qoder additionally requires a compatible announced CLI version.
-
-- **Honest receipts**: every dispatch returns a receipt recording the exact argv, effective permission policy, and whether model/effort overrides were actually forwarded — unsupported overrides are reported as not forwarded instead of silently dropped.
-
-- **Effort is opt-in**: omit `effort` unless the user explicitly requests a reasoning-effort or thinking-level override. The target CLI/config default then applies; never infer a level from task complexity. Explicit overrides are validated against the adapter's allowlist, with final support depending on the selected model and CLI. `off` is an explicit override, not the same as omission.
-
-- **Codebuddy `readonly` enforcement**: instead of plan mode, codebuddy's readonly tier runs in `default` permission mode with a generated `--settings` payload — allow/deny tool rules plus a `PreToolUse` Bash hook (`hooks/codebuddy-readonly.js`) that heuristically allows common read-only commands and denies edits, writes, redirects, command substitution and known-mutating commands. The hook is a heuristic shell filter, **not** an OS sandbox: general script runners it has to allow (`node`, `npm`, `gh`, …) can act beyond its patterns, so readonly is best-effort, not an absolute guarantee. Claude's readonly tier keeps plan mode.
-
-- **Qoder `readonly` enforcement**: `--permission-mode dont_ask` (any operation that would prompt is denied in headless mode), a built-in tool allowlist (`--tools Read,Grep,Glob,WebSearch,WebFetch`), `--disallowed-tools mcp__*,Agent`, `--strict-mcp-config` with an empty server list, and a per-invocation `--settings {"disableAllHooks":true}` that disables user, project, local and plugin hooks — so a hook cannot short-circuit the pipeline. Edits, shell/Bash, MCP tools and subagent launches are thus refused by Qoder itself. Verified on qodercli 1.0.18: a readonly run refused to create a fixture file.
-
-- **Qoder `write` / `yolo`**: `write` maps to `--permission-mode accept_edits` (in-directory edits auto-approved; every other operation that would prompt is refused, never auto-allowed) and `yolo` to `bypass_permissions`. Both inherit Qoder's configured permission rules and hooks and are **not** an OS sandbox. Non-default modes only take effect in a trusted startup directory; otherwise Qoder falls back to `default` (where headless asks are denied). Verified on qodercli 1.0.18: `accept_edits` created a fixture file.
-
-- **Qoder steering and its transport**: Qoder is driven over its documented streaming input channel — `qodercli -p --output-format stream-json --input-format stream-json`, the same streaming flags used by the official SDK — instead of `--acp`. The ACP page documents only editor integration and exposes no steering metadata there, so a second `session/prompt` under ACP would prove queueing, not step-boundary steering.
-
-  Wire shape, all cross-checked against `@qoder-ai/qoder-agent-sdk` 1.0.39 and the CLI docs:
-
-  - The task text is not an argv argument; it is one JSON object per LF on stdin (`{"type":"user","message":{"role":"user","content":[{"type":"text","text":…}]},"parent_tool_use_id":null,"uuid":…}`), with a `randomUUID` as the message uuid because the protocol keys commands by it.
-  - Boot sends the SDK's `initialize` control request as soon as the process is up, then waits for **either** its `control_response` **or** the CLI's `system`/`init` record before sending the first user message. Neither signal can be required on its own: an authenticated qodercli 1.0.18 answers `initialize` and does not announce `system`/`init` until later, while an unauthenticated one announces `system`/`init` and never answers. A failure frame (synthetic API error, failed result, unanswerable control request) that arrives with the handshake makes `start()` throw instead of opening a turn on a dead session.
-  - `result` ends exactly one turn; a result record without a `subtype` is incomplete and is ignored rather than settling the turn with an empty answer.
-  - A steer is one user message with `priority: "next"` (the documented "next suitable opportunity", i.e. a step boundary) and `shouldQuery: false` (the message joins the active turn without starting a turn of its own), so it never interrupts and is never promoted into an independent turn of its own. Because of that the steer receipt says the guidance was **sent/queued**, not definitely applied: guidance that arrives after the turn's last step stays as context for the next user message. `priority: "now"` (an interrupt) is deliberately never used for steering.
-  - An unrecovered, truncated main-assistant stream settles as cancelled rather than clean done; a synthetic main-assistant API error fails the turn with its message. Child-assistant errors do not independently fail or cancel the main turn.
-  - Cancelling uses the SDK's `interrupt` control request. A matched response reporting `still_queued` produces a warning; the hub's stop path then terminates the process. Leftover results do not invent new task turns.
-  - Any inbound `can_use_tool` control request is answered (fail-closed `deny` for readonly/write, `allow` for yolo) with its own `request_id` echoed back, and a request that arrives without a usable id fails the turn instead of leaving the CLI blocked on a reply nobody sends.
-  - `command_lifecycle` records are honoured when the CLI sends them: a `discarded`/`cancelled` state for a steer raises a warning rather than leaving the earlier "accepted" claim standing.
-
-  **Steering is conditional.** A steer is only sent when the CLI announces a stable release at or above **1.1.49** — the version our documented SDK pairing (`@qoder-ai/qoder-agent-sdk` 1.0.39) targets. That is *our documented-contract baseline*, not a claim about the vendor's earliest supporting version. The announced `qodercli_version` (from the `system`/`init` record, or the same field in the `initialize` response when present) must be present, be a stable release number, and meet the baseline; a missing, malformed, prerelease or older version makes `external_agent_steer` refuse with the reported version and an upgrade note, writes no steer frame at all, and leaves start/status/follow-up/stop fully usable.
-
-  Why the gate exists: the inspected qodercli 1.0.18 binary's inbound user-message schema declares `priority: ["now","next","later"]` but not `shouldQuery`, and nothing in it reads `shouldQuery` off an inbound frame — so on an older CLI a steer would be an ordinary queued message whose delivery contract we cannot confirm. Per-command `command_lifecycle` records appear in SDK 1.0.39's protocol types but are absent from the local 1.0.18 binary; handling them is optional and never blocks steering.
-
-  **Live verification status:** after updating the CLI, a read-only probe with qodercli **1.1.52** completed the real driver handshake and passed the steering version check, with no model or effort override. Inference was blocked by exhausted test-account credits before any tool call, so no steering message was sent. Earlier 1.0.18 probes were also blocked by account restrictions; separate no-model probes exercised startup only. Successful live-model steering and follow-up after steering remain **unverified**; the implementation is supported by the documented contract, public SDK/binary evidence and offline protocol tests.
-
-Per-CLI compatibility notes live as comments in `adapters.ts` and in the `effective policy` line of each dispatch receipt.
-
-## Files
-
-```
-index.ts       tool registration, task registry, watchdog, notifications
-adapters.ts    per-CLI one-shot adapters
-sessions.ts    persistent session drivers (steer / follow-up)
-hooks/         PreToolUse Bash hook used by codebuddy's readonly --settings
-```
-
-## Community
-
-[LINUX DO](https://linux.do/)
+- [AGENTS.md](AGENTS.md) — repository layout, commands, invariants, documentation rules
+- [docs/architecture.md](docs/architecture.md) — dispatch flow, receipts, transports · [docs/adapters.md](docs/adapters.md) — per-CLI capability matrix
+- [docs/qoder.md](docs/qoder.md) — Qoder stream-json contract · [.agents/notes/](.agents/notes/) — decision records
 
 ## License
 
