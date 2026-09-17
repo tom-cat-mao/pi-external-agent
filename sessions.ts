@@ -663,6 +663,15 @@ class CodexAppServerDriver extends BaseSessionDriver implements SessionDriver {
 	}
 
 	private async startTurn(text: string): Promise<void> {
+		// The turn is marked active BEFORE turn/start goes out, as the ACP and
+		// Qoder drivers do. `codex app-server` can write the response and the
+		// turn's notifications in one stdout chunk; a turn/completed read from
+		// that chunk would reach settle() before the awaited response had run
+		// its continuation and be dropped as if it were stale, leaving the task
+		// running forever. Activating up front makes either arrival order work;
+		// the response only contributes the turn id.
+		this.currentTurnId = undefined;
+		this.markActive();
 		const res = await this.request(
 			CODEX_METHODS.turnStart,
 			{
@@ -672,8 +681,9 @@ class CodexAppServerDriver extends BaseSessionDriver implements SessionDriver {
 			},
 			COMMAND_TIMEOUT_MS,
 		);
-		this.currentTurnId = res?.turn?.id;
-		this.markActive();
+		// The turn may already have settled out of the same chunk; never adopt
+		// the id of a turn that is no longer running.
+		if (this.active) this.currentTurnId = res?.turn?.id;
 	}
 
 	private handleNotification(method: string, params: any): void {
