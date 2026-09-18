@@ -2040,7 +2040,7 @@ export default function (pi: ExtensionAPI) {
 			"external_agent_steer is not an interrupt (it lands at the next step boundary); if it reports that the turn already ended, use external_agent_follow_up.",
 			"external_agent_follow_up continues the same session instead of re-dispatching work already done.",
 			"Treat external agent answers as claims to verify against the code, not as fact.",
-			"Opt-in extras: template wraps the task with an output contract; verify runs an acceptance command after settle; long answers are archived to a handle — page them back with external_agent_status offset.",
+			"Opt-in extras: template (output contract) · verify (acceptance run after settle) · status offset (paged recall) · follow_up fromTaskId (relay a settled answer into another live session).",
 		],
 		parameters: Type.Object({
 			agent: StringEnum(AGENT_IDS as unknown as readonly string[]),

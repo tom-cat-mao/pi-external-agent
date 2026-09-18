@@ -53,8 +53,19 @@ Builtins:
 - `evidence-research` — readonly research; Summary + Details with `path:line` anchors.
 - `verify-report` — write tasks; change list + suggested verify command.
 - `review-report` — reviews; verdict + per-item checklist with evidence locations.
-- `relay-envelope` — worker-to-worker message format (used by relay, Wave 3).
+- `relay-envelope` — worker-to-worker message format; follow_up with `fromTaskId` relays through it.
 - `board-entry` — evidence-board entry format (used by board, Wave 4).
+
+## Relay
+
+`external_agent_follow_up` with `fromTaskId` injects a settled task's answer (or an
+archived page of it, via `offset`/`length`) into another live session, wrapped in
+the relay-envelope template (from/purpose/body/anchors). Delivery is layered:
+steer for a running task, follow-up for a settled-alive session, explicit refusal
+otherwise — a relay never silently becomes a new task. Chains cap at 2 hops; the
+receipt carries bytes + sha256 prefix + a 500-char excerpt so the coordinator keeps
+visibility without the full text replaying. `external_agent_status` shows how many
+relays a session received.
 
 ## Meter
 
