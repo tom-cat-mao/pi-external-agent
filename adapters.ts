@@ -76,6 +76,16 @@ export function reasonixEffortToken(effort: Effort): string {
 	return REASONIX_EFFORT_TOKENS[effort];
 }
 
+/** Token counts a CLI reports for one result, in the meter's field names. */
+export interface CliUsage {
+	/** Input (prompt-side) tokens, as reported by the target CLI; not billing. */
+	in?: number;
+	/** Output (completion-side) tokens, as reported by the target CLI; not billing. */
+	out?: number;
+	/** Cached input tokens the target CLI reported reusing; not billing. */
+	cached?: number;
+}
+
 /** Normalized event extracted from an agent's stdout stream. */
 export interface AgentEvent {
 	/** "message" = model prose, "reasoning" = thinking, "tool" = tool activity,
@@ -86,6 +96,13 @@ export interface AgentEvent {
 	 *  and producing a correct answer. Treating those as failures marks good runs bad. */
 	kind: "message" | "reasoning" | "tool" | "usage" | "warning" | "error";
 	text: string;
+	/** CLI self-reported token accounting carried by the same record as this event
+	 *  (claude-family result records today). Absent when the record has none. */
+	usage?: CliUsage;
+	/** Cost in USD as reported by the target CLI; not billing. Only the
+	 *  claude-family result record self-reports one today, and a reported
+	 *  placeholder 0 is not attached (it adds nothing to a total). */
+	costUsd?: number;
 }
 
 export interface BuildArgsInput {
@@ -261,6 +278,23 @@ function codexFamily(
 // ---------------------------------------------------------------------------
 
 /**
+ * Token accounting out of a claude-family result record, using Claude Code's
+ * stream-json field names: `usage: { input_tokens, output_tokens,
+ * cache_read_input_tokens, ... }`. `cached` is cache READS;
+ * `cache_creation_input_tokens` is a cache write and is deliberately not
+ * folded in. Fields the record does not carry stay absent — never defaulted.
+ */
+function claudeUsage(rec: any): CliUsage | undefined {
+	const u = rec.usage;
+	if (!u || typeof u !== "object") return undefined;
+	const usage: CliUsage = {};
+	if (typeof u.input_tokens === "number") usage.in = u.input_tokens;
+	if (typeof u.output_tokens === "number") usage.out = u.output_tokens;
+	if (typeof u.cache_read_input_tokens === "number") usage.cached = u.cache_read_input_tokens;
+	return Object.keys(usage).length > 0 ? usage : undefined;
+}
+
+/**
  * Shared trap for this family's result record: an API failure comes back as
  *   { "subtype": "success", "is_error": true, "result": "API Error: 524 ..." }
  * Trusting `subtype` alone would swallow the error as a valid answer.
@@ -268,12 +302,25 @@ function codexFamily(
 function claudeResultEvent(rec: any): AgentEvent {
 	const text = typeof rec.result === "string" ? rec.result : "";
 	const failed = rec.is_error === true || /^API Error/i.test(text) || (Array.isArray(rec.errors) && rec.errors.length > 0);
+	const detail = Array.isArray(rec.errors) && rec.errors.length > 0 ? rec.errors.join("; ") : text;
 
-	if (failed) {
-		const detail = Array.isArray(rec.errors) && rec.errors.length > 0 ? rec.errors.join("; ") : text;
-		return { kind: "error", text: detail || "agent reported is_error without detail" };
-	}
-	return { kind: "message", text };
+	const event: AgentEvent = failed
+		? { kind: "error", text: detail || "agent reported is_error without detail" }
+		: { kind: "message", text };
+
+	// The same record also carries the run's CLI-reported accounting (a failed
+	// run's burned tokens included). Attached only when actually present: an
+	// absent field must stay absent, so nothing is invented for records that do
+	// not report it.
+	const usage = claudeUsage(rec);
+	if (usage) event.usage = usage;
+	// A cost of exactly 0 is not surfaced. It adds nothing to an accumulated
+	// total, and attaching it would change the event shape (and any deep-equal
+	// against it) for every record carrying the Claude-Code-shaped default
+	// zero — qoder's persistent session driver routes its result records
+	// through this same parser. Every non-zero reported amount passes through.
+	if (typeof rec.total_cost_usd === "number" && rec.total_cost_usd !== 0) event.costUsd = rec.total_cost_usd;
+	return event;
 }
 
 /**
