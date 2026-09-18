@@ -20,7 +20,8 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { resolve } from "node:path";
+import { homedir } from "node:os";
+import { join, resolve } from "node:path";
 import { type AgentToolResult, type ExtensionAPI, keyHint } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
@@ -43,6 +44,9 @@ import {
 	type SessionDriver,
 	type SteerResult,
 } from "./sessions.ts";
+import { ensureStored, extractSummary, placeholderFor, readChunk, type StoredAnswer } from "./artifacts.ts";
+import { createMeter, type MeterSnapshot, type UsageSample } from "./meter.ts";
+import { applyTemplate, loadTemplate } from "./templates.ts";
 
 // ---------------------------------------------------------------------------
 // Task registry
@@ -80,6 +84,8 @@ interface DispatchReceipt {
 	environment: "inherited from Pi process; values hidden";
 	/** Defaults to "oneshot" for receipts produced before persistent sessions existed. */
 	transport?: Transport;
+	/** Template applied to the task text, as `name@version`; absent when none was used. */
+	template?: string;
 }
 
 interface Task {
@@ -119,8 +125,37 @@ interface Task {
 	lastWatchdogNoticeAt: number;
 	/** Consecutive stall notices sent during the current quiet streak. */
 	watchdogNotices: number;
+	/** Per-turn archived answers, appended at each settle; recall pages from the last one. */
+	archives?: StoredAnswer[];
+	/** Set when archiving failed and the answer stayed inline (fail-open, never silent). */
+	archiveError?: string;
+	/** Acceptance command: caller-provided (verify param) beats worker-declared. */
+	verifyCommand?: string;
+	verifyTimeoutSeconds?: number;
+	verifyResult?: VerifyResult;
+	/** Template label (`name@version`) when a task template was applied. */
+	templateLabel?: string;
+	/** Set while settle-time finalize (archive + verify) is in flight; awaited by reporters. */
+	finalizePromise?: Promise<void>;
 	/** Idle reap: kills a persistent session that got no follow-up in time. */
 	idleReapTimer?: ReturnType<typeof setTimeout>;
+}
+
+/** Post-settle acceptance run: mechanical facts only, never a verdict. */
+interface VerifyResult {
+	command: string;
+	exitCode: number | null;
+	outputTail: string;
+	durationMs: number;
+	/** Present when the command never ran (host without pi.exec, readonly guard, …). */
+	skipped?: string;
+}
+
+/** Optional dispatch extras: template label for the receipt, verify for settle-time acceptance. */
+interface DispatchExtras {
+	templateLabel?: string;
+	verifyCommand?: string;
+	verifyTimeoutSeconds?: number;
 }
 
 interface TaskSnapshot {
@@ -230,7 +265,36 @@ function getTaskRegistry(): SharedTaskRegistry {
 const taskRegistry = getTaskRegistry();
 const tasks = taskRegistry.tasks;
 
+/** CLI-reported usage/cost accounting; "as reported by the target CLI", never billing. */
+const meter = createMeter();
+
+/**
+ * Host capabilities the module-level settle paths cannot see on their own: the
+ * session directory (archive root) and pi.exec (verify runs). Captured by the
+ * factory from tool ctx / the pi object; absent in tests and ephemeral sessions,
+ * where both mechanisms stay off (fail-open).
+ */
+const finalizeHooks: {
+	sessionDir?: string;
+	exec?: (command: string, args: string[], options: { cwd: string; timeout: number }) => Promise<{ stdout: string; stderr: string; code: number }>;
+} = {};
+
+/** Feed every parsed usage/cost event into the meter, regardless of event kind. */
+function meterUsageEvent(taskId: string, event: AgentEvent): void {
+	const sample: UsageSample = { source: "cli-reported" };
+	if (event.usage) {
+		sample.in = event.usage.in;
+		sample.out = event.usage.out;
+		sample.cached = event.usage.cached;
+	}
+	if (typeof event.costUsd === "number") sample.costUsd = event.costUsd;
+	if (sample.in === undefined && sample.out === undefined && sample.cached === undefined && sample.costUsd === undefined) return;
+	meter.record(taskId, sample);
+}
+
 const MAX_EVENTS = 400; // ring cap; oldest dropped
+/** Answers longer than this are archived at settle and replaced by a handle + summary/excerpt. */
+const ARCHIVE_INLINE_CHARS = 4_000; // matches NOTIFY_PREVIEW_CHARS
 const MODE_RANK: Record<Mode, number> = { readonly: 0, write: 1, yolo: 2 };
 const MAX_ANSWER_CHARS = 50_000; // matches pi's own subagent cap
 const MAX_STDERR_CHARS = 8_000;
@@ -447,6 +511,151 @@ function summarize(task: Task): string {
  * so a long answer cannot blow up the context uninvited. Full text stays
  * available through external_agent_status.
  */
+// ---------------------------------------------------------------------------
+// Settle finalize: archive + verify (fail-open, mechanical only)
+// ---------------------------------------------------------------------------
+
+/**
+ * The verify-report template's closing section; the first line (or first fenced
+ * block) is the suggested acceptance command.
+ */
+function parseSuggestedVerifyCommand(answer: string): string | undefined {
+	const match = /##\s*Suggested verify command\s*\n([\s\S]*?)(?:\n##\s|$)/i.exec(answer);
+	const body = match?.[1]?.trim();
+	if (!body) return undefined;
+	const fenced = /```(?:bash|sh)?\s*\n([\s\S]*?)```/.exec(body);
+	const command = (fenced ? fenced[1] : body).trim().split("\n")[0]?.trim();
+	return command || undefined;
+}
+
+/**
+ * Archive the settled answer when it is long or follows the Summary/Details
+ * template structure. Fail-open: no session dir or a write error leaves the
+ * answer inline (archiveError recorded), because losing the answer is worse
+ * than replaying it.
+ */
+async function archiveTaskAnswer(task: Task): Promise<void> {
+	const answer = answerOf(task);
+	if (!answer) return;
+	const summary = extractSummary(answer);
+	if (answer.length <= ARCHIVE_INLINE_CHARS && summary === undefined) return;
+	if (!finalizeHooks.sessionDir) return;
+	try {
+		const stored = await ensureStored(
+			join(finalizeHooks.sessionDir, "external-agent"),
+			task.id,
+			task.archives?.length ?? 0,
+			answer,
+		);
+		(task.archives ??= []).push(stored);
+	} catch (err) {
+		task.archiveError = err instanceof Error ? err.message : String(err);
+	}
+}
+
+/**
+ * Run the acceptance command after settle. The caller's verify param wins; a
+ * worker-declared command (verify-report template) is the fallback and is never
+ * executed for readonly tasks — a read-only worker must not gain execution
+ * through its answer text. The result is mechanical (exit code, output tail);
+ * what it means is the caller's judgment.
+ */
+async function maybeRunVerify(task: Task): Promise<void> {
+	let command = task.verifyCommand;
+	let declaredByWorker = false;
+	if (!command) {
+		command = parseSuggestedVerifyCommand(answerOf(task));
+		declaredByWorker = command !== undefined;
+		if (command) task.verifyCommand = command;
+	}
+	if (!command) return;
+	if (declaredByWorker && task.mode === "readonly") {
+		task.verifyResult = {
+			command,
+			exitCode: null,
+			outputTail: "",
+			durationMs: 0,
+			skipped: "worker-declared commands are not executed for readonly tasks",
+		};
+		return;
+	}
+	if (!finalizeHooks.exec) {
+		task.verifyResult = { command, exitCode: null, outputTail: "", durationMs: 0, skipped: "pi.exec unavailable in this host" };
+		return;
+	}
+	const started = Date.now();
+	try {
+		const result = await finalizeHooks.exec("bash", ["-lc", command], {
+			cwd: task.cwd,
+			timeout: (task.verifyTimeoutSeconds ?? 120) * 1000,
+		});
+		const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
+		task.verifyResult = {
+			command,
+			exitCode: result.code,
+			outputTail: truncate(output.trim(), 1_500).text,
+			durationMs: Date.now() - started,
+		};
+	} catch (err) {
+		task.verifyResult = {
+			command,
+			exitCode: null,
+			outputTail: "",
+			durationMs: Date.now() - started,
+			skipped: err instanceof Error ? err.message : String(err),
+		};
+	}
+}
+
+/** Settle-time finalize: archive, verify, then notify. Awaited by wait/compare reports. */
+async function finalizeAndNotify(task: Task): Promise<void> {
+	if (task.state === "done") {
+		await archiveTaskAnswer(task);
+		await maybeRunVerify(task);
+	}
+	notifyTaskSettled(task);
+}
+
+/** Fire-and-forget at settle sites; reporters await task.finalizePromise. */
+function startFinalize(task: Task): void {
+	task.finalizePromise = finalizeAndNotify(task);
+}
+
+/**
+ * The inline form of a settled answer: archived answers show the handle plus the
+ * template summary (or a head/tail excerpt); unarchived ones truncate as before.
+ */
+function presentAnswer(task: Task, inlineLimit: number): { text: string; truncated: boolean } {
+	const latest = task.archives?.[task.archives.length - 1];
+	if (!latest) return truncate(answerOf(task), inlineLimit);
+	const answer = answerOf(task);
+	const text = placeholderFor({ ...latest, taskId: task.id, text: answer }, { summary: extractSummary(answer) });
+	return { text, truncated: false };
+}
+
+/** Compact text dump of the meter for /external_agent_stats. */
+function formatMeterSnapshot(snapshot: MeterSnapshot): string {
+	const totals = snapshot.totals;
+	const lines = [
+		"external-agent stats (as reported by the target CLIs; not billing):",
+		`dispatches: ${snapshot.dispatchTotal} · tokens in/out/cached: ${totals.in ?? 0}/${totals.out ?? 0}/${totals.cached ?? 0}` +
+			(totals.costUsd !== undefined ? ` · cost $${totals.costUsd.toFixed(4)}` : ""),
+	];
+	const refusals = Object.entries(snapshot.refusedTotal);
+	if (refusals.length > 0) lines.push(`refusals: ${refusals.map(([reason, n]) => `${n}× ${reason}`).join("; ")}`);
+	for (const [taskId, t] of Object.entries(snapshot.tasks)) {
+		lines.push(
+			`  ${taskId}: in/out/cached ${t.in ?? 0}/${t.out ?? 0}/${t.cached ?? 0}${t.costUsd !== undefined ? ` · $${t.costUsd.toFixed(4)}` : ""} · ${t.samples} samples`,
+		);
+	}
+	return lines.join("\n");
+}
+
+function verifyLine(result: VerifyResult): string {
+	if (result.skipped) return `verify: \`${result.command}\` — skipped (${result.skipped})`;
+	return `verify: \`${result.command}\` — exit ${result.exitCode ?? "?"} in ${fmtDuration(result.durationMs)}`;
+}
+
 function notifyTaskSettled(task: Task): void {
 	if (task.notified) return;
 	if (task.notify === "off") {
@@ -476,7 +685,8 @@ function notifySettled(pi: ExtensionAPI, task: Task): void {
 	if (errs) lines.push(`errors: ${truncate(errs, 500).text}`);
 
 	if (task.state === "done") {
-		const preview = truncate(answerOf(task), NOTIFY_PREVIEW_CHARS);
+		if (task.verifyResult) lines.push(verifyLine(task.verifyResult));
+		const preview = presentAnswer(task, NOTIFY_PREVIEW_CHARS);
 		if (preview.text) {
 			lines.push("", preview.text);
 			if (preview.truncated) {
@@ -638,6 +848,7 @@ function createTask(
 		watchdogNotices: 0,
 	};
 	tasks.set(task.id, task);
+	meter.recordDispatch(task.id);
 	ensureWatchdogTimer();
 	return task;
 }
@@ -651,10 +862,18 @@ function startTask(
 	watchdogMs: number,
 	model?: string,
 	effort?: Effort,
+	extras: DispatchExtras = {},
 ): Task {
 	return hasSessionDriver(agent)
-		? startPersistentTask(agent, taskText, cwd, mode, notify, watchdogMs, model, effort)
-		: startOneshotTask(agent, taskText, cwd, mode, notify, watchdogMs, model, effort);
+		? startPersistentTask(agent, taskText, cwd, mode, notify, watchdogMs, model, effort, extras)
+		: startOneshotTask(agent, taskText, cwd, mode, notify, watchdogMs, model, effort, extras);
+}
+
+/** Settle-time fields that come from dispatch extras rather than the agent stream. */
+function applyExtras(task: Task, extras: DispatchExtras): void {
+	if (extras.templateLabel) task.templateLabel = extras.templateLabel;
+	if (extras.verifyCommand) task.verifyCommand = extras.verifyCommand;
+	if (extras.verifyTimeoutSeconds !== undefined) task.verifyTimeoutSeconds = extras.verifyTimeoutSeconds;
 }
 
 /**
@@ -671,6 +890,7 @@ function startPersistentTask(
 	watchdogMs: number,
 	model?: string,
 	effort?: Effort,
+	extras: DispatchExtras = {},
 ): Task {
 	const adapter = ADAPTERS[agent];
 	const driver = SESSION_DRIVERS[agent]!();
@@ -705,9 +925,11 @@ function startPersistentTask(
 		watchdogMs,
 		environment: INHERITED_ENVIRONMENT_NOTICE,
 		transport: "persistent",
+		...(extras.templateLabel ? { template: extras.templateLabel } : {}),
 	});
 
 	const task = createTask(agent, taskText, cwd, mode, notify, watchdogMs, dispatch, "persistent");
+	applyExtras(task, extras);
 	task.driver = driver;
 
 	driver.onEvent((event) => {
@@ -725,7 +947,7 @@ function startPersistentTask(
 			task.state = "failed";
 			task.endedAt = Date.now();
 			if (!task.spawnError) task.spawnError = task.stderr.trim().slice(0, 500) || undefined;
-			notifyTaskSettled(task);
+			startFinalize(task);
 		}
 	});
 
@@ -742,7 +964,7 @@ function startPersistentTask(
 			task.sessionAlive = false;
 			task.spawnError = err instanceof Error ? err.message : String(err);
 			driver.kill();
-			notifyTaskSettled(task);
+			startFinalize(task);
 		});
 
 	return task;
@@ -773,6 +995,7 @@ function pushEvent(task: Task, event: AgentEvent): void {
 		if (task.answerStartIndex > 0) task.answerStartIndex -= 1;
 	}
 	task.lastEventAt = Date.now();
+	meterUsageEvent(task.id, event);
 }
 
 function settlePersistentTask(task: Task, outcome: { status: "done" | "failed" | "cancelled"; error?: string }): void {
@@ -780,7 +1003,7 @@ function settlePersistentTask(task: Task, outcome: { status: "done" | "failed" |
 	task.state = outcome.status === "cancelled" ? "stopped" : outcome.status;
 	task.endedAt = Date.now();
 	if (outcome.error) task.spawnError = outcome.error;
-	notifyTaskSettled(task);
+	startFinalize(task);
 	// A cancelled turn is one the model asked to stop; no reason to keep the
 	// session around for a follow-up.
 	if (task.state === "stopped") {
@@ -824,6 +1047,7 @@ function startOneshotTask(
 	watchdogMs: number,
 	model?: string,
 	effort?: Effort,
+	extras: DispatchExtras = {},
 ): Task {
 	const adapter = ADAPTERS[agent];
 	const adapterDispatch = adapter.buildDispatch({ task: taskText, cwd, mode, model, effort });
@@ -856,8 +1080,10 @@ function startOneshotTask(
 		watchdogMs,
 		environment: INHERITED_ENVIRONMENT_NOTICE,
 		transport: "oneshot",
+		...(extras.templateLabel ? { template: extras.templateLabel } : {}),
 	});
 	const task = createTask(agent, taskText, cwd, mode, notify, watchdogMs, dispatch, "oneshot");
+	applyExtras(task, extras);
 
 	let proc: ChildProcess;
 	try {
@@ -881,7 +1107,7 @@ function startOneshotTask(
 		task.state = "failed";
 		task.endedAt = Date.now();
 		task.spawnError = err.message;
-		notifyTaskSettled(task);
+		startFinalize(task);
 	});
 
 	let buffer = "";
@@ -921,7 +1147,7 @@ function startOneshotTask(
 		}
 		// An agent can exit 0 and still have reported an error event, so check both.
 		task.state = code === 0 && !errorsOf(task) ? "done" : "failed";
-		notifyTaskSettled(task);
+		startFinalize(task);
 	});
 
 	return task;
@@ -1072,6 +1298,11 @@ function detailReport(task: Task, tailCount: number): string {
 
 	const errs = errorsOf(task);
 	if (errs) lines.push(`agent errors: ${errs}`);
+	if (task.templateLabel) lines.push(`template: ${task.templateLabel}`);
+	if (task.verifyResult) {
+		lines.push(verifyLine(task.verifyResult));
+		if (task.verifyResult.outputTail) lines.push("verify output tail:", task.verifyResult.outputTail);
+	}
 	const warns = warningsOf(task);
 	if (warns) lines.push(`non-fatal warnings: ${truncate(warns, 400).text}`);
 
@@ -1092,9 +1323,10 @@ function detailReport(task: Task, tailCount: number): string {
 		const answer = answerOf(task);
 		const earlier = task.answerStartIndex > 0;
 		if (answer) {
-			const { text, truncated } = truncate(answer, MAX_ANSWER_CHARS);
+			const { text, truncated } = presentAnswer(task, MAX_ANSWER_CHARS);
 			lines.push("", earlier ? "answer (latest turn):" : "answer:", text);
 			if (truncated) lines.push("[answer was truncated]");
+			if (task.archiveError) lines.push(`[archive unavailable: ${task.archiveError}; answer inlined]`);
 			if (earlier) lines.push(`[earlier turns: ${allAnswersOf(task).length} chars across ${task.answerStartIndex} events — latest turn shown]`);
 		} else {
 			lines.push("", "no answer produced");
@@ -1352,7 +1584,8 @@ function compareSection(slot: CompareSlot): string[] {
 			`${modeDisplay(task.mode)} · ${escapeTerminalControls(task.cwd)}`,
 	];
 	if (task.state === "done") {
-		const answer = truncate(answerOf(task), WAIT_ANSWER_PREVIEW_CHARS);
+		if (task.verifyResult) lines.push(verifyLine(task.verifyResult));
+		const answer = presentAnswer(task, WAIT_ANSWER_PREVIEW_CHARS);
 		lines.push(answer.text || `(no answer text was parsed — external_agent_status taskId="${task.id}")`);
 		if (answer.truncated) {
 			lines.push(
@@ -1395,7 +1628,7 @@ function compareResults(slots: CompareSlot[]): CompareResult[] {
 			dispatch: copyDispatchReceipt(task.dispatch),
 		};
 		if (task.state === "done") {
-			const answer = truncate(answerOf(task), WAIT_ANSWER_PREVIEW_CHARS);
+			const answer = presentAnswer(task, WAIT_ANSWER_PREVIEW_CHARS);
 			if (answer.text) {
 				result.answer = answer.text;
 				result.answerTruncated = answer.truncated;
@@ -1557,6 +1790,7 @@ export default function (pi: ExtensionAPI) {
 			"external_agent_steer is not an interrupt (it lands at the next step boundary); if it reports that the turn already ended, use external_agent_follow_up.",
 			"external_agent_follow_up continues the same session instead of re-dispatching work already done.",
 			"Treat external agent answers as claims to verify against the code, not as fact.",
+			"Opt-in extras: template wraps the task with an output contract; verify runs an acceptance command after settle; long answers are archived to a handle — page them back with external_agent_status offset.",
 		],
 		parameters: Type.Object({
 			agent: StringEnum(AGENT_IDS as unknown as readonly string[]),
@@ -1593,6 +1827,20 @@ export default function (pi: ExtensionAPI) {
 						"Minutes of no activity before a stall notice (default 15; 0 disables; notify off disables it too).",
 				}),
 			),
+			template: Type.Optional(
+				Type.String({
+					description: "Task template name (e.g. evidence-research, verify-report); wraps the task with an output contract.",
+				}),
+			),
+			verify: Type.Optional(
+				Type.Object(
+					{
+						command: Type.String(),
+						timeoutSeconds: Type.Optional(Type.Number()),
+					},
+					{ description: "After settle, run this acceptance command and report its exit code (mechanical, no verdict)." },
+				),
+			),
 		}),
 
 		async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -1616,13 +1864,45 @@ export default function (pi: ExtensionAPI) {
 
 			const checked = validateDispatch(agent, mode, cwd, effort);
 			if (!checked.ok) {
+				meter.recordRefused(checked.reason);
 				return {
 					content: [{ type: "text", text: `Refused: ${checked.reason}` }],
 					details: { refused: true },
 				};
 			}
 
-			const task = startTask(agent, params.task, cwd, mode, notify, watchdogMs, model, effort);
+			// Archive root for settle-time finalize; ephemeral sessions leave it off.
+			try {
+				finalizeHooks.sessionDir = ctx.sessionManager.getSessionDir() ?? undefined;
+			} catch {
+				// no persistent session directory: archiving stays off
+			}
+
+			let taskText = params.task;
+			let templateLabel: string | undefined;
+			if (typeof params.template === "string" && params.template) {
+				let loaded;
+				try {
+					loaded = await loadTemplate(params.template, { projectDir: cwd, homeDir: homedir() });
+				} catch (err) {
+					meter.recordRefused("template-not-found");
+					return {
+						content: [{ type: "text", text: `Refused: ${err instanceof Error ? err.message : String(err)}` }],
+						details: { refused: true },
+					};
+				}
+				taskText = applyTemplate(loaded.body, taskText);
+				templateLabel = `${loaded.name}@${loaded.version}`;
+			}
+
+			const task = startTask(agent, taskText, cwd, mode, notify, watchdogMs, model, effort, {
+				templateLabel,
+				verifyCommand: typeof params.verify?.command === "string" ? params.verify.command : undefined,
+				verifyTimeoutSeconds:
+					typeof params.verify?.timeoutSeconds === "number" && Number.isFinite(params.verify.timeoutSeconds)
+						? params.verify.timeoutSeconds
+						: undefined,
+			});
 
 			const notes: string[] = [];
 			if (adapter.degraded) notes.push(`note: ${agent} is degraded — ${adapter.degraded}`);
@@ -1720,6 +2000,9 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			taskId: Type.Optional(Type.String()),
 			tail: Type.Optional(Type.Number({ description: "Recent events to show. Default 8." })),
+			offset: Type.Optional(
+				Type.Number({ description: "Page the archived answer from this byte offset (from a placeholder's recall hint)." }),
+			),
 		}),
 
 		async execute(_id, params) {
@@ -1742,6 +2025,28 @@ export default function (pi: ExtensionAPI) {
 						],
 						details: {} as ExternalAgentStatusDetails,
 					};
+				}
+				if (params.offset !== undefined) {
+					const archived = task.archives?.[task.archives.length - 1];
+					if (!archived) {
+						return {
+							content: [{ type: "text", text: `No archived answer for ${task.id} (answer stayed inline; use external_agent_status without offset).` }],
+							details: {} as ExternalAgentStatusDetails,
+						};
+					}
+					try {
+						const page = await readChunk(archived.filePath, Number(params.offset));
+						const header = `[recall ${archived.id} offset=${Math.max(0, Math.floor(Number(params.offset)))} next_offset=${page.nextOffset} eof=${page.eof}]`;
+						return {
+							content: [{ type: "text", text: `${header}\n${page.text}` }],
+							details: {} as ExternalAgentStatusDetails,
+						};
+					} catch (err) {
+						return {
+							content: [{ type: "text", text: `Recall failed for ${archived.id}: ${err instanceof Error ? err.message : String(err)}` }],
+							details: {} as ExternalAgentStatusDetails,
+						};
+					}
 				}
 				return {
 					content: [{ type: "text", text: detailReport(task, Number(params.tail ?? 8)) }],
@@ -1853,7 +2158,7 @@ export default function (pi: ExtensionAPI) {
 					lines.push(summarize(task));
 					if (task.state !== "running") {
 						if (task.state === "done") {
-							const preview = truncate(answerOf(task), WAIT_ANSWER_PREVIEW_CHARS);
+							const preview = presentAnswer(task, WAIT_ANSWER_PREVIEW_CHARS);
 							if (preview.text) {
 								lines.push(preview.text);
 								if (preview.truncated) {
@@ -1883,9 +2188,11 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			return await new Promise((resolvePromise) => {
-				const finish = (timedOut: boolean, aborted: boolean) => {
+				const finish = async (timedOut: boolean, aborted: boolean) => {
 					clearInterval(timer);
 					signal?.removeEventListener("abort", onAbort);
+					// Settle finalize (archive/verify) is async; the report must see its results.
+					await Promise.all(watched.map((t) => t.finalizePromise));
 					resolvePromise({
 						content: [{ type: "text", text: report(timedOut, aborted) }],
 						details: {
@@ -1916,8 +2223,9 @@ export default function (pi: ExtensionAPI) {
 		name: "external_agent_compare",
 		label: "External Agent Compare",
 		description: [
-			"Put one task to several agent CLIs in one blocking call: every valid spec is dispatched in parallel with",
-			"its own mode, model, effort and cwd, and the answers come back side by side once they settle or the",
+			"Put one task to several agent CLIs in one blocking call (specs[].task can override it per slot): every valid",
+			"spec is dispatched in parallel with its own mode, model, effort and cwd, and the answers come back side by",
+			"side once they settle or the",
 			"timeout elapses. It never diffs, scores or ranks — judging is yours. A spec that fails validation",
 			"(unsupported mode or effort, write/yolo conflict in its cwd) is recorded as a refusal while the others",
 			"still run. On timeout the receipt lists the taskIds still running: finish them with external_agent_wait,",
@@ -1927,6 +2235,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Ask several external agent CLIs the same task at once",
 		promptGuidelines: [
 			"Prefer external_agent_compare over chaining agents in a pipeline: disagreement between answers is the signal.",
+			"specs[].task overrides the shared task per slot; template/verify apply to every slot.",
 		],
 		parameters: Type.Object({
 			task: Type.String({
@@ -1935,6 +2244,9 @@ export default function (pi: ExtensionAPI) {
 			agents: Type.Array(
 				Type.Object({
 					agent: StringEnum(AGENT_IDS as unknown as readonly string[]),
+					task: Type.Optional(
+						Type.String({ description: "Per-slot task override; defaults to the shared task." }),
+					),
 					cwd: Type.Optional(
 						Type.String({
 							description: "Working directory for this agent. Defaults to the session cwd.",
@@ -1962,6 +2274,18 @@ export default function (pi: ExtensionAPI) {
 				Type.Number({
 					description: `Seconds to wait for the whole batch (default ${WAIT_DEFAULT_TIMEOUT_S}, max ${WAIT_MAX_TIMEOUT_S}).`,
 				}),
+			),
+			template: Type.Optional(
+				Type.String({ description: "Task template applied to every slot (see external_agent_start)." }),
+			),
+			verify: Type.Optional(
+				Type.Object(
+					{
+						command: Type.String(),
+						timeoutSeconds: Type.Optional(Type.Number()),
+					},
+					{ description: "After each slot settles, run this acceptance command and report its exit code." },
+				),
 			),
 		}),
 
@@ -1992,6 +2316,35 @@ export default function (pi: ExtensionAPI) {
 					? Math.min(Math.max(params.timeout, 5), WAIT_MAX_TIMEOUT_S)
 					: WAIT_DEFAULT_TIMEOUT_S;
 
+			// Archive root for settle-time finalize; ephemeral sessions leave it off.
+			try {
+				finalizeHooks.sessionDir = ctx.sessionManager.getSessionDir() ?? undefined;
+			} catch {
+				// no persistent session directory: archiving stays off
+			}
+
+			let templateBody: string | undefined;
+			let templateLabel: string | undefined;
+			if (typeof params.template === "string" && params.template) {
+				try {
+					const loaded = await loadTemplate(params.template, { projectDir: ctx.cwd, homeDir: homedir() });
+					applyTemplate(loaded.body, ""); // dry-run: a body without {{TASK}} must not reach dispatch
+					templateBody = loaded.body;
+					templateLabel = `${loaded.name}@${loaded.version}`;
+				} catch (err) {
+					meter.recordRefused("template-not-found");
+					return noRun(`Refused: ${err instanceof Error ? err.message : String(err)}`);
+				}
+			}
+			const extras: DispatchExtras = {
+				templateLabel,
+				verifyCommand: typeof params.verify?.command === "string" ? params.verify.command : undefined,
+				verifyTimeoutSeconds:
+					typeof params.verify?.timeoutSeconds === "number" && Number.isFinite(params.verify.timeoutSeconds)
+						? params.verify.timeoutSeconds
+						: undefined,
+			};
+
 			const slots: CompareSlot[] = [];
 			for (const [index, spec] of specs.entries()) {
 				// A malformed spec is one refused entry, not a thrown call: the other
@@ -2019,6 +2372,7 @@ export default function (pi: ExtensionAPI) {
 				// with its reason and the loop keeps going.
 				const checked = validateDispatch(agent, mode, cwd, effort);
 				if (!checked.ok) {
+					meter.recordRefused(checked.reason);
 					slots.push({ index, agent, reason: checked.reason, mode, cwd });
 					continue;
 				}
@@ -2027,7 +2381,18 @@ export default function (pi: ExtensionAPI) {
 				// driver when the adapter has one, one-shot process otherwise. notify
 				// is off because this receipt is the notification (see
 				// rearmCompareNotifications for the timeout case).
-				const task = startTask(agent, taskText, cwd, mode, "off", DEFAULT_WATCHDOG_MS, model, effort);
+				const slotTask = typeof spec.task === "string" && spec.task ? spec.task : taskText;
+				const task = startTask(
+					agent,
+					templateBody ? applyTemplate(templateBody, slotTask) : slotTask,
+					cwd,
+					mode,
+					"off",
+					DEFAULT_WATCHDOG_MS,
+					model,
+					effort,
+					extras,
+				);
 				slots.push({ index, agent, task, mode, cwd });
 			}
 
@@ -2068,6 +2433,8 @@ export default function (pi: ExtensionAPI) {
 				timedOut = outcome.timedOut;
 				aborted = outcome.aborted;
 				if (timedOut || aborted) rearmCompareNotifications(dispatched);
+				// Settle finalize (archive/verify) is async; the report must see its results.
+				await Promise.all(dispatched.map((slot) => slot.task.finalizePromise));
 			}
 
 			return {
@@ -2320,6 +2687,16 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text", text: ok ? `Stopped ${task.id}.` : `${task.id} was not running (${task.state}).` }],
 				details: { taskId: task.id, state: task.state } as ExternalAgentStopDetails,
 			};
+		},
+	});
+
+	// Settle-time verify runs through pi.exec; absent in stubbed hosts (tests).
+	finalizeHooks.exec = typeof pi.exec === "function" ? pi.exec.bind(pi) : undefined;
+
+	pi.registerCommand?.("external_agent_stats", {
+		description: "External-agent usage counters (CLI-reported; not billing).",
+		handler: async (_args, ctx) => {
+			ctx.ui?.notify?.(formatMeterSnapshot(meter.snapshot()), "info");
 		},
 	});
 

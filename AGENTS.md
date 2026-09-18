@@ -4,9 +4,12 @@ Working rules for agents editing this repository.
 
 ## Layout
 
-- `index.ts` — hub: tool registration, dispatch validation, task registry, stall watchdog, notifications.
-- `adapters.ts` — per-CLI one-shot adapters: argv spelling and stdout parsing, plus the `ADAPTERS` registry.
+- `index.ts` — hub: tool registration, dispatch validation, task registry, stall watchdog, notifications, settle-time archive/verify.
+- `adapters.ts` — per-CLI one-shot adapters: argv spelling and stdout parsing (incl. usage/cost), plus the `ADAPTERS` registry.
 - `sessions.ts` — persistent session drivers for steer / follow-up.
+- `artifacts.ts` — answer archive: settle-time content-addressed store, inline placeholder, paged recall.
+- `templates.ts` + `templates/` — task-template loading (project > user > builtin) and the five builtins.
+- `meter.ts` — CLI-reported usage/cost counters behind `/external_agent_stats`.
 - `hooks/` — `codebuddy-readonly.js`, the PreToolUse Bash hook loaded by codebuddy's readonly `--settings`.
 - `test/` — `node:test` suites; pi packages are stubbed via `registerHooks`.
 

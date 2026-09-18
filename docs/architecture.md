@@ -10,7 +10,7 @@ Where each piece of the current system lives, and how one dispatch flows through
 4. **Spawn and task registry** — the hub spawns the CLI and records the task under a taskId: state, cwd, mode, transport, event log, session handle, watchdog counters.
 5. **Monitoring** — stdout lines are normalized by the adapter's `parseEvent` into message / reasoning / tool / usage / warning / error events. Those events feed the status view, the notification callback, and the final answer.
 6. **Watchdog** — a shared scanner notices a running task that has been quiet for its `watchdogMs` (default 15m) and notifies the model, at most three times per quiet streak.
-7. **Settle** — on process exit (one-shot) or turn end (persistent), the task settles, notifications fire, and the answer is available through status or the receipt.
+7. **Settle** — on process exit (one-shot) or turn end (persistent), the task settles, notifications fire, and the answer is available through status or the receipt. Settle-time finalize then runs two fail-open mechanics: long or template-structured answers are archived to the session dir and replaced inline by a handle + summary (recall pages back via `external_agent_status` `offset`), and a known verify command runs via `pi.exec` with its exit code reported. Usage/cost events self-reported by CLIs accumulate in the meter (`/external_agent_stats`). Dispatch may wrap the task in a `template` output contract; the receipt records `name@version`. See [capabilities.md](capabilities.md).
 
 ## Receipts
 
