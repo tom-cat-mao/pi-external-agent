@@ -20,6 +20,7 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { type AgentToolResult, type ExtensionAPI, keyHint } from "@earendil-works/pi-coding-agent";
@@ -135,6 +136,10 @@ interface Task {
 	verifyResult?: VerifyResult;
 	/** Template label (`name@version`) when a task template was applied. */
 	templateLabel?: string;
+	/** How far this session sits from the coordinator's own dispatch (relay hops). */
+	relayDepth: number;
+	/** Relay messages delivered into this session. */
+	relaysReceived: number;
 	/** Set while settle-time finalize (archive + verify) is in flight; awaited by reporters. */
 	finalizePromise?: Promise<void>;
 	/** Idle reap: kills a persistent session that got no follow-up in time. */
@@ -234,6 +239,34 @@ interface ExternalAgentFollowUpDetails {
 	taskId?: string;
 	state?: TaskState;
 	sessionAlive?: boolean;
+}
+
+/** Why one worker's answer is being handed to another (the relay-envelope template's purposes). */
+type RelayPurpose = "reproduce" | "combine" | "challenge";
+
+interface ExternalAgentRelayDetails {
+	kind: "external-agent-relay";
+	relayed: boolean;
+	fromTaskId?: string;
+	taskId?: string;
+	state?: TaskState;
+	/** Why nothing was delivered. */
+	reason?: string;
+	/** Which channel the message actually went in by. */
+	via?: "steer" | "followUp";
+	purpose?: RelayPurpose;
+	/** UTF-8 bytes of the excerpt that traveled. */
+	bytes?: number;
+	/** sha256 of that excerpt, lowercase hex. */
+	sha256?: string;
+	/** `path:line` references found inside the excerpt. */
+	anchors?: string[];
+	/** The target's hop depth once this message landed. */
+	hop?: number;
+	/** Archive handle the excerpt was read from, when the source answer was archived. */
+	archiveId?: string;
+	/** What the target CLI said about how it took the message. */
+	note?: string;
 }
 
 interface SharedTaskRegistry {
@@ -846,6 +879,8 @@ function createTask(
 		watchdogMs,
 		lastWatchdogNoticeAt: 0,
 		watchdogNotices: 0,
+		relayDepth: 0,
+		relaysReceived: 0,
 	};
 	tasks.set(task.id, task);
 	meter.recordDispatch(task.id);
@@ -1036,6 +1071,23 @@ function reclaimSession(task: Task): void {
 	if (!task.sessionAlive) return;
 	task.sessionAlive = false;
 	task.driver?.kill();
+}
+
+/**
+ * Re-arm a settled persistent task for a new turn handed to it in place. The
+ * answer window moves to the new turn, and the notifications the last turn
+ * consumed are re-armed with it.
+ */
+function beginFollowUpTurn(task: Task): void {
+	task.answerStartIndex = task.events.length;
+	task.state = "running";
+	task.endedAt = undefined;
+	task.notified = false;
+	task.exitCode = null;
+	task.spawnError = undefined;
+	task.lastEventAt = Date.now();
+	task.watchdogNotices = 0;
+	clearIdleReap(task);
 }
 
 function startOneshotTask(
@@ -1294,6 +1346,7 @@ function detailReport(task: Task, tailCount: number): string {
 				? `session: alive (external_agent_follow_up once settled; ${steering})`
 				: "session: reclaimed — follow-ups are refused, dispatch a new task",
 		);
+		if (task.relaysReceived > 0) lines.push(`relays received: ${task.relaysReceived}`);
 	}
 
 	const errs = errorsOf(task);
@@ -1691,6 +1744,203 @@ function rearmCompareNotifications(slots: DispatchedCompareSlot[]): void {
 	for (const slot of slots) {
 		if (slot.task.state === "running") slot.task.notify = "steer";
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Relay: one worker's answer into another worker's session
+// ---------------------------------------------------------------------------
+
+/**
+ * How far a message may travel from the coordinator's own dispatch. Past this the
+ * workers are negotiating among themselves, and the coordinator — the party that
+ * owns the judgment — is the one who has to carry it.
+ */
+const RELAY_MAX_HOPS = 2;
+/** Selection window, in UTF-8 bytes: a default that fits one turn, a hard ceiling. */
+const RELAY_DEFAULT_BYTES = 4_000;
+const RELAY_MAX_BYTES = 16_000;
+/** How much of the excerpt the coordinator sees in the receipt. */
+const RELAY_RECEIPT_CHARS = 500;
+/** Upper bound on anchors listed for one relay; the body stays the claim surface. */
+const RELAY_MAX_ANCHORS = 12;
+
+function isRelayPurpose(value: unknown): value is RelayPurpose {
+	return value === "reproduce" || value === "combine" || value === "challenge";
+}
+
+/**
+ * A byte window of an answer that never reached the archive (short, or archiving
+ * was unavailable). Cut on character boundaries, the same rule readChunk follows,
+ * so a slice can never emit half a character.
+ */
+function sliceUtf8(text: string, offset: number, maxBytes: number): string {
+	const buffer = Buffer.from(text, "utf8");
+	let start = offset > 0 ? Math.min(Math.floor(offset), buffer.byteLength) : 0;
+	while (start < buffer.byteLength && (buffer[start] & 0xc0) === 0x80) start += 1;
+	let end = Math.min(buffer.byteLength, start + Math.max(1, Math.floor(maxBytes)));
+	while (end > start && end < buffer.byteLength && (buffer[end] & 0xc0) === 0x80) end -= 1;
+	return buffer.toString("utf8", start, end);
+}
+
+/** `path:line` and `path:start-end` references inside an excerpt, deduped and capped. */
+function anchorRefs(text: string): string[] {
+	const found = text.match(/[\w./-]+\.[A-Za-z0-9]+:\d+(?:-\d+)?/g) ?? [];
+	return [...new Set(found)].slice(0, RELAY_MAX_ANCHORS);
+}
+
+/**
+ * The text a relay delivers: the source excerpt as an envelope, wrapped in the
+ * relay-envelope template (project > user > builtin, like any other template) so
+ * the receiving worker reads it as data from a peer and answers with anchors.
+ */
+async function relayEnvelope(
+	source: Task,
+	target: Task,
+	purpose: RelayPurpose,
+	excerpt: string,
+): Promise<{ text: string; anchors: string[] }> {
+	const anchors = anchorRefs(excerpt);
+	const message = [
+		`from: ${source.id}`,
+		`to: ${target.id}`,
+		`purpose: ${purpose}`,
+		"body:",
+		excerpt,
+		"anchors:",
+		...(anchors.length > 0 ? anchors.map((anchor) => `- ${anchor}`) : ["none"]),
+	].join("\n");
+	const loaded = await loadTemplate("relay-envelope", { projectDir: target.cwd, homeDir: homedir() });
+	return { text: applyTemplate(loaded.body, message), anchors };
+}
+
+/**
+ * Relay one task's settled answer into another task's live session. The channel is
+ * whatever that session actually offers — a steer while it runs, a follow-up once
+ * it has settled and its process is still up — and anything else is refused with
+ * the reason. It never degrades into a fresh dispatch: a new task holds none of the
+ * conversation the message was addressed to.
+ */
+async function relayAnswerToTask(params: Record<string, unknown>): Promise<AgentToolResult<ExternalAgentRelayDetails>> {
+	const targetId = typeof params.taskId === "string" ? params.taskId : "";
+	const sourceId = typeof params.fromTaskId === "string" ? params.fromTaskId.trim() : "";
+	const known = () => [...tasks.keys()].join(", ") || "(none)";
+	const refuse = (reason: string, extra: Partial<ExternalAgentRelayDetails> = {}): AgentToolResult<ExternalAgentRelayDetails> => ({
+		content: [{ type: "text", text: `Relay refused: ${reason}` }],
+		details: { kind: "external-agent-relay", relayed: false, fromTaskId: sourceId || undefined, taskId: targetId || undefined, reason, ...extra },
+	});
+
+	const target = tasks.get(targetId);
+	if (!target) return refuse(`unknown taskId "${targetId}". Known: ${known()}`);
+	const source = tasks.get(sourceId);
+	if (!source) return refuse(`unknown fromTaskId "${sourceId}". Known: ${known()}`);
+	if (source === target) return refuse(`${source.id} cannot relay to itself.`);
+	if (params.purpose !== undefined && !isRelayPurpose(params.purpose)) {
+		return refuse(`purpose must be reproduce, combine or challenge (got "${String(params.purpose)}").`);
+	}
+	const purpose: RelayPurpose = isRelayPurpose(params.purpose) ? params.purpose : "combine";
+	if (source.state === "running") return refuse(`${source.id} is still running, so it has no settled answer to relay.`);
+	if (source.state === "stopped") return refuse(`${source.id} was stopped before it settled, so it has no answer to relay.`);
+	if (source.relayDepth >= RELAY_MAX_HOPS) {
+		return refuse(
+			`${source.id} already sits ${source.relayDepth} hops from the coordinator and the limit is ${RELAY_MAX_HOPS}. ` +
+				`Read its answer with external_agent_status taskId="${source.id}" and carry it yourself.`,
+		);
+	}
+
+	const maxBytes =
+		typeof params.length === "number" && Number.isFinite(params.length)
+			? Math.min(Math.max(Math.floor(params.length), 1), RELAY_MAX_BYTES)
+			: RELAY_DEFAULT_BYTES;
+	const offset = typeof params.offset === "number" && Number.isFinite(params.offset) && params.offset > 0 ? Math.floor(params.offset) : 0;
+	const archived = source.archives?.[source.archives.length - 1];
+	let excerpt: string;
+	if (archived) {
+		try {
+			excerpt = (await readChunk(archived.filePath, offset, { maxBytes })).text;
+		} catch (err) {
+			return refuse(`the archived answer of ${source.id} could not be read: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	} else {
+		excerpt = sliceUtf8(answerOf(source), offset, maxBytes);
+	}
+	if (!excerpt.trim()) {
+		return refuse(
+			`${source.id} has no answer text at offset ${offset} (${Buffer.byteLength(answerOf(source), "utf8")} bytes available).`,
+		);
+	}
+
+	const via: "steer" | "followUp" = target.state === "running" ? "steer" : "followUp";
+	const guard = requireCapableTask(target.id, via);
+	if ("error" in guard) return refuse(guard.error);
+	if (via === "steer") {
+		const blocked = target.driver?.steerUnavailableReason;
+		if (blocked) return refuse(`${target.id} cannot be steered: ${blocked}`);
+	} else if (!target.sessionAlive || !target.driver?.alive) {
+		return refuse(
+			`The session process for ${target.id} has been reclaimed (idle for ${Math.round(IDLE_REAP_MS / 60_000)}m or stopped), ` +
+				"so its conversation is gone. Dispatch a new task with a self-contained prompt instead.",
+		);
+	}
+
+	let envelope: { text: string; anchors: string[] };
+	try {
+		envelope = await relayEnvelope(source, target, purpose, excerpt);
+	} catch (err) {
+		return refuse(`the relay envelope could not be built: ${err instanceof Error ? err.message : String(err)}`);
+	}
+
+	let note: string | undefined;
+	if (via === "steer") {
+		const result = await target.driver!.steer(envelope.text);
+		if (!result.accepted) return refuse(`${target.id} did not take the steer: ${result.reason}`, { via });
+		note = result.note;
+	} else {
+		try {
+			await target.driver!.followUp(envelope.text);
+		} catch (err) {
+			return refuse(`${target.id} did not take the relay as a follow-up: ${err instanceof Error ? err.message : String(err)}`, { via });
+		}
+		beginFollowUpTurn(target);
+	}
+	target.relayDepth = Math.max(target.relayDepth, source.relayDepth + 1);
+	target.relaysReceived += 1;
+	pushEvent(target, { kind: "tool", text: `relay from ${source.id} (${purpose})`.slice(0, 200) });
+
+	const bytes = Buffer.byteLength(excerpt, "utf8");
+	const sha256 = createHash("sha256").update(excerpt, "utf8").digest("hex");
+	const waiting =
+		target.notify === "off"
+			? `Poll external_agent_status taskId="${target.id}" once it settles: it was dispatched with notify off.`
+			: `Its completion notification will reach you, or call external_agent_wait with taskIds=["${target.id}"].`;
+	const lines = [
+		`relayed ${source.id}→${target.id}: ${bytes} bytes · sha256:${sha256.slice(0, 8)} · via ${via} · hop ${target.relayDepth}`,
+		escapeTerminalControls(excerpt.slice(0, RELAY_RECEIPT_CHARS)),
+		archived ? placeholderFor({ ...archived, taskId: source.id }) : "",
+		`${target.id} ${via === "steer" ? "keeps running, with the message injected at its next step boundary" : "is running again in the same session"}. ${waiting}`,
+		note ? `note: ${note}` : "",
+		typeof params.message === "string" && params.message.trim()
+			? `note: your message parameter was not sent — fromTaskId composes the text from ${source.id}'s answer.`
+			: "",
+	];
+
+	return {
+		content: [{ type: "text", text: lines.filter(Boolean).join("\n") }],
+		details: {
+			kind: "external-agent-relay",
+			relayed: true,
+			fromTaskId: source.id,
+			taskId: target.id,
+			state: target.state,
+			via,
+			purpose,
+			bytes,
+			sha256,
+			anchors: envelope.anchors,
+			hop: target.relayDepth,
+			archiveId: archived?.id,
+			note,
+		},
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -2549,10 +2799,17 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Ask a follow-up in the same external agent session",
 		parameters: Type.Object({
 			taskId: Type.String({ description: "Task id from external_agent_start." }),
-			message: Type.String({ description: "Follow-up message for the same session." }),
+			message: Type.String({ description: "Follow-up text; ignored for a relay." }),
+			fromTaskId: Type.Optional(Type.String({ description: "Relay source task; its answer is the body." })),
+			purpose: Type.Optional(StringEnum(["reproduce", "combine", "challenge"] as const, { description: "Relay intent." })),
+			offset: Type.Optional(Type.Number({ description: "Start byte in the source answer." })),
+			length: Type.Optional(Type.Number({ description: "Excerpt bytes (default 4000, max 16000)." })),
 		}),
 
-		async execute(_id, params): Promise<AgentToolResult<ExternalAgentFollowUpDetails>> {
+		async execute(_id, params): Promise<AgentToolResult<ExternalAgentFollowUpDetails | ExternalAgentRelayDetails>> {
+			// A relay composes its own message from another task's answer, so it takes
+			// a different channel decision and never falls through to the plain path.
+			if (params.fromTaskId != null) return await relayAnswerToTask(params as Record<string, unknown>);
 			const guard = requireCapableTask(params.taskId, "followUp");
 			if ("error" in guard) {
 				return { content: [{ type: "text", text: guard.error }], details: { continued: false } };
@@ -2604,16 +2861,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			// A new turn starts: report it, and scope the answer to it.
-			task.answerStartIndex = task.events.length;
-			task.state = "running";
-			task.endedAt = undefined;
-			task.notified = false;
-			task.exitCode = null;
-			task.spawnError = undefined;
-			task.lastEventAt = Date.now();
-			task.watchdogNotices = 0;
-			clearIdleReap(task);
+			beginFollowUpTurn(task);
 			pushEvent(task, { kind: "tool", text: `follow-up: ${params.message}`.slice(0, 200) });
 
 			return {
@@ -2634,9 +2882,10 @@ export default function (pi: ExtensionAPI) {
 
 		renderCall(args, theme, _context) {
 			const taskId = typeof args.taskId === "string" ? escapeTerminalControls(args.taskId) : "?";
-			const preview = typeof args.message === "string" ? taskPromptPreview(args.message, 60) : "";
+			const from = typeof args.fromTaskId === "string" ? escapeTerminalControls(args.fromTaskId) : undefined;
+			const preview = from ? `${from}→${taskId}` : `${taskId} · ${typeof args.message === "string" ? taskPromptPreview(args.message, 60) : ""}`;
 			return new Text(
-				theme.fg("toolTitle", theme.bold("external-agent follow-up ")) + theme.fg("accent", `${taskId} · ${preview}`),
+				theme.fg("toolTitle", theme.bold(from ? "external-agent relay " : "external-agent follow-up ")) + theme.fg("accent", preview),
 				0,
 				0,
 			);
