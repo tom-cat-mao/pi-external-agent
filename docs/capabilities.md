@@ -1,8 +1,7 @@
 # Capabilities: archive, verify, templates, meter
 
-Opt-in mechanics that change what happens around a dispatch. The tool schemas stay
-the short version; this file is the reference the coordinator reads when it actually
-uses one of them.
+Opt-in mechanics that change what happens around a dispatch. This file is the
+reference the coordinator reads when it uses one of them.
 
 ## Answer archive
 
@@ -18,8 +17,7 @@ template was used):
 ```
 
 Recall pages through `external_agent_status({taskId, offset})` — byte offset, one
-page ≤16KB/400 lines, `next_offset`/`eof` in the recall header. Paging back the
-whole file and comparing sha256 is the integrity check. Archiving fails open: a
+page ≤16KB/400 lines, `next_offset`/`eof` in the recall header. Archiving fails open: a
 write error keeps the answer inline and marks `archive unavailable` in the status.
 
 Persistent sessions archive every settled turn as its own file; recall always
@@ -54,18 +52,33 @@ Builtins:
 - `verify-report` — write tasks; change list + suggested verify command.
 - `review-report` — reviews; verdict + per-item checklist with evidence locations.
 - `relay-envelope` — worker-to-worker message format; follow_up with `fromTaskId` relays through it.
-- `board-entry` — evidence-board entry format (used by board, Wave 4).
+- `board-entry` — evidence-board row format; compare appends to a board through it.
+
+## Isolate
+
+`isolate: true` (start/compare) runs the worker in a fresh git worktree
+`<repo>/.external-agent/worktrees/<taskId>` on branch `ea-<taskId>`; a non-git cwd
+is refused. The hub never merges and never deletes. Status and settle notices carry
+the path, a diff-stat summary, and a neutral `retained worktrees:` line (folded
+past five). Merging or removing is the owner's call.
+
+## Board
+
+compare appends one JSONL row per settled slot (`claim`, `anchors`, `answerRef`,
+`status: "unverified"`) to the board file — explicit `board` path, else
+`<session-dir>/external-agent/board.jsonl`, `""` disables. The report ends with a
+digest line; write failures are reported, never fatal.
 
 ## Relay
 
 `external_agent_follow_up` with `fromTaskId` injects a settled task's answer (or an
-archived page of it, via `offset`/`length`) into another live session, wrapped in
-the relay-envelope template (from/purpose/body/anchors). Delivery is layered:
+archived page via `offset`/`length`) into another live session, wrapped in the
+relay-envelope template. Delivery is layered:
 steer for a running task, follow-up for a settled-alive session, explicit refusal
 otherwise — a relay never silently becomes a new task. Chains cap at 2 hops; the
 receipt carries bytes + sha256 prefix + a 500-char excerpt so the coordinator keeps
-visibility without the full text replaying. `external_agent_status` shows how many
-relays a session received.
+visibility without replay. `external_agent_status` shows how many relays a session
+received.
 
 ## Meter
 
