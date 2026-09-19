@@ -91,5 +91,4 @@ Propagation (relay, board, acceptance): the Details section must carry anchors;
 the hub only extracts them into relay envelopes and board rows, so checking them
 is the caller's or a verifier's job. Free mechanical facts — git pre/post diff
 stat, exit codes, CLI-reported usage — are always captured when available. Wait
-reports also include an "event summary" line with counts and the last event excerpt
-to help the model see retry storms versus genuine stalls.
+reports carry an "event summary" line: per-kind counts (tool×N, warning×M) and the last event excerpt, distinguishing retry storms from genuine stalls.
