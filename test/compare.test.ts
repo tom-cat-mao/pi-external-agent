@@ -54,21 +54,17 @@ hub.default({
 afterEach(() => lifecycle.get("session_shutdown")!({ reason: "quit" }));
 
 /**
- * Two one-shot agents, both shaped like the CLIs their adapters parse:
- *   claude -> a single compact `{type:"result",result}` line (claude family)
- *   kimi   -> OpenAI-style chat records (kimi stream-json)
+ * Three mock agents, each shaped like the transport its adapter is driven on:
+ *   kimi   -> one-shot stream-json: OpenAI-style chat records (the only adapter
+ *             left without a session driver)
+ *   claude -> persistent stream-json session: initialize handshake, then one
+ *             result record per user message (Claude-Code-shaped)
+ *   codex  -> persistent `app-server` JSON-RPC: thread/start then turn/start
  * COMPARE_MOCK_HOLD makes kimi accept its turn and never settle, which is what
  * the timeout path needs; COMPARE_MOCK_ANSWER overrides the answer text so the
  * truncation bound can be exercised.
  */
 const COMPARE_MOCKS: Record<string, string> = {
-	claude: `#!/usr/bin/env node
-const fs = require("node:fs");
-const argvFile = process.env.COMPARE_MOCK_ARGV_FILE;
-if (argvFile) fs.appendFileSync(argvFile, JSON.stringify({ bin: "claude", argv: process.argv.slice(2) }) + "\\n");
-const answer = process.env.COMPARE_MOCK_ANSWER || "CLAUDE-ANSWER";
-process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: answer }) + "\\n", function () { process.exit(0); });
-`,
 	kimi: `#!/usr/bin/env node
 const fs = require("node:fs");
 const argvFile = process.env.COMPARE_MOCK_ARGV_FILE;
@@ -79,6 +75,33 @@ if (process.env.COMPARE_MOCK_HOLD === "1") {
 	const answer = process.env.COMPARE_MOCK_ANSWER || "KIMI-ANSWER";
 	process.stdout.write(JSON.stringify({ role: "assistant", content: answer }) + "\\n", function () { process.exit(0); });
 }
+`,
+	claude: `#!/usr/bin/env node
+const fs = require("node:fs");
+const argvFile = process.env.COMPARE_MOCK_ARGV_FILE;
+if (argvFile) fs.appendFileSync(argvFile, JSON.stringify({ bin: "claude", argv: process.argv.slice(2) }) + "\\n");
+const answer = process.env.COMPARE_MOCK_ANSWER || "CLAUDE-ANSWER";
+const send = function (value) { process.stdout.write(JSON.stringify(value) + "\\n"); };
+send({ type: "system", subtype: "init", session_id: "sess-1", model: "mock", permissionMode: "bypassPermissions", tools: [] });
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", function (chunk) {
+	buffer += chunk;
+	const lines = buffer.split("\\n");
+	buffer = lines.pop();
+	for (const line of lines) {
+		if (!line.trim()) continue;
+		let msg;
+		try { msg = JSON.parse(line); } catch { continue; }
+		if (msg.type === "control_request") {
+			send({ type: "control_response", response: { subtype: "success", request_id: msg.request_id, response: {} } });
+			continue;
+		}
+		if (msg.type === "user" && msg.shouldQuery !== false) {
+			send({ type: "result", subtype: "success", is_error: false, result: answer, usage: { input_tokens: 7, output_tokens: 3 } });
+		}
+	}
+});
 `,
 	// codex is driven over `codex app-server` (JSON-RPC), i.e. the persistent
 	// session arm of the compare dispatch rather than the one-shot arm.
@@ -197,9 +220,11 @@ test("compare: dispatches several agents and returns one aggregated side-by-side
 		assert.equal(typeof claude.taskId, "string");
 		// A compare entry carries the same honest dispatch receipt a start returns.
 		assert.equal(claude.dispatch.version, 1);
-		assert.equal(claude.dispatch.argv[claude.dispatch.promptArgIndex], "say which module owns the task registry");
 		assert.equal(claude.dispatch.notify, "off");
-		assert.equal(claude.dispatch.transport, "oneshot");
+		// claude is a session agent now: the receipt describes the session channel.
+		assert.equal(claude.dispatch.transport, "persistent");
+		assert.equal(claude.dispatch.stdin, "stream-json");
+		assert.equal(claude.dispatch.promptArgIndex, -1, "the prompt travels over the protocol, not argv");
 		// Effort stays opt-in: nothing was invented for a spec that omitted it.
 		assert.equal(claude.dispatch.effort.requested, undefined);
 		assert.equal(claude.dispatch.effort.forwarded, false);
@@ -211,6 +236,11 @@ test("compare: dispatches several agents and returns one aggregated side-by-side
 		assert.equal(kimi.state, "done");
 		assert.equal(kimi.answer, "KIMI-ANSWER");
 		assert.equal(kimi.mode, "yolo");
+		// kimi is the one-shot arm: the task really is an argv word there.
+		assert.equal(kimi.dispatch.transport, "oneshot");
+		assert.equal(kimi.dispatch.argv[kimi.dispatch.promptArgIndex], "say which module owns the task registry");
+		assert.equal(kimi.dispatch.effort.requested, undefined);
+		assert.equal(kimi.dispatch.argv.includes("--effort"), false);
 
 		const text = compared.content[0].text;
 		assert.match(text, /sync blocking call/);
@@ -428,8 +458,11 @@ test("compare: a persistent-session agent rides its session driver in the same b
 			{
 				task: "name the transport this agent uses",
 				agents: [
-					{ agent: "codex", mode: "yolo", effort: "high" },
-					{ agent: "claude", mode: "readonly" },
+					// kimi is yolo-only and the batch shares one directory, so the
+					// session slot carries readonly and the one-shot slot yolo —
+					// two mutating tasks in one cwd would be refused.
+					{ agent: "codex", mode: "readonly", effort: "high" },
+					{ agent: "kimi", mode: "yolo" },
 				],
 			},
 			dir,
@@ -450,7 +483,9 @@ test("compare: a persistent-session agent rides its session driver in the same b
 		assert.equal(turnStart.length, 1);
 		assert.equal(turnStart[0].effort, "high");
 
-		assert.equal(oneshot.agent, "claude");
+		// kimi is the only adapter left without a session driver, so it is the
+		// one-shot arm here; it answers and exits instead of holding a session open.
+		assert.equal(oneshot.agent, "kimi");
 		assert.equal(oneshot.state, "done");
 		assert.equal(oneshot.dispatch.transport, "oneshot");
 		assert.equal(oneshot.dispatch.effort.requested, undefined);
@@ -484,8 +519,8 @@ test("compare: a codex turn whose completion shares the turn/start response chun
 			{
 				task: "name the transport this agent uses",
 				agents: [
-					{ agent: "codex", mode: "yolo" },
-					{ agent: "claude", mode: "readonly" },
+					{ agent: "codex", mode: "readonly" },
+					{ agent: "kimi", mode: "yolo" },
 				],
 			},
 			dir,

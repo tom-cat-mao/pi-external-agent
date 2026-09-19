@@ -16,7 +16,7 @@ Run readonly in `default` permission mode with a generated `--settings` payload:
 
 ## Alternatives considered
 
-1. **Plan mode.** Strongest reason: it is the harness's own read-only mode — the same tier claude keeps — so no custom rule payload is needed. Why rejected: it is not equivalent headless; its auto-rejected permission request cancels the turn outright, so a readonly run would die instead of refusing one tool call.
+1. **Plan mode.** Strongest reason: it is the harness's own read-only mode, so no custom rule payload is needed. Why rejected: it is not equivalent headless; its auto-rejected permission request cancels the turn outright, so a readonly run would die instead of refusing one tool call.
 2. **OS sandbox.** Strongest reason: an OS-level boundary would be airtight rather than heuristic. Why rejected: no sandbox is available for this CLI on this platform, so there is nothing to bind the tier to.
 
 ## Consequences

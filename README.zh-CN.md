@@ -51,7 +51,7 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
 | `codebuddy` | 腾讯 | yolo | ✅ ACP step 边界注入 |
 | `qoder` | 阿里 | yolo | follow-up ✅；steer ✅，需 CLI 声明的版本满足 1.1.49 基线 |
 | `kimi` | Moonshot | 仅 yolo（headless 拒收权限旗标） | ❌ |
-| `claude` | Anthropic | readonly | ❌ |
+| `claude` | Anthropic | yolo（readonly–yolo 三档；effort low–max，无 off） | ✅ stream-json |
 
 ## 文档
 

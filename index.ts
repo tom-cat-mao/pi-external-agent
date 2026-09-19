@@ -8,11 +8,12 @@
  *    notifications, blocking external_agent_wait, or external_agent_compare
  *    (side by side, no judging). Why: .agents/notes/implemented/2026-08-17-no-wall-clock-timeout.md
  *
- * 2. Permission tiers are enforced by the target harness, never by a prompt
- *    request, and defaults are per-adapter: codex/pi/kimi/codebuddy/reasonix/qoder
- *    yolo, claude readonly. kimi is yolo-only (headless mode rejects permission
- *    flags), so readonly/write are refused; concurrent write/yolo tasks in the same
- *    directory are refused outright. Why: .agents/notes/implemented/2026-09-07-kimi-yolo-only.md
+ * 2. Permission tiers are enforced mechanically — by the target harness, or by the
+ *    session driver answering protocol permission requests (claude's can_use_tool) —
+ *    never by a prompt request, and defaults are per-adapter:
+ *    codex/pi/kimi/codebuddy/reasonix/qoder/claude
+ *    yolo; kimi is yolo-only (headless mode rejects permission flags), so readonly/write are refused;
+ *    concurrent write/yolo tasks in the same directory are refused outright. Why: .agents/notes/implemented/2026-09-07-kimi-yolo-only.md
  *
  * 3. One tool surface: `agent` is an enum rather than one tool per CLI, because
  *    tool descriptions cost context in every request.
@@ -489,11 +490,25 @@ function enforcementDisplay(receipt: DispatchReceipt): string {
 	switch (receipt.readOnlyEnforcement) {
 		case "harness-enforced":
 			return "harness-enforced";
+		case "driver-enforced":
+			return "driver-enforced (can_use_tool deny)";
 		case "not-enforced":
 			return "NOT enforced by target harness";
 		default:
 			return "not applicable (write/yolo mode)";
 	}
+}
+
+/**
+ * Readonly enforcement on the persistent path. Drivers that hand the tier to
+ * the target harness (sandbox, tool allowlist, settings rules) report
+ * harness-enforced; claude's stream-json driver answers can_use_tool with a
+ * deny itself, so its receipt says driver-enforced rather than claiming a
+ * harness boundary that does not exist.
+ */
+function sessionReadOnlyEnforcement(agent: AgentId, mode: Mode): AdapterDispatch["readOnlyEnforcement"] {
+	if (mode !== "readonly") return "not-applicable";
+	return ADAPTERS[agent].driverEnforcedReadOnly ? "driver-enforced" : "harness-enforced";
 }
 
 function freezeDispatchReceipt(receipt: DispatchReceipt): DispatchReceipt {
@@ -1410,7 +1425,7 @@ function startPersistentTask(
 		provider: adapter.provider,
 		requestedMode: mode,
 		effectivePolicy: adapter.sessionPolicy?.(mode) ?? `${adapter.session?.steerNote ?? "session"} (persistent session)`,
-		readOnlyEnforcement: mode === "readonly" ? "harness-enforced" : "not-applicable",
+		readOnlyEnforcement: sessionReadOnlyEnforcement(agent, mode),
 		model: model
 			? { requested: model, forwarded: true, note: "Passed to the persistent session at startup." }
 			: { forwarded: false, note: "No model override requested; target CLI/config selects the model." },
@@ -1953,6 +1968,7 @@ function isDispatchReceipt(value: unknown): value is DispatchReceipt {
 		isMode(receipt.requestedMode) &&
 		(receipt.effectivePolicy === null || typeof receipt.effectivePolicy === "string") &&
 		(receipt.readOnlyEnforcement === "harness-enforced" ||
+			receipt.readOnlyEnforcement === "driver-enforced" ||
 			receipt.readOnlyEnforcement === "not-enforced" ||
 			receipt.readOnlyEnforcement === "not-applicable") &&
 		!!receipt.model &&
@@ -2083,7 +2099,7 @@ function receiptFromStartArgs(args: Record<string, unknown>, fallbackCwd: string
 			provider: adapter.provider,
 			requestedMode: mode,
 			effectivePolicy: adapter.sessionPolicy?.(mode) ?? `${adapter.session?.steerNote ?? "session"} (persistent session)`,
-			readOnlyEnforcement: mode === "readonly" ? "harness-enforced" : "not-applicable",
+			readOnlyEnforcement: sessionReadOnlyEnforcement(agent, mode),
 			model: model
 				? { requested: model, forwarded: true, note: "Passed to the persistent session at startup." }
 				: { forwarded: false, note: "No model override requested; target CLI/config selects the model." },
@@ -2484,6 +2500,9 @@ async function relayAnswerToTask(params: Record<string, unknown>): Promise<Agent
 // Extension
 // ---------------------------------------------------------------------------
 
+/** Agents whose adapter advertises a persistent session, in AGENT_IDS order. */
+const PERSISTENT_AGENTS = AGENT_IDS.filter((id) => ADAPTERS[id].session).join(", ");
+
 const agentTable = AGENT_IDS.map((id) => {
 	const a = ADAPTERS[id];
 	const flags = [
@@ -2559,14 +2578,14 @@ export default function (pi: ExtensionAPI) {
 		label: "External Agent",
 		description: [
 			"Dispatch a task to another coding agent CLI. Returns a taskId immediately; the agent runs in the",
-			"background and notifies you when it settles, so you can start several and keep working. There is no",
-			"wall-clock timeout, but a stall watchdog (default 15m quiet) also notifies you, so ending your turn",
-			"while waiting is safe.",
+			"background and notifies you when it settles. Start several and keep working. There is no wall-clock",
+			"timeout, but a stall watchdog (default 15m quiet) also notifies you, so ending your turn while",
+			"waiting is safe.",
 			`Agents: ${agentTable}.`,
 			"Task text must be self-contained: the agent sees none of this conversation; state the goal, files and what to return.",
 			"Concurrent write/yolo tasks in one directory are refused; effort is opt-in (see the effort parameter).",
-			"pi, codex, reasonix, codebuddy and qoder are persistent sessions (the conversation survives the answer,",
-			"so it can be followed up or steered); the others are one-shot with no way back in.",
+			`Persistent sessions: ${PERSISTENT_AGENTS} (the conversation survives the answer, so it can be followed up or steered);`,
+			"the others are one-shot with no way back in.",
 		].join(" "),
 		promptSnippet: "Delegate a task to an external coding agent CLI",
 		promptGuidelines: [
@@ -2575,7 +2594,7 @@ export default function (pi: ExtensionAPI) {
 			"external_agent_steer is not an interrupt (it lands at the next step boundary); if it reports that the turn already ended, use external_agent_follow_up.",
 			"external_agent_follow_up continues the same session instead of re-dispatching work already done.",
 			"Treat external agent answers as claims to verify against the code, not as fact.",
-			"Opt-in extras: template (output contract) · verify (acceptance run after settle) · status offset (paged recall) · follow_up fromTaskId (relay) · isolate (own worktree) · compare board (evidence rows).",
+			"Opt-in extras (per parameter): template · verify · isolate · status offset · follow_up fromTaskId · compare board.",
 		],
 		parameters: Type.Object({
 			agent: StringEnum(AGENT_IDS as unknown as readonly string[]),

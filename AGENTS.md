@@ -23,7 +23,7 @@ Run only the test file relevant to your change locally; run the full suite befor
 ## Invariants
 
 - **No wall-clock kill.** Tasks run to completion. The stall watchdog notifies the model when a running task goes quiet (default 15m); the model decides whether to stop. See [.agents/notes/implemented/2026-08-17-no-wall-clock-timeout.md](.agents/notes/implemented/2026-08-17-no-wall-clock-timeout.md).
-- **Permission tiers are enforced by the target CLI harness**, never by a prompt-level request. See [docs/adapters.md](docs/adapters.md).
+- **Permission tiers are enforced mechanically** — by the target CLI harness, or by the session driver answering protocol permission requests (claude's `can_use_tool`) — never by a prompt-level request. See [docs/adapters.md](docs/adapters.md).
 - **One tool surface.** `agent` is an enum rather than one tool per CLI, because tool descriptions cost context in every request. See [.agents/notes/implemented/2026-08-17-single-tool-surface.md](.agents/notes/implemented/2026-08-17-single-tool-surface.md).
 - **Non-trivial changes ship with a note** in `.agents/notes/` in the same commit.
 

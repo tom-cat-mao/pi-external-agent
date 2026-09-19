@@ -51,7 +51,7 @@ All off by default; enable per call — `template` (output contract), `verify` (
 | `codebuddy` | Tencent | yolo | ✅ via ACP step-boundary injection |
 | `qoder` | Alibaba | yolo | follow-up ✅; steer ✅ when the announced CLI meets the 1.1.49 baseline |
 | `kimi` | Moonshot | yolo only (its headless mode rejects permission flags) | ❌ |
-| `claude` | Anthropic | readonly | ❌ |
+| `claude` | Anthropic | yolo (readonly–yolo; effort low–max, no off) | ✅ via stream-json |
 
 ## Documentation
 

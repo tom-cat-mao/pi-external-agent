@@ -19,7 +19,7 @@ Every dispatch returns a receipt: the exact argv, the effective permission polic
 ## Transports
 
 - **One-shot** (`adapters.ts`) — a headless process per task; process exit is completion, defined by `buildDispatch` plus `parseEvent`.
-- **Persistent** (`sessions.ts`) — a long-lived stdio session where turn end, not process exit, is the completion signal, so a follow-up keeps the conversation. Drivers: `PiRpcDriver` (pi `--mode rpc`), `CodexAppServerDriver` (`codex app-server`), `AcpDriver` (reasonix, codebuddy), `QoderStreamJsonDriver` (qoder stream-json). A driver in `SESSION_DRIVERS` (tested by `hasSessionDriver()`) selects this transport; the adapter's `session` flags say whether steer / follow-up exist. Without a driver, one-shot is the only path.
+- **Persistent** (`sessions.ts`) — a long-lived stdio session whose completion signal is turn end, not process exit, so a follow-up keeps the conversation. Drivers: `PiRpcDriver` (pi `--mode rpc`), `CodexAppServerDriver` (`codex app-server`), `AcpDriver` (reasonix, codebuddy), `ClaudeStreamJsonDriver` (claude stream-json), `QoderStreamJsonDriver` (qoder stream-json). A driver in `SESSION_DRIVERS` (tested by `hasSessionDriver()`) selects this transport; the adapter's `session` flags say whether steer / follow-up exist. Without a driver, one-shot is the only path.
 
 ## Tool map
 

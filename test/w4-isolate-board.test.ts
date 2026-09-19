@@ -104,21 +104,62 @@ function withEnv(values: Record<string, string>): () => void {
 	};
 }
 
+/**
+ * claude is driven over the stream-json session channel: system/init + answered
+ * initialize, then one result record per user message. Both fixtures below take
+ * the task out of that user message — the argv no longer carries it.
+ */
+const CLAUDE_SESSION_PREAMBLE = `const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+send({ type: "system", subtype: "init", session_id: "sess-1", model: "mock", permissionMode: "bypassPermissions", tools: [] });
+let buffer = "";
+process.stdin.setEncoding("utf8");
+function handle(msg) {
+	if (msg.type === "control_request") {
+		send({ type: "control_response", response: { subtype: "success", request_id: msg.request_id, response: {} } });
+		return;
+	}
+	if (msg.type !== "user" || msg.shouldQuery === false) return;
+	const task = (msg.message && Array.isArray(msg.message.content) ? msg.message.content : [])
+		.map(function (block) { return block.text || ""; }).join("");
+`;
+
 const CLAUDE_WRITE_MOCK = `#!/usr/bin/env node
 const fs = require("node:fs");
 if (process.env.CLAUDE_MOCK_LOG_FILE) fs.appendFileSync(process.env.CLAUDE_MOCK_LOG_FILE, JSON.stringify({ cwd: process.cwd() }) + "\\n");
 fs.writeFileSync("ISOLATED.txt", "worker output\\n");
-process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "ISOLATED_OK",
-  usage: { input_tokens: 1, output_tokens: 1 } }) + "\\n");
+${CLAUDE_SESSION_PREAMBLE}	send({ type: "result", subtype: "success", is_error: false, result: "ISOLATED_OK",
+		usage: { input_tokens: 1, output_tokens: 1 } });
+}
+process.stdin.on("data", function (chunk) {
+	buffer += chunk;
+	const lines = buffer.split("\\n");
+	buffer = lines.pop();
+	for (const line of lines) {
+		if (!line.trim()) continue;
+		let msg;
+		try { msg = JSON.parse(line); } catch { continue; }
+		handle(msg);
+	}
+});
 `;
 
-/** Reads the task out of claude's `-p <task>` argv and answers with a structured claim. */
+/** Answers with a structured claim built from the task the session was sent. */
 const CLAUDE_ECHO_MOCK = `#!/usr/bin/env node
-const at = process.argv.indexOf("-p");
-const task = at === -1 ? "" : (process.argv[at + 1] || "");
-const answer = "## Summary\\nclaim " + task + "\\n\\n## Details\\nsee src/index.ts:4 for " + task + "\\n";
-process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: answer,
-  usage: { input_tokens: 3, output_tokens: 4 } }) + "\\n");
+${CLAUDE_SESSION_PREAMBLE}	const answer = "## Summary\\nclaim " + task + "\\n\\n## Details\\nsee src/index.ts:4 for " + task + "\\n";
+	send({ type: "result", subtype: "success", is_error: false, result: answer,
+		usage: { input_tokens: 3, output_tokens: 4 } });
+}
+process.stdin.on("data", function (chunk) {
+	buffer += chunk;
+	const lines = buffer.split("\\n");
+	buffer = lines.pop();
+	for (const line of lines) {
+		if (!line.trim()) continue;
+		let msg;
+		try { msg = JSON.parse(line); } catch { continue; }
+		handle(msg);
+	}
+});
 `;
 
 /** The exact answer text the echo mock produces for one task, after trim. */
