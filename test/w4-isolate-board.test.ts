@@ -175,7 +175,7 @@ test("w4: isolate runs the worker in its own worktree and leaves the main checko
 	const restore = withEnv({ PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`, CLAUDE_MOCK_LOG_FILE: logFile });
 	try {
 		const started = await call("external_agent_start", {
-			agent: "claude",
+			agent: "pi",
 			task: "write ISOLATED.txt",
 			mode: "write",
 			cwd: repo,
@@ -220,7 +220,7 @@ test("w4: isolate runs the worker in its own worktree and leaves the main checko
 
 		// …and stays idempotent across later isolated dispatches.
 		const again = await call("external_agent_start", {
-			agent: "claude",
+			agent: "pi",
 			task: "write AGAIN.txt",
 			mode: "write",
 			cwd: repo,
@@ -238,7 +238,7 @@ test("w4: isolate refuses a cwd that is not a git repository without leaving any
 	const restore = withEnv({ PATH: `${dir}${path.delimiter}${process.env.PATH ?? ""}` });
 	try {
 		const result = await call("external_agent_start", {
-			agent: "claude",
+			agent: "pi",
 			task: "write ISOLATED.txt",
 			mode: "write",
 			cwd: dir,
@@ -263,8 +263,8 @@ test("w4: compare with isolate gives every slot its own worktree, so same-repo w
 		const result = await call("external_agent_compare", {
 			task: "SHARED",
 			agents: [
-				{ agent: "claude", cwd: repo, mode: "write", task: "ALPHA_TASK" },
-				{ agent: "claude", cwd: repo, mode: "write", task: "BETA_TASK" },
+				{ agent: "pi", cwd: repo, mode: "write", task: "ALPHA_TASK" },
+				{ agent: "pi", cwd: repo, mode: "write", task: "BETA_TASK" },
 			],
 			isolate: true,
 			board: "",
@@ -301,7 +301,7 @@ test("w4: the retained-worktree line folds past five and lists the oldest first"
 	const restore = withEnv({ PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}` });
 	try {
 		const started = await call("external_agent_start", {
-			agent: "claude",
+			agent: "pi",
 			task: "write",
 			mode: "write",
 			cwd: repo,
@@ -329,7 +329,7 @@ test("w4: a failed worktree add refuses the dispatch and never touches an alread
 	const restore = withEnv({ PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}` });
 	try {
 		const result = await call("external_agent_start", {
-			agent: "claude",
+			agent: "pi",
 			task: "write",
 			mode: "write",
 			cwd: repo,
@@ -358,9 +358,9 @@ test("w4: compare appends one board row per settled slot and reports the digest"
 		const result = await call("external_agent_compare", {
 			task: "SHARED",
 			agents: [
-				{ agent: "claude", cwd: dir, mode: "readonly", task: "ALPHA_TASK" },
+				{ agent: "pi", cwd: dir, mode: "readonly", task: "ALPHA_TASK" },
 				{ agent: "kimi", cwd: dir, mode: "readonly" },
-				{ agent: "claude", cwd: dir, mode: "readonly", task: "BETA_TASK" },
+				{ agent: "pi", cwd: dir, mode: "readonly", task: "BETA_TASK" },
 			],
 			timeout: 30,
 		});
@@ -406,8 +406,8 @@ test("w4: board \"\" disables the board without touching the compare result", as
 		const result = await call("external_agent_compare", {
 			task: "SHARED",
 			agents: [
-				{ agent: "claude", cwd: dir, mode: "readonly", task: "ALPHA_TASK" },
-				{ agent: "claude", cwd: dir, mode: "readonly", task: "BETA_TASK" },
+				{ agent: "pi", cwd: dir, mode: "readonly", task: "ALPHA_TASK" },
+				{ agent: "pi", cwd: dir, mode: "readonly", task: "BETA_TASK" },
 			],
 			board: "",
 			timeout: 30,
@@ -431,8 +431,8 @@ test("w4: a board write failure is reported as unavailable and never fails the c
 		const result = await call("external_agent_compare", {
 			task: "SHARED",
 			agents: [
-				{ agent: "claude", cwd: dir, mode: "readonly", task: "ALPHA_TASK" },
-				{ agent: "claude", cwd: dir, mode: "readonly", task: "BETA_TASK" },
+				{ agent: "pi", cwd: dir, mode: "readonly", task: "ALPHA_TASK" },
+				{ agent: "pi", cwd: dir, mode: "readonly", task: "BETA_TASK" },
 			],
 			board: path.join(blocker, "board.jsonl"),
 			timeout: 30,

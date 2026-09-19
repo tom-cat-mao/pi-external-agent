@@ -145,12 +145,8 @@ process.stdin.on("data", (chunk) => {
 });
 `;
 
-const CLAUDE_MOCK = `#!/usr/bin/env node
-const fs = require("node:fs");
-const answer = process.env.CLAUDE_MOCK_ANSWER_FILE ? fs.readFileSync(process.env.CLAUDE_MOCK_ANSWER_FILE, "utf8") : "CLAUDE_OK";
-process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: answer,
-  usage: { input_tokens: 12, output_tokens: 5 }, total_cost_usd: 0.01 }) + "\\n");
-`;
+const PI_READONLY_MOCK = `#!/usr/bin/env node
+process.exit(0);`;
 
 function makeFixtureDir(files: Record<string, string>): string {
 	const dir = mkdtempSync(path.join(tmpdir(), "w3-fixture-"));
@@ -260,7 +256,7 @@ test("w3: relay injects the source answer into a running session as an envelope"
 		QODER_MOCK_SCENARIO: JSON.stringify({ turns: [{ hold: true }] }),
 	});
 	try {
-		const source = await call("external_agent_start", { agent: "claude", task: "dig in", mode: "readonly", cwd: dir, notify: "off" });
+		const source = await call("external_agent_start", { agent: "pi", task: "dig in", mode: "readonly", cwd: dir, notify: "off" });
 		const sourceId = source.details.task.taskId;
 		await settleTask(sourceId);
 		const targetId = await startQoder(dir);
@@ -319,7 +315,7 @@ test("w3: the receipt hash matches the bytes that arrived, and offset/length cho
 		QODER_MOCK_SCENARIO: JSON.stringify({ turns: [{ hold: true }] }),
 	});
 	try {
-		const source = await call("external_agent_start", { agent: "claude", task: "dig in", mode: "readonly", cwd: dir, notify: "off" });
+		const source = await call("external_agent_start", { agent: "pi", task: "dig in", mode: "readonly", cwd: dir, notify: "off" });
 		const sourceId = source.details.task.taskId;
 		await settleTask(sourceId);
 		const targetId = await startQoder(dir);
@@ -358,7 +354,7 @@ test("w3: a third hop is refused instead of the workers negotiating among themse
 		QODER_MOCK_SCENARIO: JSON.stringify({ turns: [{ answer: "TURN-1" }, { answer: "TURN-2" }] }),
 	});
 	try {
-		const source = await call("external_agent_start", { agent: "claude", task: "dig in", mode: "readonly", cwd: dir, notify: "off" });
+		const source = await call("external_agent_start", { agent: "pi", task: "dig in", mode: "readonly", cwd: dir, notify: "off" });
 		const sourceId = source.details.task.taskId;
 		await settleTask(sourceId);
 		const firstId = await startQoder(dir);
@@ -395,12 +391,12 @@ test("w3: relay refuses a one-shot target and a dead session rather than degradi
 	writeFileSync(answerFile, "RELAY_THIS_BODY");
 	const restore = withEnv({ PATH: `${dir}${path.delimiter}${process.env.PATH ?? ""}`, CLAUDE_MOCK_ANSWER_FILE: answerFile });
 	try {
-		const source = await call("external_agent_start", { agent: "claude", task: "dig in", mode: "readonly", cwd: dir, notify: "off" });
+		const source = await call("external_agent_start", { agent: "pi", task: "dig in", mode: "readonly", cwd: dir, notify: "off" });
 		const sourceId = source.details.task.taskId;
 		await settleTask(sourceId);
 
 		const oneShotId = (
-			await call("external_agent_start", { agent: "claude", task: "target", mode: "readonly", cwd: dir, notify: "off" })
+			await call("external_agent_start", { agent: "pi", task: "target", mode: "readonly", cwd: dir, notify: "off" })
 		).details.task.taskId;
 		await settleTask(oneShotId);
 		const refusedOneshot = await call("external_agent_follow_up", { taskId: oneShotId, message: "", fromTaskId: sourceId });
@@ -503,7 +499,7 @@ test("w3: an unarchived answer is selected by bytes, on character boundaries", a
 		QODER_MOCK_SCENARIO: JSON.stringify({ turns: [{ hold: true }] }),
 	});
 	try {
-		const source = await call("external_agent_start", { agent: "claude", task: "look", mode: "readonly", cwd: dir, notify: "off" });
+		const source = await call("external_agent_start", { agent: "pi", task: "look", mode: "readonly", cwd: dir, notify: "off" });
 		const sourceId = source.details.task.taskId;
 		await settleTask(sourceId);
 		assert.doesNotMatch(resultText(await call("external_agent_status", { taskId: sourceId })), /answer archived:/, "kept inline");

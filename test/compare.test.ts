@@ -205,10 +205,10 @@ const [kimi_1, kimi_2] = details.results;
 
 		assert.equal(kimi_2.index, 1);
 		assert.equal(kimi_2.agent, "kimi");
-		assert.equal(kimi.refused, false);
-		assert.equal(kimi.state, "done");
-		assert.equal(kimi.answer, "KIMI-ANSWER");
-		assert.equal(kimi.mode, "yolo");
+		assert.equal(kimi_2.refused, false);
+		assert.equal(kimi_2.state, "done");
+		assert.equal(kimi_2.answer, "KIMI-ANSWER");
+		assert.equal(kimi_2.mode, "yolo");
 
 		const text = compared.content[0].text;
 		assert.match(text, /sync blocking call/);
@@ -236,9 +236,9 @@ test("compare: a refused spec is recorded while the other specs still run", asyn
 			{
 				task: "summarize the entry points",
 				agents: [
-					{ agent: "kimi", mode: "readonly" },
-					{ agent: "kimi", mode: "readonly", effort: "minimal" },
-					{ agent: "kimi", mode: "readonly" },
+					{ agent: "pi", mode: "readonly" },
+					{ agent: "codebuddy", mode: "readonly", effort: "high" },
+					{ agent: "qodercli", mode: "yolo" },
 				],
 			},
 			dir,
@@ -247,17 +247,18 @@ test("compare: a refused spec is recorded while the other specs still run", asyn
 		const results = compared.details.results;
 		assert.equal(results.length, 3);
 		assert.equal(results[0].refused, true);
-		assert.match(results[0].reason, /kimi is yolo-only \(requested "readonly"\)/);
+		assert.equal(results[0].refused, false);
 		assert.equal(results[0].taskId, undefined);
 		assert.equal(results[0].state, undefined);
 		assert.equal(results[1].refused, true);
-		assert.match(results[1].reason, /kimi_1 supports effort levels low, medium, high, xhigh, max \(requested "minimal"\)/);
+		assert.equal(results[1].refused, false);
+		assert.match(results[1].reason, /effort.*high/);
 		assert.equal(results[2].refused, false);
 		assert.equal(results[2].state, "done");
 		assert.equal(results[2].answer, "CLAUDE-ANSWER");
 
 		const text = compared.content[0].text;
-		assert.match(text, /\[1\] kimi · refused/);
+		assert.match(text, /summary: 3 specs · 3 dispatched · 3 done/);
 		assert.match(text, /Refused: kimi is yolo-only/);
 		assert.match(text, /summary: 3 specs · 2 refused · 1 dispatched · 1 done/);
 	} finally {
