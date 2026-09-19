@@ -67,19 +67,19 @@ Upgrade claude to first-class citizen status:
 - `test/claude.test.ts`: new file — comprehensive test suite
 - `.agents/notes/.../2026-09-19-claude-adapter-modernization.md`: this document
 
-## Alternatives Considered
+## Alternatives considered
 
 1. Keep claude capped at readonly
-   - Reason: maintain separation from codebuddy roles
-   - Rejected: claude shares same gateway; role distinction is arbitrary
+   - Strongest reason: maintain separation from codebuddy roles
+   - Why rejected: claude shares same gateway; role distinction is arbitrary
 
 2. Use ACP protocol instead of stream-json
-   - Reason: codebuddy uses ACP for persistence
-   - Rejected: claune docs emphasize stream-json; less complexity
+   - Strongest reason: codebuddy uses ACP for persistence  
+   - Why rejected: claude docs emphasize stream-json; less complexity
 
 3. Add ultracode support
-   - Reason: match codebuddy's full range
-   - Rejected: pi domain mapping doesn't include ultracode; keep consistent
+   - Strongest reason: match codebuddy's full range
+   - Why rejected: pi domain mapping doesn't include ultracode; keep consistent
 
 ## Implementation Notes
 

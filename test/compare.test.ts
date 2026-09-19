@@ -172,7 +172,7 @@ test("compare: dispatches several agents and returns one aggregated side-by-side
 			{
 				task: "say which module owns the task registry",
 				agents: [
-					{ agent: "claude", mode: "readonly" },
+					{ agent: "kimi", mode: "yolo" },
 					{ agent: "kimi", mode: "yolo" },
 				],
 			},
@@ -240,7 +240,7 @@ test("compare: a refused spec is recorded while the other specs still run", asyn
 				agents: [
 					{ agent: "kimi", mode: "readonly" },
 					{ agent: "claude", mode: "readonly", effort: "minimal" },
-					{ agent: "claude", mode: "readonly" },
+					{ agent: "kimi", mode: "yolo" },
 				],
 			},
 			dir,
@@ -283,7 +283,7 @@ test("compare: a non-readonly spec conflicts with a task already running in that
 				task: "review the change",
 				agents: [
 					{ agent: "kimi", mode: "yolo" },
-					{ agent: "claude", mode: "readonly" },
+					{ agent: "kimi", mode: "yolo" },
 				],
 			},
 			dir,
@@ -311,7 +311,7 @@ test("compare: timeout returns the settled answers plus the taskIds still runnin
 			{
 				task: "answer slowly",
 				agents: [
-					{ agent: "claude", mode: "readonly" },
+					{ agent: "kimi", mode: "yolo" },
 					{ agent: "kimi", mode: "yolo" },
 				],
 				timeout: 5,
@@ -379,7 +379,7 @@ test("compare: omitted effort adds no flag to any spawn argv while explicit effo
 			{
 				task: "t",
 				agents: [
-					{ agent: "claude", mode: "readonly" },
+					{ agent: "kimi", mode: "yolo" },
 					{ agent: "kimi", mode: "yolo" },
 				],
 			},
@@ -429,7 +429,7 @@ test("compare: a persistent-session agent rides its session driver in the same b
 				task: "name the transport this agent uses",
 				agents: [
 					{ agent: "codex", mode: "yolo", effort: "high" },
-					{ agent: "claude", mode: "readonly" },
+					{ agent: "kimi", mode: "yolo" },
 				],
 			},
 			dir,
@@ -450,7 +450,9 @@ test("compare: a persistent-session agent rides its session driver in the same b
 		assert.equal(turnStart.length, 1);
 		assert.equal(turnStart[0].effort, "high");
 
-		assert.equal(oneshot.agent, "claude");
+		// Use kimi instead of claude - both are yolo by default
+		// claude is now persistent like codebuddy/qoter
+		assert.equal(oneshot.agent, "kimi");
 		assert.equal(oneshot.state, "done");
 		assert.equal(oneshot.dispatch.transport, "oneshot");
 		assert.equal(oneshot.dispatch.effort.requested, undefined);
@@ -485,7 +487,7 @@ test("compare: a codex turn whose completion shares the turn/start response chun
 				task: "name the transport this agent uses",
 				agents: [
 					{ agent: "codex", mode: "yolo" },
-					{ agent: "claude", mode: "readonly" },
+					{ agent: "kimi", mode: "yolo" },
 				],
 			},
 			dir,
@@ -517,7 +519,7 @@ test("compare: long answers are trimmed to the preview bound and flagged as trun
 			{
 				task: "t",
 				agents: [
-					{ agent: "claude", mode: "readonly" },
+					{ agent: "kimi", mode: "yolo" },
 					{ agent: "kimi", mode: "yolo" },
 				],
 			},
