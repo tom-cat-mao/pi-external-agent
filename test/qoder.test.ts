@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { ADAPTERS, qoderPermissionArgs } from "../adapters.ts";
-import { FOLLOWUP_AGENT_IDS, SESSION_DRIVERS, STEER_AGENT_IDS } from "../sessions.ts";
+import { ADAPTERS, qoderPermissionArgs } from "../src/adapters.ts";
+import { FOLLOWUP_AGENT_IDS, SESSION_DRIVERS, STEER_AGENT_IDS } from "../src/sessions.ts";
 
 test("qoder adapter basics", () => {
 	const a = ADAPTERS.qoder;

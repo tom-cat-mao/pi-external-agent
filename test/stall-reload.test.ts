@@ -53,7 +53,7 @@ const moduleHooks = registerHooks({
 	},
 });
 
-const hub = (await import("../index.ts")) as any;
+const hub = (await import("../src/index.ts")) as any;
 moduleHooks.deregister();
 // The event record reads the stall clock, not Date.now.
 hub.stallClock.now = () => 2_000 + 2 * 60_000;

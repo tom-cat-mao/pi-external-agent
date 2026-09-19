@@ -413,7 +413,7 @@ function parseClaudeFamilyStreamLine(line: string): AgentEvent | null {
  * call time, so it stays correct wherever the extension is installed.
  */
 export function buildReadonlySettings(): string {
-	const hookPath = fileURLToPath(new URL("./hooks/codebuddy-readonly.js", import.meta.url));
+	const hookPath = fileURLToPath(new URL("../hooks/codebuddy-readonly.js", import.meta.url));
 	const quotedHookPath = `'${hookPath.replaceAll("'", `'\\''`)}'`;
 	return JSON.stringify({
 		permissions: {

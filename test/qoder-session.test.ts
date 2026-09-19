@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { SESSION_DRIVERS, type SessionDriver, type TurnOutcome } from "../sessions.ts";
-import type { AgentEvent, Effort, Mode } from "../adapters.ts";
+import { SESSION_DRIVERS, type SessionDriver, type TurnOutcome } from "../src/sessions.ts";
+import type { AgentEvent, Effort, Mode } from "../src/adapters.ts";
 
 interface MockTurn {
 	chunks?: string[];

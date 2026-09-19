@@ -3,8 +3,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ADAPTERS } from "../adapters.ts";
-import { SESSION_DRIVERS, type TurnOutcome } from "../sessions.ts";
+import { ADAPTERS } from "../src/adapters.ts";
+import { SESSION_DRIVERS, type TurnOutcome } from "../src/sessions.ts";
 
 const CLOSED_STDIN_MOCK = `#!/usr/bin/env node
 const fs = require("node:fs");

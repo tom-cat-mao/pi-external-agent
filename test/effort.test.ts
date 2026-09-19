@@ -15,9 +15,9 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { ADAPTERS, AGENT_IDS } from "../adapters.ts";
-import { SESSION_DRIVERS } from "../sessions.ts";
-import type { AgentId, Effort } from "../adapters.ts";
+import { ADAPTERS, AGENT_IDS } from "../src/adapters.ts";
+import { SESSION_DRIVERS } from "../src/sessions.ts";
+import type { AgentId, Effort } from "../src/adapters.ts";
 
 function effortPayload(argv: string[]): string | undefined {
 	const cIndex = argv.indexOf("-c");
@@ -29,7 +29,7 @@ function effortPayload(argv: string[]): string | undefined {
 	return undefined;
 }
 
-const INDEX_SOURCE = readFileSync(new URL("../index.ts", import.meta.url), "utf8");
+const INDEX_SOURCE = readFileSync(new URL("../src/index.ts", import.meta.url), "utf8");
 
 function sliceBetween(source: string, start: string, end: string): string {
 	const from = source.indexOf(start);

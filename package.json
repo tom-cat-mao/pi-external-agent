@@ -34,12 +34,7 @@
     "typescript": "^5.5.0"
   },
   "files": [
-    "index.ts",
-    "adapters.ts",
-    "sessions.ts",
-    "artifacts.ts",
-    "templates.ts",
-    "meter.ts",
+    "src/",
     "templates/",
     "hooks/codebuddy-readonly.js",
     "README.md",

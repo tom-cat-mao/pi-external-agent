@@ -47,7 +47,7 @@ const SAFE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 const PROJECT_REL = path.join(".pi", "external-agent", "templates");
 const USER_REL = path.join(".pi", "agent", "external-agent", "templates");
-const BUILTIN_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "templates");
+const BUILTIN_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "templates");
 
 /** The three candidate paths for a template, in precedence order. */
 function candidates(name: string, dirs: TemplateDirs): Array<{ source: TemplateSource; file: string }> {

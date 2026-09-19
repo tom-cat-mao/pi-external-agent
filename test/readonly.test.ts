@@ -13,11 +13,11 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmdirSync, unlinkSync
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
-import { ADAPTERS, buildReadonlySettings } from "../adapters.ts";
-import { SESSION_DRIVERS } from "../sessions.ts";
+import { ADAPTERS, buildReadonlySettings } from "../src/adapters.ts";
+import { SESSION_DRIVERS } from "../src/sessions.ts";
 
 const HOOK_PATH = fileURLToPath(new URL("../hooks/codebuddy-readonly.js", import.meta.url));
-const ADAPTERS_PATH = fileURLToPath(new URL("../adapters.ts", import.meta.url));
+const ADAPTERS_PATH = fileURLToPath(new URL("../src/adapters.ts", import.meta.url));
 
 function runHook(input: string): any {
 	const out = execFileSync("node", [HOOK_PATH], { input, encoding: "utf8" });
@@ -125,13 +125,17 @@ test("hook: invalid JSON fails closed", () => {
 
 test("settings hook command works from an install path with spaces and quotes", async () => {
 	const dir = mkdtempSync(path.join(tmpdir(), "ext 'a$gent sync-"));
-	const sub = path.join(dir, "sub dir");
-	mkdirSync(sub);
-	copyFileSync(ADAPTERS_PATH, path.join(sub, "adapters.ts"));
-	mkdirSync(path.join(sub, "hooks"));
-	copyFileSync(HOOK_PATH, path.join(sub, "hooks", "codebuddy-readonly.js"));
+	// Mirrors the installed layout: adapters.ts sits in src/, the hook in the
+	// sibling hooks/ directory it resolves against.
+	const root = path.join(dir, "install dir");
+	const src = path.join(root, "src");
+	mkdirSync(root);
+	mkdirSync(src);
+	mkdirSync(path.join(root, "hooks"));
+	copyFileSync(ADAPTERS_PATH, path.join(src, "adapters.ts"));
+	copyFileSync(HOOK_PATH, path.join(root, "hooks", "codebuddy-readonly.js"));
 	try {
-		const mod = await import(pathToFileURL(path.join(sub, "adapters.ts")).href);
+		const mod = await import(pathToFileURL(path.join(src, "adapters.ts")).href);
 		const command = JSON.parse(mod.buildReadonlySettings()).hooks.PreToolUse[0].hooks[0].command;
 		const out = execFileSync("sh", ["-c", command], {
 			input: JSON.stringify({ tool_name: "Read", tool_input: {} }),
@@ -139,10 +143,11 @@ test("settings hook command works from an install path with spaces and quotes", 
 		});
 		assert.equal(JSON.parse(out).hookSpecificOutput.permissionDecision, "allow");
 	} finally {
-		unlinkSync(path.join(sub, "adapters.ts"));
-		unlinkSync(path.join(sub, "hooks", "codebuddy-readonly.js"));
-		rmdirSync(path.join(sub, "hooks"));
-		rmdirSync(sub);
+		unlinkSync(path.join(src, "adapters.ts"));
+		unlinkSync(path.join(root, "hooks", "codebuddy-readonly.js"));
+		rmdirSync(path.join(root, "hooks"));
+		rmdirSync(src);
+		rmdirSync(root);
 		rmdirSync(dir);
 	}
 });
