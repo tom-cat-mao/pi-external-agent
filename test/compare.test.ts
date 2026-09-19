@@ -239,7 +239,7 @@ test("compare: a refused spec is recorded while the other specs still run", asyn
 				task: "summarize the entry points",
 				agents: [
 					{ agent: "kimi", mode: "readonly" },
-					{ agent: "claude", mode: "readonly", effort: "minimal" },
+					{ agent: "qodercli", mode: "readonly", effort: "minimal" },
 					{ agent: "qodercli", mode: "readonly" },
 				],
 			},
@@ -357,14 +357,14 @@ test("compare: the schema requires 2..8 agents and execute refuses counts outsid
 	assert.equal(agents.items.properties.agent.type, "string");
 	assert.deepEqual(agents.items.properties.agent.enum, ["codex", "pi", "kimi", "codebuddy", "claude", "reasonix", "qoder"]);
 
-	const single = await compare({ task: "t", agents: [{ agent: "claude", mode: "readonly" }] });
+	const single = await compare({ task: "t", agents: [{ agent: "qodercli", mode: "readonly" }] });
 	assert.match(single.content[0].text, /at least 2 agent specs \(got 1\)/);
 	assert.deepEqual(single.details.results, []);
 
 	const empty = await compare({ task: "t", agents: [] });
 	assert.match(empty.content[0].text, /at least 2 agent specs \(got 0\)/);
 
-	const tooMany = await compare({ task: "t", agents: Array.from({ length: 9 }, () => ({ agent: "claude", mode: "readonly" })) });
+	const tooMany = await compare({ task: "t", agents: Array.from({ length: 9 }, () => ({ agent: "qodercli", mode: "readonly" })) });
 	assert.match(tooMany.content[0].text, /at most 8 agent specs \(got 9\)/);
 	assert.deepEqual(tooMany.details.results, []);
 });
@@ -396,7 +396,7 @@ test("compare: omitted effort adds no flag to any spawn argv while explicit effo
 			{
 				task: "t",
 				agents: [
-					{ agent: "claude", mode: "readonly", effort: "high" },
+					{ agent: "qodercli", mode: "readonly", effort: "high" },
 					{ agent: "qodercli", mode: "readonly" },
 				],
 			},
