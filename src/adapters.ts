@@ -4,7 +4,7 @@
  * Each adapter knows two things and nothing else:
  *   - buildDispatch: how to spell and describe a headless, structured-output invocation
  *   - parseEvent: how to turn one stdout line into a normalized event
- * Everything else (spawn, monitoring, abort, bookkeeping) is shared in index.ts.
+ * Everything else (spawn, monitoring, abort, bookkeeping) is shared in hub/registry.ts.
  *
  * Capabilities as currently wired:
  *   codex     -> OpenAI; yolo workhorse with its own sandbox tiers (read-only / workspace-write / danger-full-access)
@@ -21,7 +21,7 @@
  *   qoder     -> yolo default, stream-json driven; steering is version-gated.
  *                Why: .agents/notes/implemented/2026-09-15-qoder-steering-version-gate.md
  *
- * Effort flags as currently supported (index.ts refuses anything else):
+ * Effort flags as currently supported (hub/registry.ts refuses anything else):
  *   pi        -> --thinking <off|minimal|low|medium|high|xhigh|max>
  *   codebuddy -> --effort <minimal|low|medium|high|xhigh|max>
  *   claude    -> --effort <low|medium|high|xhigh|max>
@@ -40,7 +40,7 @@ export type Mode = "readonly" | "write" | "yolo";
 
 /**
  * Reasoning effort, normalized across CLIs. Not every adapter supports every
- * level (or any level): Adapter.supportedEfforts is the allowlist, index.ts
+ * level (or any level): Adapter.supportedEfforts is the allowlist, hub/registry.ts
  * refuses anything outside it. "off" is spelled "none" in the codex family.
  */
 export const EFFORT_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -336,7 +336,7 @@ function claudeResultEvent(rec: any): AgentEvent {
 /**
  * claude emits its result as ONE compact single-line JSON object (possibly an
  * array of records), so line-framed parsing plus the close-time buffer flush
- * in index.ts works. codebuddy's `--output-format json` is PRETTY-PRINTED
+ * in hub/registry.ts works. codebuddy's `--output-format json` is PRETTY-PRINTED
  * multi-line JSON instead (133 lines for a one-word answer, verified on
  * 2.117.1): every line fails JSON.parse individually and the trailing flush
  * sees only the final "]", so the answer never surfaces. codebuddy therefore

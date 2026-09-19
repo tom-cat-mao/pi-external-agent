@@ -4,9 +4,9 @@ Where each piece lives, and how a dispatch flows.
 
 ## Dispatch flow
 
-1. **Registration** — `hub/tools.ts` registers the seven tools; `index.ts` wires them into the extension.
+1. **Registration** — `src/hub/tools.ts` registers the seven tools; `src/index.ts` wires them into the extension.
 2. **Validation** — `validateDispatch(agent, mode, cwd, effort, conflictCwd)` refuses a dispatch before spawning: modes outside adapter limits, effort outside supported range, or concurrent writes to the same effective directory (isolate points it at a fresh worktree).
-3. **Adapter dispatch** — `ADAPTERS[agent].buildDispatch(...)` in `adapters.ts` spells the argv, the prompt argument index, the effective policy, and whether model/effort overrides are forwarded.
+3. **Adapter dispatch** — `ADAPTERS[agent].buildDispatch(...)` in `src/adapters.ts` spells the argv, the prompt argument index, the effective policy, and whether model/effort overrides are forwarded.
 4. **Spawn and task registry** — the hub spawns the CLI and records the task under a taskId: state, cwd, mode, transport, event log, session handle, watchdog counters.
 5. **Monitoring** — stdout lines normalize via the adapter's `parseEvent` into message/reasoning/tool/usage/warning/error events, feeding the status view, notification callback, and final answer.
 6. **Watchdog** — a shared scanner notices stalled tasks and notifies the model, at most three times per streak. *Quiet* means no event for the task's effective threshold (its own cadence, clamped to `watchdogMs`); *struggling* means warnings/errors keep arriving while no progress event has for 5m. `external_agent_wait` skips tasks it watches, so the waiter claims the stall first.
@@ -18,8 +18,8 @@ Every dispatch returns a receipt: the exact argv, the effective policy, the tran
 
 ## Transports
 
-- **One-shot** (`adapters.ts`) — a headless process per task; process exit is completion, defined by `buildDispatch` plus `parseEvent`.
-- **Persistent** (`drivers/`) — a long-lived stdio session whose completion signal is turn end, not process exit, so a follow-up keeps the conversation. Drivers: `PiRpcDriver` (pi `--mode rpc`), `CodexAppServerDriver` (`codex app-server`), `AcpDriver` (reasonix, codebuddy), `ClaudeStreamJsonDriver` (claude stream-json), `QoderStreamJsonDriver` (qoder stream-json). A driver in `SESSION_DRIVERS` (tested by `hasSessionDriver()`) selects this transport; the adapter's `session` flags say whether steer / follow-up exist. Without a driver, one-shot is the only path.
+- **One-shot** (`src/adapters.ts`) — a headless process per task; process exit is completion, defined by `buildDispatch` plus `parseEvent`.
+- **Persistent** (`src/drivers/`) — a long-lived stdio session whose completion signal is turn end, not process exit, so a follow-up keeps the conversation. Drivers: `PiRpcDriver` (pi `--mode rpc`), `CodexAppServerDriver` (`codex app-server`), `AcpDriver` (reasonix, codebuddy), `ClaudeStreamJsonDriver` (claude stream-json), `QoderStreamJsonDriver` (qoder stream-json). A driver in `SESSION_DRIVERS` (tested by `hasSessionDriver()`) selects this transport; the adapter's `session` flags say whether steer / follow-up exist. Without a driver, one-shot is the only path.
 
 ## Tool map
 
@@ -33,7 +33,7 @@ Every dispatch returns a receipt: the exact argv, the effective policy, the tran
 | `external_agent_steer` | Guide a running persistent task at its next step boundary |
 | `external_agent_follow_up` | Continue a settled persistent task in the same session; `purpose` labels a relay |
 
-All seven handlers live in `hub/tools.ts` and act on the registry in `hub/registry.ts`; capability differences are read from `ADAPTERS`.
+All seven handlers live in `src/hub/tools.ts` and act on the registry in `src/hub/registry.ts`; capability differences are read from `ADAPTERS`.
 
 ## See also
 

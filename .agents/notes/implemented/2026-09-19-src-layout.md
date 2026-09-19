@@ -79,7 +79,7 @@ a doc comment naming the file's role.
 ## Consequences
 
 - No source file exceeds 1500 lines — `adapters.ts` (995) included. The largest
-  new file is `hub/registry.ts` (1384), then `hub/tools.ts` (1244).
+  new file is `hub/registry.ts` (1390), then `hub/tools.ts` (1244).
 - `test/effort.test.ts` reads the tool source by path; that path and the seven
   `../src/sessions.ts` imports are the only test edits. No assertion changed.
 - `src/index.ts` re-exports `stallClock`, `scanWatchdogs` and `stallTestApi`,

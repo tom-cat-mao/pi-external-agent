@@ -29,7 +29,7 @@ function effortPayload(argv: string[]): string | undefined {
 	return undefined;
 }
 
-const INDEX_SOURCE = readFileSync(new URL("../src/hub/tools.ts", import.meta.url), "utf8");
+const TOOLS_SOURCE = readFileSync(new URL("../src/hub/tools.ts", import.meta.url), "utf8");
 
 function sliceBetween(source: string, start: string, end: string): string {
 	const from = source.indexOf(start);
@@ -45,7 +45,7 @@ function prose(source: string): string {
 }
 
 const START_TOOL_SOURCE = sliceBetween(
-	INDEX_SOURCE,
+	TOOLS_SOURCE,
 	'name: "external_agent_start"',
 	'name: "external_agent_status"',
 );
@@ -63,8 +63,8 @@ const COMPLEXITY_TO_EFFORT = [
 ];
 
 test("metadata: external_agent_start surfaces do not recommend inferring effort from task complexity", () => {
-	assert.doesNotMatch(INDEX_SOURCE, /low\/minimal for fast lookups/);
-	assert.doesNotMatch(INDEX_SOURCE, /high\/xhigh for hard/);
+	assert.doesNotMatch(TOOLS_SOURCE, /low\/minimal for fast lookups/);
+	assert.doesNotMatch(TOOLS_SOURCE, /high\/xhigh for hard/);
 	for (const surface of [DESCRIPTION_SURFACE, GUIDELINES_SURFACE, EFFORT_PARAM_SURFACE]) {
 		for (const pattern of COMPLEXITY_TO_EFFORT) {
 			assert.doesNotMatch(surface, pattern, `complexity-based effort recommendation reintroduced: ${pattern}`);
@@ -75,7 +75,7 @@ test("metadata: external_agent_start surfaces do not recommend inferring effort 
 test("metadata: the opt-in effort rule has exactly one home, the start effort schema", () => {
 	// The full rule lives in the effort parameter of external_agent_start and
 	// nowhere else; every other surface either points at it or stays silent.
-	assert.equal(INDEX_SOURCE.match(/opt-in reasoning-effort override/gi)?.length, 1);
+	assert.equal(TOOLS_SOURCE.match(/opt-in reasoning-effort override/gi)?.length, 1);
 
 	assert.match(EFFORT_PARAM_SURFACE, /opt-in reasoning-effort override/i);
 	assert.match(EFFORT_PARAM_SURFACE, /explicitly requests an/i);
