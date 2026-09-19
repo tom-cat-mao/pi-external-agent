@@ -185,9 +185,9 @@ test("compare: dispatches several agents and returns one aggregated side-by-side
 		assert.equal(details.aborted, false);
 		assert.equal(details.results.length, 2);
 
-		const [claude, kimi] = details.results;
-		assert.equal(claude.index, 0);
-		assert.equal(claude.agent, "claude");
+		const [kimi_first, kimi_second] = details.results;
+		assert.equal(kimi_first.index, 0);
+		assert.equal(kimi_first.agent, "kimi");
 		assert.equal(claude.refused, false);
 		assert.equal(claude.state, "done");
 		assert.equal(claude.answer, "CLAUDE-ANSWER");
