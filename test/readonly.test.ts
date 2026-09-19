@@ -59,10 +59,11 @@ test("one-shot codebuddy: readonly -> default + --settings; write/yolo unchanged
 	assert.equal(yolo.argv.includes("--settings"), false);
 });
 
-test("one-shot claude: readonly still plan, no --settings", () => {
+
+test("claude persistent session: readonly -> dontAsk with stream-json", () => {
+	// claude upgraded to yolo default with stream-json persistence like codebuddy
 	const ro = ADAPTERS.claude.buildDispatch({ task: "t", cwd: "/tmp", mode: "readonly" });
-	assert.equal(ro.argv[ro.argv.indexOf("--permission-mode") + 1], "plan");
-	assert.equal(ro.argv.includes("--settings"), false);
+	assert.equal(ro.argv[ro.argv.indexOf("--permission-mode") + 1], "dontAsk");
 });
 
 test("ACP codebuddy driver: readonly -> default + --settings; write/yolo unchanged", () => {
