@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ADAPTERS } from "../src/adapters.ts";
-import { SESSION_DRIVERS, type TurnOutcome } from "../src/sessions.ts";
+import { SESSION_DRIVERS, type TurnOutcome } from "../src/drivers/index.ts";
 
 const CLOSED_STDIN_MOCK = `#!/usr/bin/env node
 const fs = require("node:fs");

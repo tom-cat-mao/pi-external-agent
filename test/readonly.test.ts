@@ -14,7 +14,7 @@ import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 import { ADAPTERS, buildReadonlySettings } from "../src/adapters.ts";
-import { SESSION_DRIVERS } from "../src/sessions.ts";
+import { SESSION_DRIVERS } from "../src/drivers/index.ts";
 
 const HOOK_PATH = fileURLToPath(new URL("../hooks/codebuddy-readonly.js", import.meta.url));
 const ADAPTERS_PATH = fileURLToPath(new URL("../src/adapters.ts", import.meta.url));

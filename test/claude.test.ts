@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { ADAPTERS } from "../src/adapters.ts";
-import { SESSION_DRIVERS, STEER_AGENT_IDS, FOLLOWUP_AGENT_IDS } from "../src/sessions.ts";
+import { SESSION_DRIVERS, STEER_AGENT_IDS, FOLLOWUP_AGENT_IDS } from "../src/drivers/index.ts";
 
 test("claude adapter basics", () => {
 	const a = ADAPTERS.claude;

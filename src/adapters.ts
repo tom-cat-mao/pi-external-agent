@@ -48,7 +48,7 @@ export type Effort = (typeof EFFORT_LEVELS)[number];
 
 /**
  * Wire spellings of the normalized effort scale, exported so the persistent
- * session drivers in sessions.ts can map with the same vocabulary the
+ * session drivers in drivers/ can map with the same vocabulary the
  * one-shot buildDispatch paths use instead of re-deriving it.
  *
  * codex: "off" is spelled "none" (both the -c config override and app-server).
@@ -162,9 +162,9 @@ export interface Adapter {
 	/** Known-degraded adapters are still callable but flagged in the tool output. */
 	degraded?: string;
 	/**
-	 * Persistent-session capability. Set for every agent sessions.ts drives over
-	 * a long-lived connection (see SESSION_DRIVERS / hasSessionDriver); index.ts
-	 * picks the persistent transport for exactly those agents and the oneshot
+	 * Persistent-session capability. Set for every agent drivers/ drives over
+	 * a long-lived connection (see SESSION_DRIVERS / hasSessionDriver); the hub's
+	 * registry picks the persistent transport for exactly those agents and the oneshot
 	 * buildDispatch/parseEvent path for the rest — there is no fallback between
 	 * the two. The tool description is built from the adapter table's steer /
 	 * followUp flags and does not include these notes; steerNote feeds the

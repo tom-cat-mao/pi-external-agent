@@ -4,9 +4,13 @@ Working rules for agents editing this repository.
 
 ## Layout
 
-- `src/index.ts` — hub: tool registration, dispatch validation, task registry, stall watchdog, notifications, settle-time archive/verify.
+- `src/index.ts` — extension entry: binds the tool surface, `pi.exec`, the stats command and the session lifecycle.
+- `src/hub/tools.ts` — the seven tool registrations and their description strings.
+- `src/hub/registry.ts` — task registry and state machine: dispatch validation, one-shot and persistent transports, settle finalize, notifications, stall watchdog, worktrees, session lifecycle.
+- `src/hub/reporting.ts` — caller-facing text: status report, dispatch receipts, compare report, relay receipt.
+- `src/hub/shared.ts` — task/receipt types, hub constants, pure formatting helpers and input predicates.
 - `src/adapters.ts` — per-CLI one-shot adapters: argv spelling and stdout parsing (incl. usage/cost), plus the `ADAPTERS` registry.
-- `src/sessions.ts` — persistent session drivers for steer / follow-up.
+- `src/drivers/` — persistent session drivers for steer / follow-up: `base.ts` (stdio + JSON-RPC plumbing), one file per wire protocol (`pi-rpc`, `codex-app-server`, `acp`, `stream-json`), and `index.ts` (`SESSION_DRIVERS`).
 - `src/artifacts.ts` — answer archive: settle-time content-addressed store, inline placeholder, paged recall.
 - `src/templates.ts` + `templates/` — task-template loading (project > user > builtin) and the five builtins.
 - `src/meter.ts` — CLI-reported usage/cost counters behind `/external_agent_stats`.
