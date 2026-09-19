@@ -39,19 +39,7 @@ Requires pi ≥ 0.85 and whichever agent CLIs you want to drive (they don't all 
 
 ## Capabilities (opt-in)
 
-All off by default; passing the parameter enables it for that call. Details: [docs/capabilities.md](docs/capabilities.md).
-
-| Parameter / command | On | What it does |
-|---|---|---|
-| `template: "<name>"` | start, compare | Wraps the task with an output contract (project > user > builtin templates) |
-| `verify: {command}` | start, compare | Runs an acceptance command after settle and reports the exit code |
-| `isolate: true` | start, compare | Runs the worker in a fresh git worktree (never merged or deleted by the hub) |
-| `board: "<path>"` | compare | Appends per-slot evidence rows to a JSONL board |
-| `fromTaskId` (+`offset`/`length`) | follow_up | Relays a settled task's answer into another live session (hop limit 2) |
-| `offset` | status | Pages through an archived long answer |
-| `/external_agent_stats` | command | Dumps CLI-reported usage/cost counters |
-
-Answers over 4000 chars (or template-structured) are archived at settle and shown as a handle + summary instead of replaying in full.
+All off by default; enable per call — `template` (output contract), `verify` (acceptance command after settle), `isolate` (fresh git worktree), `board` (JSONL evidence rows, compare only), `fromTaskId` (relay a settled answer into another session, follow_up only), `offset` (paged answer recall, status only), `/external_agent_stats` (CLI-reported usage counters). Long answers are archived at settle and shown as a handle + summary instead of replaying. Details: [docs/capabilities.md](docs/capabilities.md).
 
 ## Agents
 

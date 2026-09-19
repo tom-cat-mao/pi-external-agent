@@ -39,19 +39,7 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
 
 ## 可选能力（opt-in）
 
-默认全部关闭；传参即对该次调用生效。详见 [docs/capabilities.md](docs/capabilities.md)。
-
-| 参数 / 命令 | 工具 | 作用 |
-|---|---|---|
-| `template: "<name>"` | start, compare | 给任务套上输出契约模板（查找顺序：项目 > 用户 > 内置） |
-| `verify: {command}` | start, compare | settle 后运行验收命令并报告退出码 |
-| `isolate: true` | start, compare | worker 在新建的 git worktree 中运行（hub 不合并不删除） |
-| `board: "<path>"` | compare | 每槽向 JSONL 证据板追加一行 |
-| `fromTaskId`（+`offset`/`length`） | follow_up | 把已结束任务的答案选段注入另一个存活会话（跳数上限 2） |
-| `offset` | status | 分页召回已归档的长答案 |
-| `/external_agent_stats` | 命令 | 查看各 CLI 自报的用量/成本计数 |
-
-超过 4000 字符（或带模板结构）的答案在 settle 时归档，内联只显示句柄 + 摘要，不再全文重放。
+默认全部关闭，传参即生效——`template`（输出契约）、`verify`（settle 后跑验收命令）、`isolate`（新建 git worktree）、`board`（JSONL 证据行，仅 compare）、`fromTaskId`（把已结束答案注入另一会话，仅 follow_up）、`offset`（分页召回归档答案，仅 status）、`/external_agent_stats`（CLI 自报用量计数）。长答案在 settle 时归档，内联只留句柄 + 摘要，不再全文重放。详见 [docs/capabilities.md](docs/capabilities.md)。
 
 ## Agent
 
