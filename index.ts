@@ -19,8 +19,12 @@
  *    Why: .agents/notes/implemented/2026-08-17-single-tool-surface.md
  */
 
-import { spawn, type ChildProcess } from "node:child_process";
-import { resolve } from "node:path";
+import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
+import { appendFile, mkdir, readdir, stat } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
+import { promisify } from "node:util";
 import { type AgentToolResult, type ExtensionAPI, keyHint } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
@@ -43,6 +47,9 @@ import {
 	type SessionDriver,
 	type SteerResult,
 } from "./sessions.ts";
+import { ensureStored, extractSummary, placeholderFor, readChunk, type StoredAnswer } from "./artifacts.ts";
+import { createMeter, type MeterSnapshot, type UsageSample } from "./meter.ts";
+import { applyTemplate, loadTemplate } from "./templates.ts";
 
 // ---------------------------------------------------------------------------
 // Task registry
@@ -56,6 +63,23 @@ type NotifyMode = "steer" | "followUp" | "nextTurn" | "off";
  * process stays up so the same conversation can be steered or continued.
  */
 type Transport = "oneshot" | "persistent";
+
+/**
+ * A git worktree the hub created for one isolated task: a private checkout on
+ * branch `ea-<taskId>`, based on the main repository at `base`. The hub only
+ * creates these — it never merges and never deletes them — so `diffStat` is the
+ * settle-time evidence of what was left behind.
+ */
+interface WorktreeRef {
+	path: string;
+	branch: string;
+	base: string;
+}
+
+interface TaskWorktree extends WorktreeRef {
+	/** Settle-time overview: `git diff --stat HEAD` tail + uncommitted/untracked count. */
+	diffStat?: string;
+}
 
 interface DispatchReceipt {
 	version: 1;
@@ -80,6 +104,10 @@ interface DispatchReceipt {
 	environment: "inherited from Pi process; values hidden";
 	/** Defaults to "oneshot" for receipts produced before persistent sessions existed. */
 	transport?: Transport;
+	/** Template applied to the task text, as `name@version`; absent when none was used. */
+	template?: string;
+	/** Present when the task runs in a hub-created worktree; the spawn cwd is its path. */
+	worktree?: WorktreeRef;
 }
 
 interface Task {
@@ -119,8 +147,59 @@ interface Task {
 	lastWatchdogNoticeAt: number;
 	/** Consecutive stall notices sent during the current quiet streak. */
 	watchdogNotices: number;
+	/** Per-turn archived answers, appended at each settle; recall pages from the last one. */
+	archives?: StoredAnswer[];
+	/** Set when archiving failed and the answer stayed inline (fail-open, never silent). */
+	archiveError?: string;
+	/** Acceptance command: caller-provided (verify param) beats worker-declared. */
+	verifyCommand?: string;
+	verifyTimeoutSeconds?: number;
+	verifyResult?: VerifyResult;
+	/** Template label (`name@version`) when a task template was applied. */
+	templateLabel?: string;
+	/** How far this session sits from the coordinator's own dispatch (relay hops). */
+	relayDepth: number;
+	/** Relay messages delivered into this session. */
+	relaysReceived: number;
+	/** Set while settle-time finalize (archive + verify) is in flight; awaited by reporters. */
+	finalizePromise?: Promise<void>;
+	/** Isolated task's worktree; the hub creates but never merges or deletes it. */
+	worktree?: TaskWorktree;
+	/** Present when this task's answer is appended to an evidence board at settle. */
+	boardFile?: string;
+	/** Set once the settle-time board row was appended. */
+	boardWritten?: boolean;
+	/** Board append failure, surfaced in the compare report (fail-open, never thrown). */
+	boardError?: string;
+	/** Neutral inventory of worktrees left on disk, captured at settle for the notification. */
+	retainedWorktrees?: string;
 	/** Idle reap: kills a persistent session that got no follow-up in time. */
 	idleReapTimer?: ReturnType<typeof setTimeout>;
+}
+
+/** Post-settle acceptance run: mechanical facts only, never a verdict. */
+interface VerifyResult {
+	command: string;
+	exitCode: number | null;
+	outputTail: string;
+	durationMs: number;
+	/** Present when the command never ran (host without pi.exec, readonly guard, …). */
+	skipped?: string;
+}
+
+/** Optional dispatch extras: template label for the receipt, verify for settle-time acceptance. */
+interface DispatchExtras {
+	templateLabel?: string;
+	verifyCommand?: string;
+	verifyTimeoutSeconds?: number;
+	/**
+	 * Id allocated before dispatch. Only isolate needs this: the worktree path is
+	 * `<toplevel>/.external-agent/worktrees/<taskId>`, so the id must exist before
+	 * the worker's cwd can. createTask still allocates on its own when absent.
+	 */
+	taskId?: string;
+	/** Worktree this task was given (isolate); lands on the task and the receipt. */
+	worktree?: TaskWorktree;
 }
 
 interface TaskSnapshot {
@@ -201,6 +280,34 @@ interface ExternalAgentFollowUpDetails {
 	sessionAlive?: boolean;
 }
 
+/** Why one worker's answer is being handed to another (the relay-envelope template's purposes). */
+type RelayPurpose = "reproduce" | "combine" | "challenge";
+
+interface ExternalAgentRelayDetails {
+	kind: "external-agent-relay";
+	relayed: boolean;
+	fromTaskId?: string;
+	taskId?: string;
+	state?: TaskState;
+	/** Why nothing was delivered. */
+	reason?: string;
+	/** Which channel the message actually went in by. */
+	via?: "steer" | "followUp";
+	purpose?: RelayPurpose;
+	/** UTF-8 bytes of the excerpt that traveled. */
+	bytes?: number;
+	/** sha256 of that excerpt, lowercase hex. */
+	sha256?: string;
+	/** `path:line` references found inside the excerpt. */
+	anchors?: string[];
+	/** The target's hop depth once this message landed. */
+	hop?: number;
+	/** Archive handle the excerpt was read from, when the source answer was archived. */
+	archiveId?: string;
+	/** What the target CLI said about how it took the message. */
+	note?: string;
+}
+
 interface SharedTaskRegistry {
 	tasks: Map<string, Task>;
 	sequence: number;
@@ -230,7 +337,36 @@ function getTaskRegistry(): SharedTaskRegistry {
 const taskRegistry = getTaskRegistry();
 const tasks = taskRegistry.tasks;
 
+/** CLI-reported usage/cost accounting; "as reported by the target CLI", never billing. */
+const meter = createMeter();
+
+/**
+ * Host capabilities the module-level settle paths cannot see on their own: the
+ * session directory (archive root) and pi.exec (verify runs). Captured by the
+ * factory from tool ctx / the pi object; absent in tests and ephemeral sessions,
+ * where both mechanisms stay off (fail-open).
+ */
+const finalizeHooks: {
+	sessionDir?: string;
+	exec?: (command: string, args: string[], options: { cwd: string; timeout: number }) => Promise<{ stdout: string; stderr: string; code: number }>;
+} = {};
+
+/** Feed every parsed usage/cost event into the meter, regardless of event kind. */
+function meterUsageEvent(taskId: string, event: AgentEvent): void {
+	const sample: UsageSample = { source: "cli-reported" };
+	if (event.usage) {
+		sample.in = event.usage.in;
+		sample.out = event.usage.out;
+		sample.cached = event.usage.cached;
+	}
+	if (typeof event.costUsd === "number") sample.costUsd = event.costUsd;
+	if (sample.in === undefined && sample.out === undefined && sample.cached === undefined && sample.costUsd === undefined) return;
+	meter.record(taskId, sample);
+}
+
 const MAX_EVENTS = 400; // ring cap; oldest dropped
+/** Answers longer than this are archived at settle and replaced by a handle + summary/excerpt. */
+const ARCHIVE_INLINE_CHARS = 4_000; // matches NOTIFY_PREVIEW_CHARS
 const MODE_RANK: Record<Mode, number> = { readonly: 0, write: 1, yolo: 2 };
 const MAX_ANSWER_CHARS = 50_000; // matches pi's own subagent cap
 const MAX_STDERR_CHARS = 8_000;
@@ -347,6 +483,9 @@ function dispatchSummary(receipt: DispatchReceipt, taskId?: string): string[] {
 		`effective policy: ${receipt.effectivePolicy === null ? "none" : escapeTerminalControls(receipt.effectivePolicy)}`,
 		`readonly: ${enforcementDisplay(receipt)}`,
 		`spawn cwd: ${escapeTerminalControls(receipt.cwd)}`,
+		...(receipt.worktree
+			? [`worktree: ${escapeTerminalControls(receipt.worktree.path)} (branch ${escapeTerminalControls(receipt.worktree.branch)}; base ${escapeTerminalControls(receipt.worktree.base)})`]
+			: []),
 		`model: ${modelDisplay(receipt)}`,
 		`effort: ${effortDisplay(receipt)}`,
 		`notify: ${receipt.notify} (Pi-only; not sent to the target CLI)`,
@@ -447,6 +586,217 @@ function summarize(task: Task): string {
  * so a long answer cannot blow up the context uninvited. Full text stays
  * available through external_agent_status.
  */
+// ---------------------------------------------------------------------------
+// Settle finalize: archive + verify (fail-open, mechanical only)
+// ---------------------------------------------------------------------------
+
+/**
+ * The verify-report template's closing section; the first line (or first fenced
+ * block) is the suggested acceptance command.
+ */
+function parseSuggestedVerifyCommand(answer: string): string | undefined {
+	const match = /##\s*Suggested verify command\s*\n([\s\S]*?)(?:\n##\s|$)/i.exec(answer);
+	const body = match?.[1]?.trim();
+	if (!body) return undefined;
+	const fenced = /```(?:bash|sh)?\s*\n([\s\S]*?)```/.exec(body);
+	const command = (fenced ? fenced[1] : body).trim().split("\n")[0]?.trim();
+	return command || undefined;
+}
+
+/**
+ * Archive the settled answer when it is long or follows the Summary/Details
+ * template structure. Fail-open: no session dir or a write error leaves the
+ * answer inline (archiveError recorded), because losing the answer is worse
+ * than replaying it.
+ */
+async function archiveTaskAnswer(task: Task): Promise<void> {
+	const answer = answerOf(task);
+	if (!answer) return;
+	const summary = extractSummary(answer);
+	if (answer.length <= ARCHIVE_INLINE_CHARS && summary === undefined) return;
+	if (!finalizeHooks.sessionDir) return;
+	try {
+		const stored = await ensureStored(
+			join(finalizeHooks.sessionDir, "external-agent"),
+			task.id,
+			task.archives?.length ?? 0,
+			answer,
+		);
+		(task.archives ??= []).push(stored);
+	} catch (err) {
+		task.archiveError = err instanceof Error ? err.message : String(err);
+	}
+}
+
+/**
+ * Run the acceptance command after settle. The caller's verify param wins; a
+ * worker-declared command (verify-report template) is the fallback and is never
+ * executed for readonly tasks — a read-only worker must not gain execution
+ * through its answer text. The result is mechanical (exit code, output tail);
+ * what it means is the caller's judgment.
+ */
+async function maybeRunVerify(task: Task): Promise<void> {
+	let command = task.verifyCommand;
+	let declaredByWorker = false;
+	if (!command) {
+		command = parseSuggestedVerifyCommand(answerOf(task));
+		declaredByWorker = command !== undefined;
+		if (command) task.verifyCommand = command;
+	}
+	if (!command) return;
+	if (declaredByWorker && task.mode === "readonly") {
+		task.verifyResult = {
+			command,
+			exitCode: null,
+			outputTail: "",
+			durationMs: 0,
+			skipped: "worker-declared commands are not executed for readonly tasks",
+		};
+		return;
+	}
+	if (!finalizeHooks.exec) {
+		task.verifyResult = { command, exitCode: null, outputTail: "", durationMs: 0, skipped: "pi.exec unavailable in this host" };
+		return;
+	}
+	const started = Date.now();
+	try {
+		const result = await finalizeHooks.exec("bash", ["-lc", command], {
+			cwd: task.cwd,
+			timeout: (task.verifyTimeoutSeconds ?? 120) * 1000,
+		});
+		const output = [result.stdout, result.stderr].filter(Boolean).join("\n");
+		task.verifyResult = {
+			command,
+			exitCode: result.code,
+			outputTail: truncate(output.trim(), 1_500).text,
+			durationMs: Date.now() - started,
+		};
+	} catch (err) {
+		task.verifyResult = {
+			command,
+			exitCode: null,
+			outputTail: "",
+			durationMs: Date.now() - started,
+			skipped: err instanceof Error ? err.message : String(err),
+		};
+	}
+}
+
+/**
+ * Free mechanical facts about an isolated task's worktree, collected at settle:
+ * a bounded tail of `git diff --stat HEAD` plus the number of `git status
+ * --porcelain` lines (uncommitted and untracked together). The hub never merges,
+ * so this is the only place the worker's leftovers become visible.
+ */
+async function collectWorktreeDiff(task: Task): Promise<void> {
+	const worktree = task.worktree;
+	if (!worktree) return;
+	try {
+		const [diff, status] = await Promise.all([
+			runGit(["-C", worktree.path, "diff", "--stat", "HEAD"]),
+			runGit(["-C", worktree.path, "status", "--porcelain"]),
+		]);
+		const statLines = diff.stdout.trim().split("\n").filter(Boolean);
+		const statTail = statLines.length > 0 ? statLines.slice(-3).join(" · ") : "no diff";
+		const statusLines = status.stdout.trim() ? status.stdout.trim().split("\n").length : 0;
+		worktree.diffStat = escapeTerminalControls(`${statTail} · ${statusLines} uncommitted/untracked`);
+	} catch {
+		// The worktree may have been removed by hand between settle and this read;
+		// an absent diff is not worth an error line.
+	}
+}
+
+/** sha256 of UTF-8 text, lowercase hex. */
+function sha256Hex(text: string): string {
+	return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+/**
+ * Append one row of settled evidence to the board. One claim per settled slot,
+ * anchors extracted the same way relay extracts them, hash and archive handle
+ * carried so later readers can re-check the text. Fail-open: a write error is
+ * recorded on the task and surfaced in the compare report, never thrown — the
+ * answer itself is already safe in the archive.
+ */
+async function appendBoardEntry(task: Task): Promise<void> {
+	if (!task.boardFile || task.state !== "done") return;
+	const answer = answerOf(task);
+	if (!answer) return;
+	const archived = task.archives?.[task.archives.length - 1];
+	const row = {
+		ts: new Date().toISOString(),
+		taskId: task.id,
+		agent: task.agent,
+		mode: task.mode,
+		claim: extractSummary(answer) ?? answer.slice(0, 200),
+		anchors: anchorRefs(answer),
+		answerRef: archived?.id ?? "inline",
+		answerSha256: archived?.sha256 ?? sha256Hex(answer),
+		status: "unverified",
+		supersedes: null,
+	};
+	try {
+		await mkdir(dirname(task.boardFile), { recursive: true });
+		await appendFile(task.boardFile, `${JSON.stringify(row)}\n`, "utf8");
+		task.boardWritten = true;
+	} catch (err) {
+		task.boardError = err instanceof Error ? err.message : String(err);
+	}
+}
+
+/** Settle-time finalize: archive, verify, worktree diff, board row, then notify. */
+async function finalizeAndNotify(task: Task): Promise<void> {
+	if (task.state === "done") {
+		await archiveTaskAnswer(task);
+		await maybeRunVerify(task);
+		await collectWorktreeDiff(task);
+		await appendBoardEntry(task);
+	}
+	// Captured here (not in the sync notify path) so the notification can carry it.
+	task.retainedWorktrees = await retainedWorktreesLine();
+	notifyTaskSettled(task);
+}
+
+/** Fire-and-forget at settle sites; reporters await task.finalizePromise. */
+function startFinalize(task: Task): void {
+	task.finalizePromise = finalizeAndNotify(task);
+}
+
+/**
+ * The inline form of a settled answer: archived answers show the handle plus the
+ * template summary (or a head/tail excerpt); unarchived ones truncate as before.
+ */
+function presentAnswer(task: Task, inlineLimit: number): { text: string; truncated: boolean } {
+	const latest = task.archives?.[task.archives.length - 1];
+	if (!latest) return truncate(answerOf(task), inlineLimit);
+	const answer = answerOf(task);
+	const text = placeholderFor({ ...latest, taskId: task.id, text: answer }, { summary: extractSummary(answer) });
+	return { text, truncated: false };
+}
+
+/** Compact text dump of the meter for /external_agent_stats. */
+function formatMeterSnapshot(snapshot: MeterSnapshot): string {
+	const totals = snapshot.totals;
+	const lines = [
+		"external-agent stats (as reported by the target CLIs; not billing):",
+		`dispatches: ${snapshot.dispatchTotal} · tokens in/out/cached: ${totals.in ?? 0}/${totals.out ?? 0}/${totals.cached ?? 0}` +
+			(totals.costUsd !== undefined ? ` · cost $${totals.costUsd.toFixed(4)}` : ""),
+	];
+	const refusals = Object.entries(snapshot.refusedTotal);
+	if (refusals.length > 0) lines.push(`refusals: ${refusals.map(([reason, n]) => `${n}× ${reason}`).join("; ")}`);
+	for (const [taskId, t] of Object.entries(snapshot.tasks)) {
+		lines.push(
+			`  ${taskId}: in/out/cached ${t.in ?? 0}/${t.out ?? 0}/${t.cached ?? 0}${t.costUsd !== undefined ? ` · $${t.costUsd.toFixed(4)}` : ""} · ${t.samples} samples`,
+		);
+	}
+	return lines.join("\n");
+}
+
+function verifyLine(result: VerifyResult): string {
+	if (result.skipped) return `verify: \`${result.command}\` — skipped (${result.skipped})`;
+	return `verify: \`${result.command}\` — exit ${result.exitCode ?? "?"} in ${fmtDuration(result.durationMs)}`;
+}
+
 function notifyTaskSettled(task: Task): void {
 	if (task.notified) return;
 	if (task.notify === "off") {
@@ -474,9 +824,11 @@ function notifySettled(pi: ExtensionAPI, task: Task): void {
 	if (task.spawnError) lines.push(`spawn error: ${task.spawnError}`);
 	const errs = errorsOf(task);
 	if (errs) lines.push(`errors: ${truncate(errs, 500).text}`);
+	if (task.worktree) lines.push(`worktree: ${task.worktree.path} (branch ${task.worktree.branch})`);
 
 	if (task.state === "done") {
-		const preview = truncate(answerOf(task), NOTIFY_PREVIEW_CHARS);
+		if (task.verifyResult) lines.push(verifyLine(task.verifyResult));
+		const preview = presentAnswer(task, NOTIFY_PREVIEW_CHARS);
 		if (preview.text) {
 			lines.push("", preview.text);
 			if (preview.truncated) {
@@ -488,6 +840,8 @@ function notifySettled(pi: ExtensionAPI, task: Task): void {
 	} else {
 		lines.push(`Inspect with external_agent_status taskId="${task.id}".`);
 	}
+	// Neutral by design: the line reports accumulation, it does not ask for cleanup.
+	if (task.retainedWorktrees) lines.push(task.retainedWorktrees);
 
 	try {
 		pi.sendMessage(
@@ -595,6 +949,137 @@ function ensureWatchdogTimer(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Worktree isolation
+// ---------------------------------------------------------------------------
+
+/**
+ * Where isolated worktrees live inside the main repository. git runs through
+ * node:child_process rather than pi.exec on purpose: these are the hub's own
+ * plumbing, and the target CLI must never see or own them.
+ */
+const WORKTREE_DIR = join(".external-agent", "worktrees");
+/** Inventory folding: past this many retained worktrees, only the oldest few are listed. */
+const RETAINED_LIST_MAX = 5;
+const RETAINED_LIST_SHOWN = 3;
+
+const execFileAsync = promisify(execFile);
+
+/** One git call; rejects with the child's stderr attached (execFile's error shape). */
+async function runGit(args: string[]): Promise<{ stdout: string; stderr: string }> {
+	const { stdout, stderr } = await execFileAsync("git", args, { encoding: "utf8" });
+	return { stdout, stderr };
+}
+
+/** One-line, bounded git failure text for a refusal message. */
+function gitErrorTail(err: unknown): string {
+	const shaped = err as { stderr?: string; stdout?: string } | undefined;
+	const text = shaped?.stderr?.trim() || shaped?.stdout?.trim() || (err instanceof Error ? err.message : String(err));
+	return escapeTerminalControls(text.replace(/\s+/g, " ").trim().slice(0, 300));
+}
+
+/**
+ * The repository a cwd belongs to, or the reason there is none: isolate refuses
+ * a non-git cwd outright instead of silently running the worker unisolated.
+ */
+async function findGitTopLevel(cwd: string): Promise<{ ok: true; toplevel: string } | { ok: false; reason: string }> {
+	try {
+		const toplevel = (await runGit(["-C", cwd, "rev-parse", "--show-toplevel"])).stdout.trim();
+		if (!toplevel) return { ok: false, reason: `git rev-parse --show-toplevel in ${escapeTerminalControls(cwd)} returned nothing` };
+		return { ok: true, toplevel };
+	} catch (err) {
+		return {
+			ok: false,
+			reason:
+				`${escapeTerminalControls(cwd)} is not inside a git repository (${gitErrorTail(err)}), ` +
+				"so isolate cannot give the task its own worktree",
+		};
+	}
+}
+
+/** Whether a path exists at all; used to tell "I created this" from "it was already there". */
+async function pathExists(target: string): Promise<boolean> {
+	try {
+		await stat(target);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Create one task's worktree (`<toplevel>/.external-agent/worktrees/<taskId>` on
+ * branch `ea-<taskId>`). A failure cleans up whatever this call may have made and
+ * refuses the dispatch with git's own words — a half-made checkout is never left
+ * behind, and the caller is told rather than degraded silently.
+ */
+async function createTaskWorktree(worktree: TaskWorktree): Promise<{ ok: true } | { ok: false; reason: string }> {
+	// A path that already exists belongs to a retained worktree (or a foreign
+	// directory): the hub never deletes those, not even as failure cleanup.
+	const existed = await pathExists(worktree.path);
+	try {
+		await runGit(["-C", worktree.base, "worktree", "add", worktree.path, "-b", worktree.branch]);
+		return { ok: true };
+	} catch (err) {
+		if (!existed) {
+			await runGit(["-C", worktree.base, "worktree", "remove", "--force", worktree.path]).catch(() => undefined);
+		}
+		return {
+			ok: false,
+			reason: `git worktree add failed for ${escapeTerminalControls(worktree.path)} (${gitErrorTail(err)})`,
+		};
+	}
+}
+
+/** Ages are coarse on purpose: the line reports accumulation, not exact times. */
+function formatAge(ageMs: number): string {
+	const minutes = Math.max(0, Math.floor(ageMs / 60_000));
+	if (minutes < 60) return `${minutes}m`;
+	const hours = Math.floor(minutes / 60);
+	if (hours < 24) return `${hours}h`;
+	return `${Math.floor(hours / 24)}d`;
+}
+
+/**
+ * Neutral inventory of worktrees the hub created and did not remove — by design,
+ * since it never merges and never deletes. Bases come from the registry, so only
+ * repositories this session isolated into are scanned, and the line only exists
+ * once such a worktree does. No imperative wording: the line reports, the owner
+ * decides.
+ */
+async function retainedWorktreesLine(): Promise<string | undefined> {
+	const bases = new Set<string>();
+	for (const task of tasks.values()) {
+		if (task.worktree) bases.add(task.worktree.base);
+	}
+	const entries: Array<{ name: string; ageMs: number }> = [];
+	for (const base of bases) {
+		const root = join(base, WORKTREE_DIR);
+		let dirents;
+		try {
+			dirents = await readdir(root, { withFileTypes: true });
+		} catch {
+			continue; // nothing retained here yet, or the directory is unreadable
+		}
+		for (const dirent of dirents) {
+			if (!dirent.isDirectory()) continue;
+			try {
+				const info = await stat(join(root, dirent.name));
+				// The branch is what identifies the retained worktree in git terms.
+				entries.push({ name: `ea-${dirent.name}`, ageMs: Date.now() - info.mtimeMs });
+			} catch {
+				// It disappeared between listing and stat: nothing to report.
+			}
+		}
+	}
+	if (entries.length === 0) return undefined;
+	entries.sort((a, b) => b.ageMs - a.ageMs);
+	const shown = entries.length > RETAINED_LIST_MAX ? entries.slice(0, RETAINED_LIST_SHOWN) : entries;
+	const labels = shown.map((entry) => `${entry.name}(${formatAge(entry.ageMs)})`);
+	if (shown.length < entries.length) labels.push(`+${entries.length - shown.length} more`);
+	return `retained worktrees: ${labels.join(", ")}`;
+}
+
+// ---------------------------------------------------------------------------
 // Launch
 // ---------------------------------------------------------------------------
 
@@ -612,8 +1097,11 @@ function createTask(
 	watchdogMs: number,
 	dispatch: DispatchReceipt,
 	transport: Transport,
+	preallocatedId?: string,
 ): Task {
-	const id = nextId(agent);
+	// Isolate hands in the id it already used to name the worktree; everyone else
+	// gets the next one here, exactly as before.
+	const id = preallocatedId ?? nextId(agent);
 	const task: Task = {
 		id,
 		agent,
@@ -636,8 +1124,11 @@ function createTask(
 		watchdogMs,
 		lastWatchdogNoticeAt: 0,
 		watchdogNotices: 0,
+		relayDepth: 0,
+		relaysReceived: 0,
 	};
 	tasks.set(task.id, task);
+	meter.recordDispatch(task.id);
 	ensureWatchdogTimer();
 	return task;
 }
@@ -651,10 +1142,24 @@ function startTask(
 	watchdogMs: number,
 	model?: string,
 	effort?: Effort,
+	extras: DispatchExtras = {},
 ): Task {
 	return hasSessionDriver(agent)
-		? startPersistentTask(agent, taskText, cwd, mode, notify, watchdogMs, model, effort)
-		: startOneshotTask(agent, taskText, cwd, mode, notify, watchdogMs, model, effort);
+		? startPersistentTask(agent, taskText, cwd, mode, notify, watchdogMs, model, effort, extras)
+		: startOneshotTask(agent, taskText, cwd, mode, notify, watchdogMs, model, effort, extras);
+}
+
+/** Settle-time fields that come from dispatch extras rather than the agent stream. */
+function applyExtras(task: Task, extras: DispatchExtras): void {
+	if (extras.templateLabel) task.templateLabel = extras.templateLabel;
+	if (extras.verifyCommand) task.verifyCommand = extras.verifyCommand;
+	if (extras.verifyTimeoutSeconds !== undefined) task.verifyTimeoutSeconds = extras.verifyTimeoutSeconds;
+	if (extras.worktree) task.worktree = extras.worktree;
+}
+
+/** The receipt's copy of a worktree reference: path/branch/base, never live diff state. */
+function worktreeReceipt(worktree: TaskWorktree | undefined): { worktree?: WorktreeRef } {
+	return worktree ? { worktree: { path: worktree.path, branch: worktree.branch, base: worktree.base } } : {};
 }
 
 /**
@@ -671,6 +1176,7 @@ function startPersistentTask(
 	watchdogMs: number,
 	model?: string,
 	effort?: Effort,
+	extras: DispatchExtras = {},
 ): Task {
 	const adapter = ADAPTERS[agent];
 	const driver = SESSION_DRIVERS[agent]!();
@@ -705,9 +1211,12 @@ function startPersistentTask(
 		watchdogMs,
 		environment: INHERITED_ENVIRONMENT_NOTICE,
 		transport: "persistent",
+		...(extras.templateLabel ? { template: extras.templateLabel } : {}),
+		...worktreeReceipt(extras.worktree),
 	});
 
-	const task = createTask(agent, taskText, cwd, mode, notify, watchdogMs, dispatch, "persistent");
+	const task = createTask(agent, taskText, cwd, mode, notify, watchdogMs, dispatch, "persistent", extras.taskId);
+	applyExtras(task, extras);
 	task.driver = driver;
 
 	driver.onEvent((event) => {
@@ -725,7 +1234,7 @@ function startPersistentTask(
 			task.state = "failed";
 			task.endedAt = Date.now();
 			if (!task.spawnError) task.spawnError = task.stderr.trim().slice(0, 500) || undefined;
-			notifyTaskSettled(task);
+			startFinalize(task);
 		}
 	});
 
@@ -742,7 +1251,7 @@ function startPersistentTask(
 			task.sessionAlive = false;
 			task.spawnError = err instanceof Error ? err.message : String(err);
 			driver.kill();
-			notifyTaskSettled(task);
+			startFinalize(task);
 		});
 
 	return task;
@@ -773,6 +1282,7 @@ function pushEvent(task: Task, event: AgentEvent): void {
 		if (task.answerStartIndex > 0) task.answerStartIndex -= 1;
 	}
 	task.lastEventAt = Date.now();
+	meterUsageEvent(task.id, event);
 }
 
 function settlePersistentTask(task: Task, outcome: { status: "done" | "failed" | "cancelled"; error?: string }): void {
@@ -780,7 +1290,7 @@ function settlePersistentTask(task: Task, outcome: { status: "done" | "failed" |
 	task.state = outcome.status === "cancelled" ? "stopped" : outcome.status;
 	task.endedAt = Date.now();
 	if (outcome.error) task.spawnError = outcome.error;
-	notifyTaskSettled(task);
+	startFinalize(task);
 	// A cancelled turn is one the model asked to stop; no reason to keep the
 	// session around for a follow-up.
 	if (task.state === "stopped") {
@@ -815,6 +1325,23 @@ function reclaimSession(task: Task): void {
 	task.driver?.kill();
 }
 
+/**
+ * Re-arm a settled persistent task for a new turn handed to it in place. The
+ * answer window moves to the new turn, and the notifications the last turn
+ * consumed are re-armed with it.
+ */
+function beginFollowUpTurn(task: Task): void {
+	task.answerStartIndex = task.events.length;
+	task.state = "running";
+	task.endedAt = undefined;
+	task.notified = false;
+	task.exitCode = null;
+	task.spawnError = undefined;
+	task.lastEventAt = Date.now();
+	task.watchdogNotices = 0;
+	clearIdleReap(task);
+}
+
 function startOneshotTask(
 	agent: AgentId,
 	taskText: string,
@@ -824,6 +1351,7 @@ function startOneshotTask(
 	watchdogMs: number,
 	model?: string,
 	effort?: Effort,
+	extras: DispatchExtras = {},
 ): Task {
 	const adapter = ADAPTERS[agent];
 	const adapterDispatch = adapter.buildDispatch({ task: taskText, cwd, mode, model, effort });
@@ -856,8 +1384,11 @@ function startOneshotTask(
 		watchdogMs,
 		environment: INHERITED_ENVIRONMENT_NOTICE,
 		transport: "oneshot",
+		...(extras.templateLabel ? { template: extras.templateLabel } : {}),
+		...worktreeReceipt(extras.worktree),
 	});
-	const task = createTask(agent, taskText, cwd, mode, notify, watchdogMs, dispatch, "oneshot");
+	const task = createTask(agent, taskText, cwd, mode, notify, watchdogMs, dispatch, "oneshot", extras.taskId);
+	applyExtras(task, extras);
 
 	let proc: ChildProcess;
 	try {
@@ -881,7 +1412,7 @@ function startOneshotTask(
 		task.state = "failed";
 		task.endedAt = Date.now();
 		task.spawnError = err.message;
-		notifyTaskSettled(task);
+		startFinalize(task);
 	});
 
 	let buffer = "";
@@ -921,7 +1452,7 @@ function startOneshotTask(
 		}
 		// An agent can exit 0 and still have reported an error event, so check both.
 		task.state = code === 0 && !errorsOf(task) ? "done" : "failed";
-		notifyTaskSettled(task);
+		startFinalize(task);
 	});
 
 	return task;
@@ -985,8 +1516,18 @@ type DispatchCheck = { ok: true } | { ok: false; reason: string };
  * about the run's cost. The last check is the directory conflict: two mutating
  * agents in one directory change files in ways neither the model nor the other
  * agent can observe.
+ *
+ * `conflictCwd` is where the worker will actually run: an isolated task's cwd is
+ * its own fresh worktree, so the conflict check must not refuse it over a writer
+ * in the directory the caller named.
  */
-function validateDispatch(agent: AgentId, mode: Mode, cwd: string, effort: Effort | undefined): DispatchCheck {
+function validateDispatch(
+	agent: AgentId,
+	mode: Mode,
+	cwd: string,
+	effort: Effort | undefined,
+	conflictCwd: string = cwd,
+): DispatchCheck {
 	const adapter = ADAPTERS[agent];
 
 	// Fail closed below the adapter's floor too: an adapter with minMode
@@ -1032,12 +1573,12 @@ function validateDispatch(agent: AgentId, mode: Mode, cwd: string, effort: Effor
 
 	// Two mutating agents in one directory conflict in ways the model cannot see coming.
 	if (mode !== "readonly") {
-		const conflict = [...tasks.values()].find((t) => t.state === "running" && t.mode !== "readonly" && t.cwd === cwd);
+		const conflict = [...tasks.values()].find((t) => t.state === "running" && t.mode !== "readonly" && t.cwd === conflictCwd);
 		if (conflict) {
 			return {
 				ok: false,
 				reason:
-					`${conflict.id} is already running a ${conflict.mode} task in ${escapeTerminalControls(cwd)}. ` +
+					`${conflict.id} is already running a ${conflict.mode} task in ${escapeTerminalControls(conflictCwd)}. ` +
 					`Stop it first (external_agent_stop) or dispatch to a different directory.`,
 			};
 		}
@@ -1050,11 +1591,19 @@ function validateDispatch(agent: AgentId, mode: Mode, cwd: string, effort: Effor
 // Reporting
 // ---------------------------------------------------------------------------
 
+/** Newline-prefixed retained-worktree inventory for status output; "" when there is none. */
+async function inventorySuffix(): Promise<string> {
+	const line = await retainedWorktreesLine();
+	return line ? `\n${line}` : "";
+}
+
 function detailReport(task: Task, tailCount: number): string {
 	const lines: string[] = [];
 	lines.push(summarize(task));
 	lines.push(`agent: ${task.agent} (${ADAPTERS[task.agent].provider})`);
 	lines.push(`mode: ${modeDisplay(task.mode)} · cwd: ${task.cwd}`);
+	if (task.worktree) lines.push(`worktree: ${task.worktree.path} (branch ${task.worktree.branch})`);
+	if (task.worktree?.diffStat) lines.push(`worktree diff: ${task.worktree.diffStat}`);
 	if (task.exitCode !== null) lines.push(`exit: ${task.exitCode}`);
 	if (task.spawnError) lines.push(`spawn error: ${task.spawnError}`);
 	if (task.transport === "persistent") {
@@ -1068,10 +1617,16 @@ function detailReport(task: Task, tailCount: number): string {
 				? `session: alive (external_agent_follow_up once settled; ${steering})`
 				: "session: reclaimed — follow-ups are refused, dispatch a new task",
 		);
+		if (task.relaysReceived > 0) lines.push(`relays received: ${task.relaysReceived}`);
 	}
 
 	const errs = errorsOf(task);
 	if (errs) lines.push(`agent errors: ${errs}`);
+	if (task.templateLabel) lines.push(`template: ${task.templateLabel}`);
+	if (task.verifyResult) {
+		lines.push(verifyLine(task.verifyResult));
+		if (task.verifyResult.outputTail) lines.push("verify output tail:", task.verifyResult.outputTail);
+	}
 	const warns = warningsOf(task);
 	if (warns) lines.push(`non-fatal warnings: ${truncate(warns, 400).text}`);
 
@@ -1092,9 +1647,10 @@ function detailReport(task: Task, tailCount: number): string {
 		const answer = answerOf(task);
 		const earlier = task.answerStartIndex > 0;
 		if (answer) {
-			const { text, truncated } = truncate(answer, MAX_ANSWER_CHARS);
+			const { text, truncated } = presentAnswer(task, MAX_ANSWER_CHARS);
 			lines.push("", earlier ? "answer (latest turn):" : "answer:", text);
 			if (truncated) lines.push("[answer was truncated]");
+			if (task.archiveError) lines.push(`[archive unavailable: ${task.archiveError}; answer inlined]`);
 			if (earlier) lines.push(`[earlier turns: ${allAnswersOf(task).length} chars across ${task.answerStartIndex} events — latest turn shown]`);
 		} else {
 			lines.push("", "no answer produced");
@@ -1352,7 +1908,8 @@ function compareSection(slot: CompareSlot): string[] {
 			`${modeDisplay(task.mode)} · ${escapeTerminalControls(task.cwd)}`,
 	];
 	if (task.state === "done") {
-		const answer = truncate(answerOf(task), WAIT_ANSWER_PREVIEW_CHARS);
+		if (task.verifyResult) lines.push(verifyLine(task.verifyResult));
+		const answer = presentAnswer(task, WAIT_ANSWER_PREVIEW_CHARS);
 		lines.push(answer.text || `(no answer text was parsed — external_agent_status taskId="${task.id}")`);
 		if (answer.truncated) {
 			lines.push(
@@ -1395,7 +1952,7 @@ function compareResults(slots: CompareSlot[]): CompareResult[] {
 			dispatch: copyDispatchReceipt(task.dispatch),
 		};
 		if (task.state === "done") {
-			const answer = truncate(answerOf(task), WAIT_ANSWER_PREVIEW_CHARS);
+			const answer = presentAnswer(task, WAIT_ANSWER_PREVIEW_CHARS);
 			if (answer.text) {
 				result.answer = answer.text;
 				result.answerTruncated = answer.truncated;
@@ -1458,6 +2015,226 @@ function rearmCompareNotifications(slots: DispatchedCompareSlot[]): void {
 	for (const slot of slots) {
 		if (slot.task.state === "running") slot.task.notify = "steer";
 	}
+}
+
+/**
+ * Where per-slot evidence rows go: `""` disables the board outright, an explicit
+ * path wins, and an omitted param defaults to `<session-dir>/external-agent/
+ * board.jsonl` — a default that only exists when the session has a directory.
+ */
+function boardFileFrom(param: unknown, sessionDir: string | undefined, cwd: string): string | undefined {
+	if (param === "") return undefined;
+	if (typeof param === "string") return resolve(cwd, param);
+	return sessionDir ? join(sessionDir, "external-agent", "board.jsonl") : undefined;
+}
+
+/**
+ * The report's closing digest: how many rows this call added to the board, or
+ * why they are not there. Board trouble never changes the compare result.
+ */
+function boardDigest(slots: CompareSlot[], boardFile: string | undefined): string | undefined {
+	if (!boardFile) return undefined;
+	const failure = slots.find((slot) => slot.task?.boardError)?.task?.boardError;
+	if (failure) return `board: unavailable (${failure})`;
+	const written = slots.filter((slot) => slot.task?.boardWritten).length;
+	return `board: ${boardFile} (+${written} entries)`;
+}
+
+// ---------------------------------------------------------------------------
+// Relay: one worker's answer into another worker's session
+// ---------------------------------------------------------------------------
+
+/**
+ * How far a message may travel from the coordinator's own dispatch. Past this the
+ * workers are negotiating among themselves, and the coordinator — the party that
+ * owns the judgment — is the one who has to carry it.
+ */
+const RELAY_MAX_HOPS = 2;
+/** Selection window, in UTF-8 bytes: a default that fits one turn, a hard ceiling. */
+const RELAY_DEFAULT_BYTES = 4_000;
+const RELAY_MAX_BYTES = 16_000;
+/** How much of the excerpt the coordinator sees in the receipt. */
+const RELAY_RECEIPT_CHARS = 500;
+/** Upper bound on anchors listed for one relay; the body stays the claim surface. */
+const RELAY_MAX_ANCHORS = 12;
+
+function isRelayPurpose(value: unknown): value is RelayPurpose {
+	return value === "reproduce" || value === "combine" || value === "challenge";
+}
+
+/**
+ * A byte window of an answer that never reached the archive (short, or archiving
+ * was unavailable). Cut on character boundaries, the same rule readChunk follows,
+ * so a slice can never emit half a character.
+ */
+function sliceUtf8(text: string, offset: number, maxBytes: number): string {
+	const buffer = Buffer.from(text, "utf8");
+	let start = offset > 0 ? Math.min(Math.floor(offset), buffer.byteLength) : 0;
+	while (start < buffer.byteLength && (buffer[start] & 0xc0) === 0x80) start += 1;
+	let end = Math.min(buffer.byteLength, start + Math.max(1, Math.floor(maxBytes)));
+	while (end > start && end < buffer.byteLength && (buffer[end] & 0xc0) === 0x80) end -= 1;
+	return buffer.toString("utf8", start, end);
+}
+
+/** `path:line` and `path:start-end` references inside an excerpt, deduped and capped. */
+function anchorRefs(text: string): string[] {
+	const found = text.match(/[\w./-]+\.[A-Za-z0-9]+:\d+(?:-\d+)?/g) ?? [];
+	return [...new Set(found)].slice(0, RELAY_MAX_ANCHORS);
+}
+
+/**
+ * The text a relay delivers: the source excerpt as an envelope, wrapped in the
+ * relay-envelope template (project > user > builtin, like any other template) so
+ * the receiving worker reads it as data from a peer and answers with anchors.
+ */
+async function relayEnvelope(
+	source: Task,
+	target: Task,
+	purpose: RelayPurpose,
+	excerpt: string,
+): Promise<{ text: string; anchors: string[] }> {
+	const anchors = anchorRefs(excerpt);
+	const message = [
+		`from: ${source.id}`,
+		`to: ${target.id}`,
+		`purpose: ${purpose}`,
+		"body:",
+		excerpt,
+		"anchors:",
+		...(anchors.length > 0 ? anchors.map((anchor) => `- ${anchor}`) : ["none"]),
+	].join("\n");
+	const loaded = await loadTemplate("relay-envelope", { projectDir: target.cwd, homeDir: homedir() });
+	return { text: applyTemplate(loaded.body, message), anchors };
+}
+
+/**
+ * Relay one task's settled answer into another task's live session. The channel is
+ * whatever that session actually offers — a steer while it runs, a follow-up once
+ * it has settled and its process is still up — and anything else is refused with
+ * the reason. It never degrades into a fresh dispatch: a new task holds none of the
+ * conversation the message was addressed to.
+ */
+async function relayAnswerToTask(params: Record<string, unknown>): Promise<AgentToolResult<ExternalAgentRelayDetails>> {
+	const targetId = typeof params.taskId === "string" ? params.taskId : "";
+	const sourceId = typeof params.fromTaskId === "string" ? params.fromTaskId.trim() : "";
+	const known = () => [...tasks.keys()].join(", ") || "(none)";
+	const refuse = (reason: string, extra: Partial<ExternalAgentRelayDetails> = {}): AgentToolResult<ExternalAgentRelayDetails> => ({
+		content: [{ type: "text", text: `Relay refused: ${reason}` }],
+		details: { kind: "external-agent-relay", relayed: false, fromTaskId: sourceId || undefined, taskId: targetId || undefined, reason, ...extra },
+	});
+
+	const target = tasks.get(targetId);
+	if (!target) return refuse(`unknown taskId "${targetId}". Known: ${known()}`);
+	const source = tasks.get(sourceId);
+	if (!source) return refuse(`unknown fromTaskId "${sourceId}". Known: ${known()}`);
+	if (source === target) return refuse(`${source.id} cannot relay to itself.`);
+	if (params.purpose !== undefined && !isRelayPurpose(params.purpose)) {
+		return refuse(`purpose must be reproduce, combine or challenge (got "${String(params.purpose)}").`);
+	}
+	const purpose: RelayPurpose = isRelayPurpose(params.purpose) ? params.purpose : "combine";
+	if (source.state === "running") return refuse(`${source.id} is still running, so it has no settled answer to relay.`);
+	if (source.state === "stopped") return refuse(`${source.id} was stopped before it settled, so it has no answer to relay.`);
+	if (source.relayDepth >= RELAY_MAX_HOPS) {
+		return refuse(
+			`${source.id} already sits ${source.relayDepth} hops from the coordinator and the limit is ${RELAY_MAX_HOPS}. ` +
+				`Read its answer with external_agent_status taskId="${source.id}" and carry it yourself.`,
+		);
+	}
+
+	const maxBytes =
+		typeof params.length === "number" && Number.isFinite(params.length)
+			? Math.min(Math.max(Math.floor(params.length), 1), RELAY_MAX_BYTES)
+			: RELAY_DEFAULT_BYTES;
+	const offset = typeof params.offset === "number" && Number.isFinite(params.offset) && params.offset > 0 ? Math.floor(params.offset) : 0;
+	const archived = source.archives?.[source.archives.length - 1];
+	let excerpt: string;
+	if (archived) {
+		try {
+			excerpt = (await readChunk(archived.filePath, offset, { maxBytes })).text;
+		} catch (err) {
+			return refuse(`the archived answer of ${source.id} could not be read: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	} else {
+		excerpt = sliceUtf8(answerOf(source), offset, maxBytes);
+	}
+	if (!excerpt.trim()) {
+		return refuse(
+			`${source.id} has no answer text at offset ${offset} (${Buffer.byteLength(answerOf(source), "utf8")} bytes available).`,
+		);
+	}
+
+	const via: "steer" | "followUp" = target.state === "running" ? "steer" : "followUp";
+	const guard = requireCapableTask(target.id, via);
+	if ("error" in guard) return refuse(guard.error);
+	if (via === "steer") {
+		const blocked = target.driver?.steerUnavailableReason;
+		if (blocked) return refuse(`${target.id} cannot be steered: ${blocked}`);
+	} else if (!target.sessionAlive || !target.driver?.alive) {
+		return refuse(
+			`The session process for ${target.id} has been reclaimed (idle for ${Math.round(IDLE_REAP_MS / 60_000)}m or stopped), ` +
+				"so its conversation is gone. Dispatch a new task with a self-contained prompt instead.",
+		);
+	}
+
+	let envelope: { text: string; anchors: string[] };
+	try {
+		envelope = await relayEnvelope(source, target, purpose, excerpt);
+	} catch (err) {
+		return refuse(`the relay envelope could not be built: ${err instanceof Error ? err.message : String(err)}`);
+	}
+
+	let note: string | undefined;
+	if (via === "steer") {
+		const result = await target.driver!.steer(envelope.text);
+		if (!result.accepted) return refuse(`${target.id} did not take the steer: ${result.reason}`, { via });
+		note = result.note;
+	} else {
+		try {
+			await target.driver!.followUp(envelope.text);
+		} catch (err) {
+			return refuse(`${target.id} did not take the relay as a follow-up: ${err instanceof Error ? err.message : String(err)}`, { via });
+		}
+		beginFollowUpTurn(target);
+	}
+	target.relayDepth = Math.max(target.relayDepth, source.relayDepth + 1);
+	target.relaysReceived += 1;
+	pushEvent(target, { kind: "tool", text: `relay from ${source.id} (${purpose})`.slice(0, 200) });
+
+	const bytes = Buffer.byteLength(excerpt, "utf8");
+	const sha256 = createHash("sha256").update(excerpt, "utf8").digest("hex");
+	const waiting =
+		target.notify === "off"
+			? `Poll external_agent_status taskId="${target.id}" once it settles: it was dispatched with notify off.`
+			: `Its completion notification will reach you, or call external_agent_wait with taskIds=["${target.id}"].`;
+	const lines = [
+		`relayed ${source.id}→${target.id}: ${bytes} bytes · sha256:${sha256.slice(0, 8)} · via ${via} · hop ${target.relayDepth}`,
+		escapeTerminalControls(excerpt.slice(0, RELAY_RECEIPT_CHARS)),
+		archived ? placeholderFor({ ...archived, taskId: source.id }) : "",
+		`${target.id} ${via === "steer" ? "keeps running, with the message injected at its next step boundary" : "is running again in the same session"}. ${waiting}`,
+		note ? `note: ${note}` : "",
+		typeof params.message === "string" && params.message.trim()
+			? `note: your message parameter was not sent — fromTaskId composes the text from ${source.id}'s answer.`
+			: "",
+	];
+
+	return {
+		content: [{ type: "text", text: lines.filter(Boolean).join("\n") }],
+		details: {
+			kind: "external-agent-relay",
+			relayed: true,
+			fromTaskId: source.id,
+			taskId: target.id,
+			state: target.state,
+			via,
+			purpose,
+			bytes,
+			sha256,
+			anchors: envelope.anchors,
+			hop: target.relayDepth,
+			archiveId: archived?.id,
+			note,
+		},
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -1543,10 +2320,8 @@ export default function (pi: ExtensionAPI) {
 			"wall-clock timeout, but a stall watchdog (default 15m quiet) also notifies you, so ending your turn",
 			"while waiting is safe.",
 			`Agents: ${agentTable}.`,
-			"Task text must be self-contained: the agent sees none of this conversation, so state the goal, name the",
-			"files and what to return.",
-			"Concurrent write/yolo tasks in the same directory are refused, and effort is opt-in (see the effort",
-			"parameter).",
+			"Task text must be self-contained: the agent sees none of this conversation; state the goal, files and what to return.",
+			"Concurrent write/yolo tasks in one directory are refused; effort is opt-in (see the effort parameter).",
 			"pi, codex, reasonix, codebuddy and qoder are persistent sessions (the conversation survives the answer,",
 			"so it can be followed up or steered); the others are one-shot with no way back in.",
 		].join(" "),
@@ -1557,6 +2332,7 @@ export default function (pi: ExtensionAPI) {
 			"external_agent_steer is not an interrupt (it lands at the next step boundary); if it reports that the turn already ended, use external_agent_follow_up.",
 			"external_agent_follow_up continues the same session instead of re-dispatching work already done.",
 			"Treat external agent answers as claims to verify against the code, not as fact.",
+			"Opt-in extras: template (output contract) · verify (acceptance run after settle) · status offset (paged recall) · follow_up fromTaskId (relay) · isolate (own worktree) · compare board (evidence rows).",
 		],
 		parameters: Type.Object({
 			agent: StringEnum(AGENT_IDS as unknown as readonly string[]),
@@ -1575,9 +2351,9 @@ export default function (pi: ExtensionAPI) {
 			effort: Type.Optional(
 				StringEnum(EFFORT_LEVELS, {
 					description:
-						"Opt-in reasoning-effort override. Set it only when the user explicitly requests an effort/thinking level; " +
-						"never infer one from task complexity. Omit it to inherit the target CLI/config default — specifying off is " +
-						"an explicit override, not the same as omitting. Per-agent levels are in the agent table.",
+						"Opt-in reasoning-effort override: set it only when the user explicitly requests an effort level, never " +
+						"infer one from task complexity. Omit it to inherit the target CLI/config default (\"off\" is an override, " +
+						"not an omission). Per-agent levels: agent table.",
 				}),
 			),
 			notify: Type.Optional(
@@ -1591,6 +2367,25 @@ export default function (pi: ExtensionAPI) {
 				Type.Number({
 					description:
 						"Minutes of no activity before a stall notice (default 15; 0 disables; notify off disables it too).",
+				}),
+			),
+			template: Type.Optional(
+				Type.String({
+					description: "Task template name (e.g. evidence-research, verify-report); wraps the task with an output contract.",
+				}),
+			),
+			verify: Type.Optional(
+				Type.Object(
+					{
+						command: Type.String(),
+						timeoutSeconds: Type.Optional(Type.Number()),
+					},
+					{ description: "After settle, run this acceptance command and report its exit code (mechanical, no verdict)." },
+				),
+			),
+			isolate: Type.Optional(
+				Type.Boolean({
+					description: "Run in a fresh git worktree under .external-agent/worktrees",
 				}),
 			),
 		}),
@@ -1614,15 +2409,88 @@ export default function (pi: ExtensionAPI) {
 			const model = typeof params.model === "string" ? params.model : undefined;
 			const effort = isEffort(params.effort) ? params.effort : undefined;
 
-			const checked = validateDispatch(agent, mode, cwd, effort);
+			// isolate: the worker gets its own checkout, so the id and the repository
+			// must exist before anything is spawned. A cwd outside a git repository is
+			// a refusal, never a silent fallback to running unisolated.
+			let taskCwd = cwd;
+			let worktree: TaskWorktree | undefined;
+			let preallocatedId: string | undefined;
+			if (params.isolate === true) {
+				const top = await findGitTopLevel(cwd);
+				if (!top.ok) {
+					meter.recordRefused("isolate-not-a-git-repo");
+					return {
+						content: [{ type: "text", text: `Refused: ${top.reason}` }],
+						details: { refused: true },
+					};
+				}
+				preallocatedId = nextId(agent);
+				worktree = {
+					path: join(top.toplevel, WORKTREE_DIR, preallocatedId),
+					branch: `ea-${preallocatedId}`,
+					base: top.toplevel,
+				};
+			}
+
+			// The conflict check sees where the worker will actually run: an isolated
+			// task's own fresh worktree, which no running task can be occupying.
+			const checked = validateDispatch(agent, mode, cwd, effort, worktree?.path ?? cwd);
 			if (!checked.ok) {
+				meter.recordRefused(checked.reason);
 				return {
 					content: [{ type: "text", text: `Refused: ${checked.reason}` }],
 					details: { refused: true },
 				};
 			}
 
-			const task = startTask(agent, params.task, cwd, mode, notify, watchdogMs, model, effort);
+			// Archive root for settle-time finalize; ephemeral sessions leave it off.
+			try {
+				finalizeHooks.sessionDir = ctx.sessionManager.getSessionDir() ?? undefined;
+			} catch {
+				// no persistent session directory: archiving stays off
+			}
+
+			let taskText = params.task;
+			let templateLabel: string | undefined;
+			if (typeof params.template === "string" && params.template) {
+				let loaded;
+				try {
+					loaded = await loadTemplate(params.template, { projectDir: cwd, homeDir: homedir() });
+				} catch (err) {
+					meter.recordRefused("template-not-found");
+					return {
+						content: [{ type: "text", text: `Refused: ${err instanceof Error ? err.message : String(err)}` }],
+						details: { refused: true },
+					};
+				}
+				taskText = applyTemplate(loaded.body, taskText);
+				templateLabel = `${loaded.name}@${loaded.version}`;
+			}
+
+			// Created last among the preparations: a refusal above must not leave an
+			// unused worktree behind, and a failed create cleans up after itself.
+			if (worktree) {
+				const created = await createTaskWorktree(worktree);
+				if (!created.ok) {
+					meter.recordRefused("isolate-worktree-failed");
+					return {
+						content: [{ type: "text", text: `Refused: ${created.reason}` }],
+						details: { refused: true },
+					};
+				}
+				taskCwd = worktree.path;
+			}
+
+			const task = startTask(agent, taskText, taskCwd, mode, notify, watchdogMs, model, effort, {
+				templateLabel,
+				taskId: preallocatedId,
+				worktree,
+				verifyCommand: typeof params.verify?.command === "string" ? params.verify.command : undefined,
+				verifyTimeoutSeconds:
+					typeof params.verify?.timeoutSeconds === "number" && Number.isFinite(params.verify.timeoutSeconds)
+						? params.verify.timeoutSeconds
+						: undefined,
+			});
 
 			const notes: string[] = [];
 			if (adapter.degraded) notes.push(`note: ${agent} is degraded — ${adapter.degraded}`);
@@ -1631,6 +2499,11 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (mode === "yolo") {
 				notes.push("warning: yolo runs with no sandbox; the agent can modify or delete anything on this machine");
+			}
+			if (worktree) {
+				notes.push(
+					`worktree: ${worktree.path} (branch ${worktree.branch}) — the worker runs there, and the hub does not merge or delete it.`,
+				);
 			}
 			if (task.state === "failed") {
 				return {
@@ -1654,7 +2527,7 @@ export default function (pi: ExtensionAPI) {
 					{
 						type: "text",
 						text: [
-							`Started ${agent} as ${task.id} (${modeDisplay(task.mode)}) in ${escapeTerminalControls(cwd)}.`,
+							`Started ${agent} as ${task.id} (${modeDisplay(task.mode)}) in ${escapeTerminalControls(taskCwd)}.`,
 							...notes,
 							task.notify === "off"
 								? `No callback was requested, so poll external_agent_status taskId="${task.id}" at sparse intervals (at least 60s apart).`
@@ -1712,14 +2585,17 @@ export default function (pi: ExtensionAPI) {
 		name: "external_agent_status",
 		label: "External Agent Status",
 		description: [
-			"Check background external agent tasks. Omit taskId to list all; for one task you get elapsed and quiet",
-			"time plus recent activity, and its answer once settled. Steady activity means it is working; a long quiet",
-			"stretch means consider stopping it.",
+			"Check background external agent tasks. Omit taskId to list all; one task shows elapsed and quiet time plus",
+			"recent activity, and its answer once settled. Steady activity means working; a long quiet stretch means",
+			"consider stopping it.",
 		].join(" "),
 		promptSnippet: "Check background external agent tasks and their answers",
 		parameters: Type.Object({
 			taskId: Type.Optional(Type.String()),
 			tail: Type.Optional(Type.Number({ description: "Recent events to show. Default 8." })),
+			offset: Type.Optional(
+				Type.Number({ description: "Page the archived answer from this byte offset (from a placeholder's recall hint)." }),
+			),
 		}),
 
 		async execute(_id, params) {
@@ -1743,8 +2619,30 @@ export default function (pi: ExtensionAPI) {
 						details: {} as ExternalAgentStatusDetails,
 					};
 				}
+				if (params.offset !== undefined) {
+					const archived = task.archives?.[task.archives.length - 1];
+					if (!archived) {
+						return {
+							content: [{ type: "text", text: `No archived answer for ${task.id} (answer stayed inline; use external_agent_status without offset).` }],
+							details: {} as ExternalAgentStatusDetails,
+						};
+					}
+					try {
+						const page = await readChunk(archived.filePath, Number(params.offset));
+						const header = `[recall ${archived.id} offset=${Math.max(0, Math.floor(Number(params.offset)))} next_offset=${page.nextOffset} eof=${page.eof}]`;
+						return {
+							content: [{ type: "text", text: `${header}\n${page.text}` }],
+							details: {} as ExternalAgentStatusDetails,
+						};
+					} catch (err) {
+						return {
+							content: [{ type: "text", text: `Recall failed for ${archived.id}: ${err instanceof Error ? err.message : String(err)}` }],
+							details: {} as ExternalAgentStatusDetails,
+						};
+					}
+				}
 				return {
-					content: [{ type: "text", text: detailReport(task, Number(params.tail ?? 8)) }],
+					content: [{ type: "text", text: `${detailReport(task, Number(params.tail ?? 8))}${await inventorySuffix()}` }],
 					details: {
 						kind: "external-agent-status",
 						task: taskSnapshot(task),
@@ -1753,9 +2651,12 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const lines = [...tasks.values()].map((t) => `${summarize(t)} — ${t.agent}: ${t.task.slice(0, 80)}`);
+			const lines = [...tasks.values()].flatMap((t) => {
+				const line = `${summarize(t)} — ${t.agent}: ${t.task.slice(0, 80)}`;
+				return t.worktree ? [line, `  worktree: ${t.worktree.path} (branch ${t.worktree.branch})`] : [line];
+			});
 			return {
-				content: [{ type: "text", text: lines.join("\n") }],
+				content: [{ type: "text", text: lines.join("\n") + (await inventorySuffix()) }],
 				details: {
 					kind: "external-agent-status-list",
 					tasks: [...tasks.values()].map(taskSnapshot),
@@ -1794,8 +2695,8 @@ export default function (pi: ExtensionAPI) {
 		label: "External Agent Wait",
 		description: [
 			"Block until external agent tasks settle or the timeout elapses: how to wait inside the current turn. On",
-			"settle it returns the answer; on timeout a still-running summary, and you may wait again, do other work,",
-			"or end your turn and rely on notifications.",
+			"settle it returns the answer; on timeout a summary, and you may wait again, do other work, or end your turn",
+			"and rely on notifications.",
 		].join(" "),
 		promptSnippet: "Block until external agent tasks settle or time out",
 		parameters: Type.Object({
@@ -1853,7 +2754,7 @@ export default function (pi: ExtensionAPI) {
 					lines.push(summarize(task));
 					if (task.state !== "running") {
 						if (task.state === "done") {
-							const preview = truncate(answerOf(task), WAIT_ANSWER_PREVIEW_CHARS);
+							const preview = presentAnswer(task, WAIT_ANSWER_PREVIEW_CHARS);
 							if (preview.text) {
 								lines.push(preview.text);
 								if (preview.truncated) {
@@ -1883,9 +2784,11 @@ export default function (pi: ExtensionAPI) {
 			});
 
 			return await new Promise((resolvePromise) => {
-				const finish = (timedOut: boolean, aborted: boolean) => {
+				const finish = async (timedOut: boolean, aborted: boolean) => {
 					clearInterval(timer);
 					signal?.removeEventListener("abort", onAbort);
+					// Settle finalize (archive/verify) is async; the report must see its results.
+					await Promise.all(watched.map((t) => t.finalizePromise));
 					resolvePromise({
 						content: [{ type: "text", text: report(timedOut, aborted) }],
 						details: {
@@ -1916,17 +2819,18 @@ export default function (pi: ExtensionAPI) {
 		name: "external_agent_compare",
 		label: "External Agent Compare",
 		description: [
-			"Put one task to several agent CLIs in one blocking call: every valid spec is dispatched in parallel with",
-			"its own mode, model, effort and cwd, and the answers come back side by side once they settle or the",
+			"Put one task to several agent CLIs in one blocking call (specs[].task overrides it per slot): every valid",
+			"spec is dispatched in parallel with its own mode, model, effort and cwd; the answers come back side by",
+			"side once they settle or the",
 			"timeout elapses. It never diffs, scores or ranks — judging is yours. A spec that fails validation",
 			"(unsupported mode or effort, write/yolo conflict in its cwd) is recorded as a refusal while the others",
 			"still run. On timeout the receipt lists the taskIds still running: finish them with external_agent_wait,",
-			"or end your turn and their notifications re-invoke you. Use external_agent_start when you want to keep",
-			"working meanwhile.",
+			"or end your turn; their notifications re-invoke you. Use external_agent_start to keep working meanwhile.",
 		].join(" "),
 		promptSnippet: "Ask several external agent CLIs the same task at once",
 		promptGuidelines: [
 			"Prefer external_agent_compare over chaining agents in a pipeline: disagreement between answers is the signal.",
+			"specs[].task overrides the shared task per slot; template/verify apply to every slot.",
 		],
 		parameters: Type.Object({
 			task: Type.String({
@@ -1935,6 +2839,9 @@ export default function (pi: ExtensionAPI) {
 			agents: Type.Array(
 				Type.Object({
 					agent: StringEnum(AGENT_IDS as unknown as readonly string[]),
+					task: Type.Optional(
+						Type.String({ description: "Per-slot task override; defaults to the shared task." }),
+					),
 					cwd: Type.Optional(
 						Type.String({
 							description: "Working directory for this agent. Defaults to the session cwd.",
@@ -1961,6 +2868,28 @@ export default function (pi: ExtensionAPI) {
 			timeout: Type.Optional(
 				Type.Number({
 					description: `Seconds to wait for the whole batch (default ${WAIT_DEFAULT_TIMEOUT_S}, max ${WAIT_MAX_TIMEOUT_S}).`,
+				}),
+			),
+			template: Type.Optional(
+				Type.String({ description: "Task template applied to every slot (see external_agent_start)." }),
+			),
+			verify: Type.Optional(
+				Type.Object(
+					{
+						command: Type.String(),
+						timeoutSeconds: Type.Optional(Type.Number()),
+					},
+					{ description: "After each slot settles, run this acceptance command and report its exit code." },
+				),
+			),
+			isolate: Type.Optional(
+				Type.Boolean({
+					description: "Run in a fresh git worktree under .external-agent/worktrees",
+				}),
+			),
+			board: Type.Optional(
+				Type.String({
+					description: "Append per-slot evidence rows to this JSONL board (\"\" disables)",
 				}),
 			),
 		}),
@@ -1992,6 +2921,38 @@ export default function (pi: ExtensionAPI) {
 					? Math.min(Math.max(params.timeout, 5), WAIT_MAX_TIMEOUT_S)
 					: WAIT_DEFAULT_TIMEOUT_S;
 
+			// Archive root for settle-time finalize; ephemeral sessions leave it off.
+			try {
+				finalizeHooks.sessionDir = ctx.sessionManager.getSessionDir() ?? undefined;
+			} catch {
+				// no persistent session directory: archiving stays off
+			}
+			// Evidence board, resolved once for the whole batch: each settled slot
+			// appends its own row there (see appendBoardEntry).
+			const boardFile = boardFileFrom(params.board, finalizeHooks.sessionDir, ctx.cwd);
+
+			let templateBody: string | undefined;
+			let templateLabel: string | undefined;
+			if (typeof params.template === "string" && params.template) {
+				try {
+					const loaded = await loadTemplate(params.template, { projectDir: ctx.cwd, homeDir: homedir() });
+					applyTemplate(loaded.body, ""); // dry-run: a body without {{TASK}} must not reach dispatch
+					templateBody = loaded.body;
+					templateLabel = `${loaded.name}@${loaded.version}`;
+				} catch (err) {
+					meter.recordRefused("template-not-found");
+					return noRun(`Refused: ${err instanceof Error ? err.message : String(err)}`);
+				}
+			}
+			const extras: DispatchExtras = {
+				templateLabel,
+				verifyCommand: typeof params.verify?.command === "string" ? params.verify.command : undefined,
+				verifyTimeoutSeconds:
+					typeof params.verify?.timeoutSeconds === "number" && Number.isFinite(params.verify.timeoutSeconds)
+						? params.verify.timeoutSeconds
+						: undefined,
+			};
+
 			const slots: CompareSlot[] = [];
 			for (const [index, spec] of specs.entries()) {
 				// A malformed spec is one refused entry, not a thrown call: the other
@@ -2015,19 +2976,62 @@ export default function (pi: ExtensionAPI) {
 				const model = typeof spec.model === "string" ? spec.model : undefined;
 				const effort = isEffort(spec.effort) ? spec.effort : undefined;
 
+				// isolate is per slot: each worker gets its own checkout, so two
+				// write slots in one repository no longer collide on the cwd.
+				let slotCwd = cwd;
+				let slotWorktree: TaskWorktree | undefined;
+				let preallocatedId: string | undefined;
+				if (params.isolate === true) {
+					const top = await findGitTopLevel(cwd);
+					if (!top.ok) {
+						meter.recordRefused("isolate-not-a-git-repo");
+						slots.push({ index, agent, reason: top.reason, mode, cwd });
+						continue;
+					}
+					preallocatedId = nextId(agent);
+					slotWorktree = {
+						path: join(top.toplevel, WORKTREE_DIR, preallocatedId),
+						branch: `ea-${preallocatedId}`,
+						base: top.toplevel,
+					};
+				}
+
 				// One refused spec must not cost the caller the others: it is recorded
 				// with its reason and the loop keeps going.
-				const checked = validateDispatch(agent, mode, cwd, effort);
+				const checked = validateDispatch(agent, mode, cwd, effort, slotWorktree?.path ?? cwd);
 				if (!checked.ok) {
+					meter.recordRefused(checked.reason);
 					slots.push({ index, agent, reason: checked.reason, mode, cwd });
 					continue;
+				}
+
+				if (slotWorktree) {
+					const created = await createTaskWorktree(slotWorktree);
+					if (!created.ok) {
+						meter.recordRefused("isolate-worktree-failed");
+						slots.push({ index, agent, reason: created.reason, mode, cwd });
+						continue;
+					}
+					slotCwd = slotWorktree.path;
 				}
 
 				// Same dispatch path as external_agent_start — persistent session
 				// driver when the adapter has one, one-shot process otherwise. notify
 				// is off because this receipt is the notification (see
 				// rearmCompareNotifications for the timeout case).
-				const task = startTask(agent, taskText, cwd, mode, "off", DEFAULT_WATCHDOG_MS, model, effort);
+				const slotTask = typeof spec.task === "string" && spec.task ? spec.task : taskText;
+				const task = startTask(
+					agent,
+					templateBody ? applyTemplate(templateBody, slotTask) : slotTask,
+					slotCwd,
+					mode,
+					"off",
+					DEFAULT_WATCHDOG_MS,
+					model,
+					effort,
+					{ ...extras, taskId: preallocatedId, worktree: slotWorktree },
+				);
+				if (boardFile) task.boardFile = boardFile;
 				slots.push({ index, agent, task, mode, cwd });
 			}
 
@@ -2068,10 +3072,18 @@ export default function (pi: ExtensionAPI) {
 				timedOut = outcome.timedOut;
 				aborted = outcome.aborted;
 				if (timedOut || aborted) rearmCompareNotifications(dispatched);
+				// Settle finalize (archive/verify) is async; the report must see its results.
+				await Promise.all(dispatched.map((slot) => slot.task.finalizePromise));
 			}
 
+			const digest = boardDigest(slots, boardFile);
 			return {
-				content: [{ type: "text", text: compareReport(slots, timedOut, aborted, timeoutS) }],
+				content: [
+					{
+						type: "text",
+						text: [compareReport(slots, timedOut, aborted, timeoutS), digest].filter(Boolean).join("\n"),
+					},
+				],
 				details: { kind: "external-agent-compare", timedOut, aborted, results: compareResults(slots) },
 			};
 		},
@@ -2112,10 +3124,9 @@ export default function (pi: ExtensionAPI) {
 		label: "External Agent Steer",
 		description: [
 			"Send a mid-run guidance message to a running external agent task: correct the approach, narrow the scope,",
-			"add a constraint, or tell it to wrap up early (to cancel it instead, use external_agent_stop). Supported:",
-			`${STEER_AGENTS}; the others are one-shot and cannot be steered. Qoder steering requires the announced qodercli stable`,
-			"version >= 1.1.49 and is refused with the reported version otherwise. For a settled task, use",
-			"external_agent_follow_up.",
+			"add a constraint, or tell it to wrap up early (to cancel instead, use external_agent_stop). Supported:",
+			`${STEER_AGENTS}; the others are one-shot. Qoder steering requires qodercli stable >= 1.1.49 and is refused`,
+			"with the reported version otherwise. For a settled task, use external_agent_follow_up.",
 		].join(" "),
 		promptSnippet: "Redirect a running external agent task mid-run",
 		promptGuidelines: [
@@ -2175,17 +3186,24 @@ export default function (pi: ExtensionAPI) {
 		label: "External Agent Follow Up",
 		description: [
 			"Continue a settled external agent task with another message in the SAME session: it still has everything",
-			"it did and learned, so you need not restate the task. It goes back to running and notifies you again when",
-			`the new turn settles. Supported: ${FOLLOWUP_AGENTS}. Reclaimed after 30 minutes idle; a follow-up is then refused, so`,
-			"dispatch a new task instead.",
+			"it did and learned, so you need not restate the task. It runs again and notifies you when the new turn",
+			`settles. Supported: ${FOLLOWUP_AGENTS}. Reclaimed after 30 minutes idle; a follow-up is then refused — dispatch a new`,
+			"task instead.",
 		].join(" "),
 		promptSnippet: "Ask a follow-up in the same external agent session",
 		parameters: Type.Object({
 			taskId: Type.String({ description: "Task id from external_agent_start." }),
-			message: Type.String({ description: "Follow-up message for the same session." }),
+			message: Type.String({ description: "Follow-up text; ignored for a relay." }),
+			fromTaskId: Type.Optional(Type.String({ description: "Relay source task; its answer is the body." })),
+			purpose: Type.Optional(StringEnum(["reproduce", "combine", "challenge"] as const, { description: "Relay intent." })),
+			offset: Type.Optional(Type.Number({ description: "Start byte in the source answer." })),
+			length: Type.Optional(Type.Number({ description: "Excerpt bytes (default 4000, max 16000)." })),
 		}),
 
-		async execute(_id, params): Promise<AgentToolResult<ExternalAgentFollowUpDetails>> {
+		async execute(_id, params): Promise<AgentToolResult<ExternalAgentFollowUpDetails | ExternalAgentRelayDetails>> {
+			// A relay composes its own message from another task's answer, so it takes
+			// a different channel decision and never falls through to the plain path.
+			if (params.fromTaskId != null) return await relayAnswerToTask(params as Record<string, unknown>);
 			const guard = requireCapableTask(params.taskId, "followUp");
 			if ("error" in guard) {
 				return { content: [{ type: "text", text: guard.error }], details: { continued: false } };
@@ -2237,16 +3255,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			// A new turn starts: report it, and scope the answer to it.
-			task.answerStartIndex = task.events.length;
-			task.state = "running";
-			task.endedAt = undefined;
-			task.notified = false;
-			task.exitCode = null;
-			task.spawnError = undefined;
-			task.lastEventAt = Date.now();
-			task.watchdogNotices = 0;
-			clearIdleReap(task);
+			beginFollowUpTurn(task);
 			pushEvent(task, { kind: "tool", text: `follow-up: ${params.message}`.slice(0, 200) });
 
 			return {
@@ -2267,9 +3276,10 @@ export default function (pi: ExtensionAPI) {
 
 		renderCall(args, theme, _context) {
 			const taskId = typeof args.taskId === "string" ? escapeTerminalControls(args.taskId) : "?";
-			const preview = typeof args.message === "string" ? taskPromptPreview(args.message, 60) : "";
+			const from = typeof args.fromTaskId === "string" ? escapeTerminalControls(args.fromTaskId) : undefined;
+			const preview = from ? `${from}→${taskId}` : `${taskId} · ${typeof args.message === "string" ? taskPromptPreview(args.message, 60) : ""}`;
 			return new Text(
-				theme.fg("toolTitle", theme.bold("external-agent follow-up ")) + theme.fg("accent", `${taskId} · ${preview}`),
+				theme.fg("toolTitle", theme.bold(from ? "external-agent relay " : "external-agent follow-up ")) + theme.fg("accent", preview),
 				0,
 				0,
 			);
@@ -2320,6 +3330,16 @@ export default function (pi: ExtensionAPI) {
 				content: [{ type: "text", text: ok ? `Stopped ${task.id}.` : `${task.id} was not running (${task.state}).` }],
 				details: { taskId: task.id, state: task.state } as ExternalAgentStopDetails,
 			};
+		},
+	});
+
+	// Settle-time verify runs through pi.exec; absent in stubbed hosts (tests).
+	finalizeHooks.exec = typeof pi.exec === "function" ? pi.exec.bind(pi) : undefined;
+
+	pi.registerCommand?.("external_agent_stats", {
+		description: "External-agent usage counters (CLI-reported; not billing).",
+		handler: async (_args, ctx) => {
+			ctx.ui?.notify?.(formatMeterSnapshot(meter.snapshot()), "info");
 		},
 	});
 
