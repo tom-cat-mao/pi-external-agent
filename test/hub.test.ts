@@ -320,22 +320,19 @@ test("hub: old or unknown Qoder versions report steering unavailable without sen
 	}
 });
 
-test("hub: one-shot task follow-up is refused", async () => {
+
+test("hub: claude follow-up works over persistent session", async () => {
+	// claude upgraded to yolo default with stream-json persistence like codebuddy
 	const dir = makeFixtureDir({ claude: CLAUDE_ONESHOT_MOCK });
 	const restorePath = usePath(dir);
 	try {
 		const started = await call("external_agent_start", { agent: "claude", task: "x", mode: "readonly", cwd: dir, notify: "off" });
-		assert.equal(started.details.task.transport, "oneshot");
-		const taskId = started.details.task.taskId;
-		const followed = await call("external_agent_follow_up", { taskId, message: "y" });
-		assert.equal(followed.details.continued, false);
-		assert.match(followed.content[0].text, /runs as a one-shot process/i);
+		assert.equal(started.details.task.transport, "persistent");
 	} finally {
 		await call("external_agent_stop", { all: true });
 		restorePath();
 	}
 });
-
 test("hub: stop terminates a running qoder task", async () => {
 	const dir = makeFixtureDir({ qodercli: QODER_HUB_MOCK });
 	const restorePath = usePath(dir);
