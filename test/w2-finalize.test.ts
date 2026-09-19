@@ -52,8 +52,38 @@ hub.default({
 });
 afterEach(() => lifecycle.get("session_shutdown")!({ reason: "quit" }));
 
-const PI_READONLY_MOCK = `#!/usr/bin/env node
-process.exit(0);`;
+/**
+ * claude is driven over the stream-json session channel, so the fixture speaks
+ * that protocol: system/init + answered initialize, then one result record per
+ * user message. The answer text comes from CLAUDE_MOCK_ANSWER_FILE; the usage
+ * and cost fields feed the meter counters the stats command reports.
+ */
+const CLAUDE_SESSION_MOCK = `#!/usr/bin/env node
+const fs = require("node:fs");
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+send({ type: "system", subtype: "init", session_id: "sess-1", model: "mock", permissionMode: "bypassPermissions", tools: [] });
+const answer = process.env.CLAUDE_MOCK_ANSWER_FILE ? fs.readFileSync(process.env.CLAUDE_MOCK_ANSWER_FILE, "utf8") : "CLAUDE_OK";
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+	buffer += chunk;
+	const lines = buffer.split("\\n");
+	buffer = lines.pop();
+	for (const line of lines) {
+		if (!line.trim()) continue;
+		let msg;
+		try { msg = JSON.parse(line); } catch { continue; }
+		if (msg.type === "control_request") {
+			send({ type: "control_response", response: { subtype: "success", request_id: msg.request_id, response: {} } });
+			continue;
+		}
+		if (msg.type === "user" && msg.shouldQuery !== false) {
+			send({ type: "result", subtype: "success", is_error: false, result: answer,
+				usage: { input_tokens: 12, output_tokens: 5 }, total_cost_usd: 0.01 });
+		}
+	}
+});
+`;
 
 function makeFixtureDir(files: Record<string, string>): string {
 	const dir = mkdtempSync(path.join(tmpdir(), "w2-fixture-"));
@@ -101,7 +131,7 @@ function longAnswer(): string {
 
 test("w2: long answer is archived; status shows the handle; offset pages reconstruct it", async () => {
 	const answer = longAnswer();
-	const dir = makeFixtureDir({ pi: PI_READONLY_MOCK });
+	const dir = makeFixtureDir({ claude: CLAUDE_SESSION_MOCK });
 	const answerFile = path.join(dir, "answer.txt");
 	writeFileSync(answerFile, answer);
 	const restore = withEnv({
@@ -109,7 +139,7 @@ test("w2: long answer is archived; status shows the handle; offset pages reconst
 		CLAUDE_MOCK_ANSWER_FILE: answerFile,
 	});
 	try {
-		const start = await call("external_agent_start", { agent: "pi", task: "research it", mode: "readonly", cwd: dir, notify: "off" });
+		const start = await call("external_agent_start", { agent: "claude", task: "research it", mode: "readonly", cwd: dir, notify: "off" });
 		const taskId = start.details.task.taskId;
 		const waited = await call("external_agent_wait", { taskIds: [taskId], timeout: 20 });
 		const text = resultText(waited);
@@ -137,10 +167,10 @@ test("w2: long answer is archived; status shows the handle; offset pages reconst
 });
 
 test("w2: short answer stays inline (no archive handle)", async () => {
-	const dir = makeFixtureDir({ pi: PI_READONLY_MOCK });
+	const dir = makeFixtureDir({ claude: CLAUDE_SESSION_MOCK });
 	const restore = withEnv({ PATH: `${dir}${path.delimiter}${process.env.PATH ?? ""}` });
 	try {
-		const start = await call("external_agent_start", { agent: "pi", task: "tiny", mode: "readonly", cwd: dir, notify: "off" });
+		const start = await call("external_agent_start", { agent: "claude", task: "tiny", mode: "readonly", cwd: dir, notify: "off" });
 		const waited = await call("external_agent_wait", { taskIds: [start.details.task.taskId], timeout: 20 });
 		const text = resultText(waited);
 		assert.match(text, /CLAUDE_OK/);
@@ -152,11 +182,11 @@ test("w2: short answer stays inline (no archive handle)", async () => {
 
 test("w2: caller verify command runs through pi.exec and lands in status", async () => {
 	execCalls.length = 0;
-	const dir = makeFixtureDir({ pi: PI_READONLY_MOCK });
+	const dir = makeFixtureDir({ claude: CLAUDE_SESSION_MOCK });
 	const restore = withEnv({ PATH: `${dir}${path.delimiter}${process.env.PATH ?? ""}` });
 	try {
 		const start = await call("external_agent_start", {
-			agent: "pi",
+			agent: "claude",
 			task: "change it",
 			mode: "readonly",
 			cwd: dir,
@@ -178,7 +208,7 @@ test("w2: caller verify command runs through pi.exec and lands in status", async
 test("w2: worker-declared verify command is not executed for readonly tasks", async () => {
 	execCalls.length = 0;
 	const answer = `## Summary\ndone\n\n## Suggested verify command\n\`\`\`bash\nnpm test\n\`\`\`\n`;
-	const dir = makeFixtureDir({ pi: PI_READONLY_MOCK });
+	const dir = makeFixtureDir({ claude: CLAUDE_SESSION_MOCK });
 	const answerFile = path.join(dir, "answer.txt");
 	writeFileSync(answerFile, answer);
 	const restore = withEnv({
@@ -186,7 +216,7 @@ test("w2: worker-declared verify command is not executed for readonly tasks", as
 		CLAUDE_MOCK_ANSWER_FILE: answerFile,
 	});
 	try {
-		const start = await call("external_agent_start", { agent: "pi", task: "look", mode: "readonly", cwd: dir, notify: "off" });
+		const start = await call("external_agent_start", { agent: "claude", task: "look", mode: "readonly", cwd: dir, notify: "off" });
 		const taskId = start.details.task.taskId;
 		await call("external_agent_wait", { taskIds: [taskId], timeout: 20 });
 		const status = await call("external_agent_status", { taskId });
@@ -198,11 +228,11 @@ test("w2: worker-declared verify command is not executed for readonly tasks", as
 });
 
 test("w2: template param wraps the task and lands on the dispatch receipt", async () => {
-	const dir = makeFixtureDir({ pi: PI_READONLY_MOCK });
+	const dir = makeFixtureDir({ claude: CLAUDE_SESSION_MOCK });
 	const restore = withEnv({ PATH: `${dir}${path.delimiter}${process.env.PATH ?? ""}` });
 	try {
 		const start = await call("external_agent_start", {
-			agent: "pi",
+			agent: "claude",
 			task: "MY_TASK_BODY",
 			mode: "readonly",
 			cwd: dir,
@@ -220,11 +250,11 @@ test("w2: template param wraps the task and lands on the dispatch receipt", asyn
 });
 
 test("w2: unknown template refuses the dispatch", async () => {
-	const dir = makeFixtureDir({ pi: PI_READONLY_MOCK });
+	const dir = makeFixtureDir({ claude: CLAUDE_SESSION_MOCK });
 	const restore = withEnv({ PATH: `${dir}${path.delimiter}${process.env.PATH ?? ""}` });
 	try {
 		const result = await call("external_agent_start", {
-			agent: "pi",
+			agent: "claude",
 			task: "x",
 			mode: "readonly",
 			cwd: dir,
@@ -239,10 +269,10 @@ test("w2: unknown template refuses the dispatch", async () => {
 });
 
 test("w2: /external_agent_stats dumps meter counters", async () => {
-	const dir = makeFixtureDir({ pi: PI_READONLY_MOCK });
+	const dir = makeFixtureDir({ claude: CLAUDE_SESSION_MOCK });
 	const restore = withEnv({ PATH: `${dir}${path.delimiter}${process.env.PATH ?? ""}` });
 	try {
-		await call("external_agent_start", { agent: "pi", task: "meter me", mode: "readonly", cwd: dir, notify: "off" });
+		await call("external_agent_start", { agent: "claude", task: "meter me", mode: "readonly", cwd: dir, notify: "off" });
 		const command = commands.get("external_agent_stats");
 		assert.ok(command, "external_agent_stats command registered");
 		let shown = "";
@@ -256,14 +286,14 @@ test("w2: /external_agent_stats dumps meter counters", async () => {
 });
 
 test("w2: compare honors a per-slot task override", async () => {
-	const dir = makeFixtureDir({ pi: PI_READONLY_MOCK });
+	const dir = makeFixtureDir({ claude: CLAUDE_SESSION_MOCK });
 	const restore = withEnv({ PATH: `${dir}${path.delimiter}${process.env.PATH ?? ""}` });
 	try {
 		const result = await call("external_agent_compare", {
 			task: "SHARED_TASK",
 			agents: [
-				{ agent: "pi", cwd: dir, mode: "readonly" },
-				{ agent: "pi", cwd: dir, mode: "readonly", task: "SLOT_TASK" },
+				{ agent: "claude", cwd: dir, mode: "readonly" },
+				{ agent: "claude", cwd: dir, mode: "readonly", task: "SLOT_TASK" },
 			],
 			timeout: 30,
 		});

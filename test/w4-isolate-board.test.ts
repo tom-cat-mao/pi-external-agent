@@ -104,21 +104,62 @@ function withEnv(values: Record<string, string>): () => void {
 	};
 }
 
+/**
+ * claude is driven over the stream-json session channel: system/init + answered
+ * initialize, then one result record per user message. Both fixtures below take
+ * the task out of that user message — the argv no longer carries it.
+ */
+const CLAUDE_SESSION_PREAMBLE = `const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+send({ type: "system", subtype: "init", session_id: "sess-1", model: "mock", permissionMode: "bypassPermissions", tools: [] });
+let buffer = "";
+process.stdin.setEncoding("utf8");
+function handle(msg) {
+	if (msg.type === "control_request") {
+		send({ type: "control_response", response: { subtype: "success", request_id: msg.request_id, response: {} } });
+		return;
+	}
+	if (msg.type !== "user" || msg.shouldQuery === false) return;
+	const task = (msg.message && Array.isArray(msg.message.content) ? msg.message.content : [])
+		.map(function (block) { return block.text || ""; }).join("");
+`;
+
 const CLAUDE_WRITE_MOCK = `#!/usr/bin/env node
 const fs = require("node:fs");
 if (process.env.CLAUDE_MOCK_LOG_FILE) fs.appendFileSync(process.env.CLAUDE_MOCK_LOG_FILE, JSON.stringify({ cwd: process.cwd() }) + "\\n");
 fs.writeFileSync("ISOLATED.txt", "worker output\\n");
-process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: "ISOLATED_OK",
-  usage: { input_tokens: 1, output_tokens: 1 } }) + "\\n");
+${CLAUDE_SESSION_PREAMBLE}	send({ type: "result", subtype: "success", is_error: false, result: "ISOLATED_OK",
+		usage: { input_tokens: 1, output_tokens: 1 } });
+}
+process.stdin.on("data", function (chunk) {
+	buffer += chunk;
+	const lines = buffer.split("\\n");
+	buffer = lines.pop();
+	for (const line of lines) {
+		if (!line.trim()) continue;
+		let msg;
+		try { msg = JSON.parse(line); } catch { continue; }
+		handle(msg);
+	}
+});
 `;
 
-/** Reads the task out of claude's `-p <task>` argv and answers with a structured claim. */
+/** Answers with a structured claim built from the task the session was sent. */
 const CLAUDE_ECHO_MOCK = `#!/usr/bin/env node
-const at = process.argv.indexOf("-p");
-const task = at === -1 ? "" : (process.argv[at + 1] || "");
-const answer = "## Summary\\nclaim " + task + "\\n\\n## Details\\nsee src/index.ts:4 for " + task + "\\n";
-process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false, result: answer,
-  usage: { input_tokens: 3, output_tokens: 4 } }) + "\\n");
+${CLAUDE_SESSION_PREAMBLE}	const answer = "## Summary\\nclaim " + task + "\\n\\n## Details\\nsee src/index.ts:4 for " + task + "\\n";
+	send({ type: "result", subtype: "success", is_error: false, result: answer,
+		usage: { input_tokens: 3, output_tokens: 4 } });
+}
+process.stdin.on("data", function (chunk) {
+	buffer += chunk;
+	const lines = buffer.split("\\n");
+	buffer = lines.pop();
+	for (const line of lines) {
+		if (!line.trim()) continue;
+		let msg;
+		try { msg = JSON.parse(line); } catch { continue; }
+		handle(msg);
+	}
+});
 `;
 
 /** The exact answer text the echo mock produces for one task, after trim. */
@@ -175,7 +216,7 @@ test("w4: isolate runs the worker in its own worktree and leaves the main checko
 	const restore = withEnv({ PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`, CLAUDE_MOCK_LOG_FILE: logFile });
 	try {
 		const started = await call("external_agent_start", {
-			agent: "pi",
+			agent: "claude",
 			task: "write ISOLATED.txt",
 			mode: "write",
 			cwd: repo,
@@ -220,7 +261,7 @@ test("w4: isolate runs the worker in its own worktree and leaves the main checko
 
 		// …and stays idempotent across later isolated dispatches.
 		const again = await call("external_agent_start", {
-			agent: "pi",
+			agent: "claude",
 			task: "write AGAIN.txt",
 			mode: "write",
 			cwd: repo,
@@ -238,7 +279,7 @@ test("w4: isolate refuses a cwd that is not a git repository without leaving any
 	const restore = withEnv({ PATH: `${dir}${path.delimiter}${process.env.PATH ?? ""}` });
 	try {
 		const result = await call("external_agent_start", {
-			agent: "pi",
+			agent: "claude",
 			task: "write ISOLATED.txt",
 			mode: "write",
 			cwd: dir,
@@ -263,8 +304,8 @@ test("w4: compare with isolate gives every slot its own worktree, so same-repo w
 		const result = await call("external_agent_compare", {
 			task: "SHARED",
 			agents: [
-				{ agent: "pi", cwd: repo, mode: "write", task: "ALPHA_TASK" },
-				{ agent: "pi", cwd: repo, mode: "write", task: "BETA_TASK" },
+				{ agent: "claude", cwd: repo, mode: "write", task: "ALPHA_TASK" },
+				{ agent: "claude", cwd: repo, mode: "write", task: "BETA_TASK" },
 			],
 			isolate: true,
 			board: "",
@@ -301,7 +342,7 @@ test("w4: the retained-worktree line folds past five and lists the oldest first"
 	const restore = withEnv({ PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}` });
 	try {
 		const started = await call("external_agent_start", {
-			agent: "pi",
+			agent: "claude",
 			task: "write",
 			mode: "write",
 			cwd: repo,
@@ -329,7 +370,7 @@ test("w4: a failed worktree add refuses the dispatch and never touches an alread
 	const restore = withEnv({ PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}` });
 	try {
 		const result = await call("external_agent_start", {
-			agent: "pi",
+			agent: "claude",
 			task: "write",
 			mode: "write",
 			cwd: repo,
@@ -358,9 +399,9 @@ test("w4: compare appends one board row per settled slot and reports the digest"
 		const result = await call("external_agent_compare", {
 			task: "SHARED",
 			agents: [
-				{ agent: "pi", cwd: dir, mode: "readonly", task: "ALPHA_TASK" },
+				{ agent: "claude", cwd: dir, mode: "readonly", task: "ALPHA_TASK" },
 				{ agent: "kimi", cwd: dir, mode: "readonly" },
-				{ agent: "pi", cwd: dir, mode: "readonly", task: "BETA_TASK" },
+				{ agent: "claude", cwd: dir, mode: "readonly", task: "BETA_TASK" },
 			],
 			timeout: 30,
 		});
@@ -406,8 +447,8 @@ test("w4: board \"\" disables the board without touching the compare result", as
 		const result = await call("external_agent_compare", {
 			task: "SHARED",
 			agents: [
-				{ agent: "pi", cwd: dir, mode: "readonly", task: "ALPHA_TASK" },
-				{ agent: "pi", cwd: dir, mode: "readonly", task: "BETA_TASK" },
+				{ agent: "claude", cwd: dir, mode: "readonly", task: "ALPHA_TASK" },
+				{ agent: "claude", cwd: dir, mode: "readonly", task: "BETA_TASK" },
 			],
 			board: "",
 			timeout: 30,
@@ -431,8 +472,8 @@ test("w4: a board write failure is reported as unavailable and never fails the c
 		const result = await call("external_agent_compare", {
 			task: "SHARED",
 			agents: [
-				{ agent: "pi", cwd: dir, mode: "readonly", task: "ALPHA_TASK" },
-				{ agent: "pi", cwd: dir, mode: "readonly", task: "BETA_TASK" },
+				{ agent: "claude", cwd: dir, mode: "readonly", task: "ALPHA_TASK" },
+				{ agent: "claude", cwd: dir, mode: "readonly", task: "BETA_TASK" },
 			],
 			board: path.join(blocker, "board.jsonl"),
 			timeout: 30,

@@ -125,23 +125,41 @@ async function stillPending<T>(promise: Promise<T>, ms: number): Promise<boolean
 }
 
 /**
- * The gate is the task text: the mock blocks until a file of that name exists,
- * so the test — not the scheduler — decides when the task settles.
+ * The gate is the task text: the mock holds the turn open until a file of that
+ * name exists, so the test — not the scheduler — decides when the task settles.
+ * claude is driven over the stream-json session channel, so the fixture answers
+ * the initialize control request and takes the gate out of the user message.
  */
 const GATED_CLAUDE_MOCK = `#!/usr/bin/env node
 const fs = require("node:fs");
-const at = process.argv.indexOf("-p");
-const gate = at === -1 ? "" : (process.argv[at + 1] || "");
-if (gate) {
-  const started = Date.now();
-  while (!fs.existsSync(gate)) {
-    if (Date.now() - started > 60000) process.exit(3);
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
-  }
-}
-process.stdout.write(JSON.stringify({ type: "result", subtype: "success", is_error: false,
-  result: process.env.WAIT_MOCK_ANSWER || "WAIT_OK", usage: { input_tokens: 1, output_tokens: 1 } }) + "\\n");
-process.exit(0);
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+send({ type: "system", subtype: "init", session_id: "sess-1", model: "mock", permissionMode: "bypassPermissions", tools: [] });
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+	buffer += chunk;
+	const lines = buffer.split("\\n");
+	buffer = lines.pop();
+	for (const line of lines) {
+		if (!line.trim()) continue;
+		let msg;
+		try { msg = JSON.parse(line); } catch { continue; }
+		if (msg.type === "control_request") {
+			send({ type: "control_response", response: { subtype: "success", request_id: msg.request_id, response: {} } });
+			continue;
+		}
+		if (msg.type !== "user" || msg.shouldQuery === false) continue;
+		const gate = (msg.message && Array.isArray(msg.message.content) ? msg.message.content : [])
+			.map(function (block) { return block.text || ""; }).join("");
+		const started = Date.now();
+		while (gate && !fs.existsSync(gate)) {
+			if (Date.now() - started > 60000) process.exit(3);
+			Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+		}
+		send({ type: "result", subtype: "success", is_error: false,
+			result: process.env.WAIT_MOCK_ANSWER || "WAIT_OK", usage: { input_tokens: 1, output_tokens: 1 } });
+	}
+});
 `;
 
 /**

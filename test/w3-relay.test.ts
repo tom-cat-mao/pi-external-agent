@@ -145,8 +145,45 @@ process.stdin.on("data", (chunk) => {
 });
 `;
 
-const PI_READONLY_MOCK = `#!/usr/bin/env node
-process.exit(0);`;
+/**
+ * claude is driven over the stream-json session channel, so the fixture speaks
+ * that protocol: system/init + answered initialize, then one result record per
+ * user message. The relay source only needs a settled answer, so the text comes
+ * from CLAUDE_MOCK_ANSWER_FILE.
+ */
+const CLAUDE_SESSION_MOCK = `#!/usr/bin/env node
+const fs = require("node:fs");
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+send({ type: "system", subtype: "init", session_id: "sess-1", model: "mock", permissionMode: "bypassPermissions", tools: [] });
+const answer = process.env.CLAUDE_MOCK_ANSWER_FILE ? fs.readFileSync(process.env.CLAUDE_MOCK_ANSWER_FILE, "utf8") : "CLAUDE_OK";
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+	buffer += chunk;
+	const lines = buffer.split("\\n");
+	buffer = lines.pop();
+	for (const line of lines) {
+		if (!line.trim()) continue;
+		let msg;
+		try { msg = JSON.parse(line); } catch { continue; }
+		if (msg.type === "control_request") {
+			send({ type: "control_response", response: { subtype: "success", request_id: msg.request_id, response: {} } });
+			continue;
+		}
+		if (msg.type === "user" && msg.shouldQuery !== false) {
+			send({ type: "result", subtype: "success", is_error: false, result: answer,
+				usage: { input_tokens: 12, output_tokens: 5 }, total_cost_usd: 0.01 });
+		}
+	}
+});
+`;
+
+/** kimi is the one-shot arm: `-p <task>` on argv, one chat record, then exit. */
+const KIMI_ONESHOT_MOCK = `#!/usr/bin/env node
+const fs = require("node:fs");
+const answer = process.env.KIMI_MOCK_ANSWER_FILE ? fs.readFileSync(process.env.KIMI_MOCK_ANSWER_FILE, "utf8") : "KIMI_OK";
+process.stdout.write(JSON.stringify({ role: "assistant", content: answer }) + "\\n", function () { process.exit(0); });
+`;
 
 function makeFixtureDir(files: Record<string, string>): string {
 	const dir = mkdtempSync(path.join(tmpdir(), "w3-fixture-"));
@@ -245,7 +282,7 @@ function envelopeBody(text: string): string {
 
 test("w3: relay injects the source answer into a running session as an envelope", async () => {
 	sessionDir = mkdtempSync(path.join(tmpdir(), "w3-session-"));
-	const dir = makeFixtureDir({ claude: CLAUDE_MOCK, qodercli: QODER_HUB_MOCK });
+	const dir = makeFixtureDir({ claude: CLAUDE_SESSION_MOCK, qodercli: QODER_HUB_MOCK });
 	const answerFile = path.join(dir, "answer.txt");
 	writeFileSync(answerFile, workerAnswer("ALPHA"));
 	const logFile = path.join(dir, "log.jsonl");
@@ -256,7 +293,7 @@ test("w3: relay injects the source answer into a running session as an envelope"
 		QODER_MOCK_SCENARIO: JSON.stringify({ turns: [{ hold: true }] }),
 	});
 	try {
-		const source = await call("external_agent_start", { agent: "pi", task: "dig in", mode: "readonly", cwd: dir, notify: "off" });
+		const source = await call("external_agent_start", { agent: "claude", task: "dig in", mode: "readonly", cwd: dir, notify: "off" });
 		const sourceId = source.details.task.taskId;
 		await settleTask(sourceId);
 		const targetId = await startQoder(dir);
@@ -304,7 +341,7 @@ test("w3: relay injects the source answer into a running session as an envelope"
 
 test("w3: the receipt hash matches the bytes that arrived, and offset/length choose the window", async () => {
 	sessionDir = mkdtempSync(path.join(tmpdir(), "w3-session-"));
-	const dir = makeFixtureDir({ claude: CLAUDE_MOCK, qodercli: QODER_HUB_MOCK });
+	const dir = makeFixtureDir({ claude: CLAUDE_SESSION_MOCK, qodercli: QODER_HUB_MOCK });
 	const answerFile = path.join(dir, "answer.txt");
 	writeFileSync(answerFile, workerAnswer("BETA"));
 	const logFile = path.join(dir, "log.jsonl");
@@ -315,7 +352,7 @@ test("w3: the receipt hash matches the bytes that arrived, and offset/length cho
 		QODER_MOCK_SCENARIO: JSON.stringify({ turns: [{ hold: true }] }),
 	});
 	try {
-		const source = await call("external_agent_start", { agent: "pi", task: "dig in", mode: "readonly", cwd: dir, notify: "off" });
+		const source = await call("external_agent_start", { agent: "claude", task: "dig in", mode: "readonly", cwd: dir, notify: "off" });
 		const sourceId = source.details.task.taskId;
 		await settleTask(sourceId);
 		const targetId = await startQoder(dir);
@@ -345,7 +382,7 @@ test("w3: the receipt hash matches the bytes that arrived, and offset/length cho
 
 test("w3: a third hop is refused instead of the workers negotiating among themselves", async () => {
 	sessionDir = mkdtempSync(path.join(tmpdir(), "w3-session-"));
-	const dir = makeFixtureDir({ claude: CLAUDE_MOCK, qodercli: QODER_HUB_MOCK });
+	const dir = makeFixtureDir({ claude: CLAUDE_SESSION_MOCK, qodercli: QODER_HUB_MOCK });
 	const answerFile = path.join(dir, "answer.txt");
 	writeFileSync(answerFile, "ONE_SHOT_SOURCE_ANSWER");
 	const restore = withEnv({
@@ -354,7 +391,7 @@ test("w3: a third hop is refused instead of the workers negotiating among themse
 		QODER_MOCK_SCENARIO: JSON.stringify({ turns: [{ answer: "TURN-1" }, { answer: "TURN-2" }] }),
 	});
 	try {
-		const source = await call("external_agent_start", { agent: "pi", task: "dig in", mode: "readonly", cwd: dir, notify: "off" });
+		const source = await call("external_agent_start", { agent: "claude", task: "dig in", mode: "readonly", cwd: dir, notify: "off" });
 		const sourceId = source.details.task.taskId;
 		await settleTask(sourceId);
 		const firstId = await startQoder(dir);
@@ -386,17 +423,17 @@ test("w3: a third hop is refused instead of the workers negotiating among themse
 
 test("w3: relay refuses a one-shot target and a dead session rather than degrading to a new task", async () => {
 	sessionDir = mkdtempSync(path.join(tmpdir(), "w3-session-"));
-	const dir = makeFixtureDir({ claude: CLAUDE_MOCK, qodercli: QODER_EXIT_MOCK });
+	const dir = makeFixtureDir({ kimi: KIMI_ONESHOT_MOCK, qodercli: QODER_EXIT_MOCK });
 	const answerFile = path.join(dir, "answer.txt");
 	writeFileSync(answerFile, "RELAY_THIS_BODY");
-	const restore = withEnv({ PATH: `${dir}${path.delimiter}${process.env.PATH ?? ""}`, CLAUDE_MOCK_ANSWER_FILE: answerFile });
+	const restore = withEnv({ PATH: `${dir}${path.delimiter}${process.env.PATH ?? ""}`, KIMI_MOCK_ANSWER_FILE: answerFile });
 	try {
-		const source = await call("external_agent_start", { agent: "pi", task: "dig in", mode: "readonly", cwd: dir, notify: "off" });
+		const source = await call("external_agent_start", { agent: "kimi", task: "dig in", mode: "yolo", cwd: dir, notify: "off" });
 		const sourceId = source.details.task.taskId;
 		await settleTask(sourceId);
 
 		const oneShotId = (
-			await call("external_agent_start", { agent: "pi", task: "target", mode: "readonly", cwd: dir, notify: "off" })
+			await call("external_agent_start", { agent: "kimi", task: "target", mode: "yolo", cwd: dir, notify: "off" })
 		).details.task.taskId;
 		await settleTask(oneShotId);
 		const refusedOneshot = await call("external_agent_follow_up", { taskId: oneShotId, message: "", fromTaskId: sourceId });
@@ -487,7 +524,7 @@ test("w3: a plain follow-up still sends the caller's message verbatim and report
 
 test("w3: an unarchived answer is selected by bytes, on character boundaries", async () => {
 	sessionDir = mkdtempSync(path.join(tmpdir(), "w3-session-"));
-	const dir = makeFixtureDir({ claude: CLAUDE_MOCK, qodercli: QODER_HUB_MOCK });
+	const dir = makeFixtureDir({ claude: CLAUDE_SESSION_MOCK, qodercli: QODER_HUB_MOCK });
 	const answerFile = path.join(dir, "answer.txt");
 	const answer = `αααββγ ${"inline note about src/index.ts:4 holds ".repeat(6)}`;
 	writeFileSync(answerFile, answer);
@@ -499,7 +536,7 @@ test("w3: an unarchived answer is selected by bytes, on character boundaries", a
 		QODER_MOCK_SCENARIO: JSON.stringify({ turns: [{ hold: true }] }),
 	});
 	try {
-		const source = await call("external_agent_start", { agent: "pi", task: "look", mode: "readonly", cwd: dir, notify: "off" });
+		const source = await call("external_agent_start", { agent: "claude", task: "look", mode: "readonly", cwd: dir, notify: "off" });
 		const sourceId = source.details.task.taskId;
 		await settleTask(sourceId);
 		assert.doesNotMatch(resultText(await call("external_agent_status", { taskId: sourceId })), /answer archived:/, "kept inline");

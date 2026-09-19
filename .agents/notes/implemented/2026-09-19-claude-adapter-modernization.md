@@ -14,7 +14,7 @@ Upgrade claude to first-class citizen status:
 1. **Adapter (`adapters.ts`)**
    - Permission tiers: readonly → write → **yolo** (`bypassPermissions`)
    - Effort levels: `low|medium|high|xhigh|max` (pi domain mapping; no ultracode)
-   - Output format: `stream-json` (one-shot) for parity with qoter/codebuddy
+   - Output format: `stream-json`, driven as a persistent session for parity with qoder/codebuddy
    - Session capability: steer + follow-up enabled
 
 2. **Driver (`sessions.ts`)**
@@ -47,6 +47,11 @@ Upgrade claude to first-class citizen status:
 - Unverified against real claude binary (endpoint configuration pending); tests are fixture-based only
 - Must be regression-tested once endpoint is configured
 - Effort mapping excludes `ultracode`; ensure this matches intended scope
+
+**Coverage loss (accepted)**:
+- One-shot + readonly no longer exists as a combination. Every readonly-capable adapter is driven over a session (`claude`, `codebuddy`, `codex`, `pi`, `qoder`, `reasonix`), and `kimi` — the only one-shot adapter left — is yolo-only by its own CLI contract.
+- The fixtures that needed one-shot transport moved to `kimi` (yolo), and the ones that needed readonly moved to the claude session mock. Where a single batch needed both, the readonly slot now carries the mode that keeps two writers out of one directory.
+- Consequence for tests: the "spawn a readonly one-shot argv" path is no longer covered by compare/w2/w3/w4/wait-*; readonly argv construction stays covered by the adapter unit tests (`test/readonly.test.ts`, `test/claude.test.ts`).
 
 **Verification checklist when endpoint is ready**:
 - [ ] Dispatch read/write/yolo modes successfully
