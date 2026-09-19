@@ -145,10 +145,22 @@ function resultText(result: any): string {
 	return (result.content as Array<{ text: string }>).map((block) => block.text).join("\n");
 }
 
-async function settleTask(taskId: string): Promise<any> {
-	const waited = await call("external_agent_wait", { taskIds: [taskId], timeout: 20 });
-	assert.notEqual(waited.details.tasks[0].state, "running", `${taskId} was still running after 20s`);
-	return waited;
+/**
+ * Blocks until the task settled and its settle-time finalize ran (archive, verify,
+ * diff, notice — the notice is the last step). Polling status instead of calling
+ * external_agent_wait is deliberate: a wait would claim that notice, and this file
+ * asserts on it.
+ */
+async function settleTask(taskId: string): Promise<void> {
+	const deadline = Date.now() + 20_000;
+	const noticed = () =>
+		messages.some((message) => message.content.includes(`External agent ${taskId} `) && message.content.includes(" done after "));
+	while (Date.now() < deadline) {
+		const status = await call("external_agent_status", { taskId });
+		if (status.details.task.state !== "running" && noticed()) return;
+		await new Promise((resolve) => setTimeout(resolve, 25));
+	}
+	throw new Error(`${taskId} did not settle with a notice within 20s`);
 }
 
 // ---------------------------------------------------------------------------
