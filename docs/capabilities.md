@@ -5,11 +5,10 @@ reference for using them.
 
 ## Answer archive
 
-Answers longer than 4000 chars — or any answer carrying both `## Summary` and
+Answers >4000 chars — or any carrying both `## Summary` and
 `## Details` — are written to `<session-dir>/external-agent/answers/` at settle
-(per-turn files, sha256 recorded); answers to other contracts (e.g. review-report's
-Summary + Checklist) stay inline. What enters the conversation is the handle line
-plus the Summary (or a head/tail excerpt otherwise):
+(per-turn files, sha256 recorded); others stay inline. What enters conversation:
+handle line plus Summary (or head/tail excerpt otherwise):
 
 ```
 [answer archived: ans_<id> | N bytes | M lines | sha256:xxxxxxxx |
@@ -37,13 +36,11 @@ reason.
 
 ## Templates
 
-`template: "<name>"` wraps the task text before dispatch. Resolution order:
+`template: "<name>"` wraps task text before dispatch. Resolution order:
 `.pi/external-agent/templates/<name>.md` (project) →
 `~/.pi/agent/external-agent/templates/<name>.md` (user) → builtin. A template is
 Markdown with frontmatter (`name`, `version`, `description`) and exactly one
-`{{TASK}}` placeholder; text after it is the output contract the worker reads
-last. The receipt records `template: "name@version"`. Unknown names refuse with
-the searched paths.
+`{{TASK}}` placeholder; text after it is the output contract workers read last. Unknown names refuse with searched paths.
 
 Builtins:
 
@@ -93,4 +90,6 @@ Terminal consumption (read and move on): trust the summary, no checks.
 Propagation (relay, board, acceptance): the Details section must carry anchors;
 the hub only extracts them into relay envelopes and board rows, so checking them
 is the caller's or a verifier's job. Free mechanical facts — git pre/post diff
-stat, exit codes, CLI-reported usage — are always captured when available.
+stat, exit codes, CLI-reported usage — are always captured when available. Wait
+reports also include an "event summary" line with counts and the last event excerpt
+to help the model see retry storms versus genuine stalls.
