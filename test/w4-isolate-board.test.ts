@@ -200,6 +200,22 @@ test("w4: isolate runs the worker in its own worktree and leaves the main checko
 		assert.match(notice.content, new RegExp(`worktree: .*${taskId} \\(branch ea-${taskId}\\)`));
 		assert.match(notice.content, /retained worktrees: ea-[^\s(]+\(/);
 		assert.doesNotMatch(notice.content, /please|clean ?up|should|must|delete|remove/i);
+
+		// The hub marks the runtime dir in .git/info/exclude (local, uncommitted ignore)…
+		const excludePath = path.join(repo, ".git", "info", "exclude");
+		const marks = () => readFileSync(excludePath, "utf8").split("\n").filter((line) => line.trim() === ".external-agent/").length;
+		assert.equal(marks(), 1, "info/exclude marks .external-agent/ exactly once");
+
+		// …and stays idempotent across later isolated dispatches.
+		const again = await call("external_agent_start", {
+			agent: "claude",
+			task: "write AGAIN.txt",
+			mode: "write",
+			cwd: repo,
+			isolate: true,
+		});
+		await settleTask(again.details.task.taskId);
+		assert.equal(marks(), 1, "a second isolated task does not duplicate the mark");
 	} finally {
 		restore();
 	}
