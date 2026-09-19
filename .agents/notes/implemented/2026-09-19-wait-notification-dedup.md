@@ -28,8 +28,8 @@ sees anything — then the push is the only delivery.
 - `session_start` clears every token (a wait belongs to the session that started
   it) and re-delivers held tasks through the existing `pendingNotificationIds`
   loop, so a held notice cannot go missing.
-- The wait report gains the verify and worktree lines, making the receipt
-  content-equivalent to the push it replaces.
+- The wait report gains the verify, worktree and retained-worktrees lines, making
+  the receipt content-equivalent to the push it replaces.
 
 ## Alternatives considered
 
@@ -60,5 +60,7 @@ sees anything — then the push is the only delivery.
   behave exactly as before; only delivery changes.
 - The w4 isolate suite now settles by polling status for the notice instead of
   calling `external_agent_wait`: a wait would claim the notice it asserts on.
+- A wait that throws before its promise exists (the onUpdate hook is caller code)
+  drops its tokens in the catch, so no task stays held with nobody to release it.
 - Prompt surface 8893/8900: the wait description carries the dedup sentence,
   paid for by dropping its meta "how to wait inside the current turn" clause.

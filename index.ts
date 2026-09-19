@@ -2234,7 +2234,7 @@ async function relayAnswerToTask(params: Record<string, unknown>): Promise<Agent
 	const waiting =
 		target.notify === "off"
 			? `Poll external_agent_status taskId="${target.id}" once it settles: it was dispatched with notify off.`
-			: `Its completion notification will reach you, or call external_agent_wait with taskIds=["${target.id}"].`;
+			: `You will be notified when this turn settles; a wait that returns the answer suppresses that notification.`;
 	const lines = [
 		`relayed ${source.id}→${target.id}: ${bytes} bytes · sha256:${sha256.slice(0, 8)} · via ${via} · hop ${target.relayDepth}`,
 		escapeTerminalControls(excerpt.slice(0, RELAY_RECEIPT_CHARS)),
@@ -2768,104 +2768,114 @@ export default function (pi: ExtensionAPI) {
 			// call's receipt replaces the push that notifyTaskSettled would send.
 			const token = Symbol("wait");
 			for (const task of watched) (task.waiters ??= new Set()).add(token);
-			const timeoutS =
-				typeof params.timeout === "number" && Number.isFinite(params.timeout)
-					? Math.min(Math.max(params.timeout, 5), WAIT_MAX_TIMEOUT_S)
-					: WAIT_DEFAULT_TIMEOUT_S;
-			const deadline = Date.now() + timeoutS * 1000;
+			try {
+				const timeoutS =
+					typeof params.timeout === "number" && Number.isFinite(params.timeout)
+						? Math.min(Math.max(params.timeout, 5), WAIT_MAX_TIMEOUT_S)
+						: WAIT_DEFAULT_TIMEOUT_S;
+				const deadline = Date.now() + timeoutS * 1000;
 
-			const report = (timedOut: boolean, aborted: boolean) => {
-				const lines: string[] = [];
-				if (unknown.length > 0) lines.push(`Unknown taskIds (ignored): ${unknown.join(", ")}`);
-				if (aborted) {
-					lines.push("Wait aborted before the tasks settled.");
-				} else if (timedOut) {
-					lines.push(
-						`Still running after ${fmtDuration(timeoutS * 1000)}. Wait again, do other work, or end your turn and rely on completion/stall notifications.`,
-					);
-				}
-				for (const task of watched) {
-					lines.push(summarize(task));
-					if (task.worktree) lines.push(`worktree: ${task.worktree.path} (branch ${task.worktree.branch})`);
-					if (task.state !== "running") {
-						if (task.state === "done") {
-							if (task.verifyResult) lines.push(verifyLine(task.verifyResult));
-							const preview = presentAnswer(task, WAIT_ANSWER_PREVIEW_CHARS);
-							if (preview.text) {
-								lines.push(preview.text);
-								if (preview.truncated) {
-									lines.push(`[preview only — call external_agent_status taskId="${task.id}" for the full answer]`);
+				const report = (timedOut: boolean, aborted: boolean) => {
+					const lines: string[] = [];
+					if (unknown.length > 0) lines.push(`Unknown taskIds (ignored): ${unknown.join(", ")}`);
+					if (aborted) {
+						lines.push("Wait aborted before the tasks settled.");
+					} else if (timedOut) {
+						lines.push(
+							`Still running after ${fmtDuration(timeoutS * 1000)}. Wait again, do other work, or end your turn and rely on completion/stall notifications.`,
+						);
+					}
+					for (const task of watched) {
+						lines.push(summarize(task));
+						if (task.worktree) lines.push(`worktree: ${task.worktree.path} (branch ${task.worktree.branch})`);
+						if (task.state !== "running") {
+							// Settled evidence, worded like the notice this report replaces.
+							if (task.retainedWorktrees) lines.push(task.retainedWorktrees);
+							if (task.state === "done") {
+								if (task.verifyResult) lines.push(verifyLine(task.verifyResult));
+								const preview = presentAnswer(task, WAIT_ANSWER_PREVIEW_CHARS);
+								if (preview.text) {
+									lines.push(preview.text);
+									if (preview.truncated) {
+										lines.push(`[preview only — call external_agent_status taskId="${task.id}" for the full answer]`);
+									}
+								} else {
+									lines.push(`No answer text was parsed. Inspect with external_agent_status taskId="${task.id}".`);
 								}
 							} else {
-								lines.push(`No answer text was parsed. Inspect with external_agent_status taskId="${task.id}".`);
+								const errs = errorsOf(task);
+								if (task.spawnError) lines.push(`spawn error: ${task.spawnError}`);
+								if (errs) lines.push(`errors: ${truncate(errs, 500).text}`);
 							}
-						} else {
-							const errs = errorsOf(task);
-							if (task.spawnError) lines.push(`spawn error: ${task.spawnError}`);
-							if (errs) lines.push(`errors: ${truncate(errs, 500).text}`);
 						}
 					}
-				}
-				return lines.join("\n");
-			};
+					return lines.join("\n");
+				};
 
-			onUpdate?.({
-				content: [
-					{
-						type: "text",
-						text: `Waiting for ${watched.map((t) => t.id).join(", ")} (${waitAll ? "all" : "any"}, timeout ${timeoutS}s)`,
-					},
-				],
-				details: {},
-			});
-
-			return await new Promise((resolvePromise) => {
-				let finished = false;
-				const finish = async (timedOut: boolean, aborted: boolean) => {
-					// Idempotent: check and abort can both land before this resolves.
-					if (finished) return;
-					finished = true;
-					clearInterval(timer);
-					signal?.removeEventListener("abort", onAbort);
-					// Settle finalize (archive/verify) is async; the report must see its results.
-					await Promise.all(watched.map((t) => t.finalizePromise));
-					// Drop this call's tokens; the last waiter out settles each task. A
-					// non-aborted finish claims the settled ones — the receipt carries the
-					// answer, so the push would be a duplicate. An abort released before the
-					// caller saw anything, so the notice goes out after all. Running tasks
-					// are left alone: their settle is still ahead of them.
-					for (const task of watched) {
-						task.waiters?.delete(token);
-						if (task.state === "running" || task.notified || task.notify === "off") continue;
-						if (aborted) notifyTaskSettled(task);
-						else {
-							task.notified = true;
-							taskRegistry.pendingNotificationIds.delete(task.id);
-						}
-					}
-					resolvePromise({
-						content: [{ type: "text", text: report(timedOut, aborted) }],
-						details: {
-							kind: "external-agent-wait",
-							timedOut,
-							aborted,
-							tasks: watched.map(taskSnapshot),
+				onUpdate?.({
+					content: [
+						{
+							type: "text",
+							text: `Waiting for ${watched.map((t) => t.id).join(", ")} (${waitAll ? "all" : "any"}, timeout ${timeoutS}s)`,
 						},
-					});
-				};
-				const check = () => {
-					const settled = watched.filter((t) => t.state !== "running");
-					const condition = waitAll ? settled.length === watched.length : settled.length > 0;
-					if (condition) return finish(false, false);
-					if (Date.now() >= deadline) return finish(true, false);
-				};
-				const onAbort = () => finish(false, true);
-				// Ref'd on purpose: an in-flight wait is active work and must keep the
-				// event loop alive (print mode exits once only unref'd handles remain).
-				const timer = setInterval(check, 2_000);
-				signal?.addEventListener("abort", onAbort);
-				check();
-			});
+					],
+					details: {},
+				});
+
+				return await new Promise((resolvePromise) => {
+					let finished = false;
+					const finish = async (timedOut: boolean, aborted: boolean) => {
+						// Idempotent: check and abort can both land before this resolves.
+						if (finished) return;
+						finished = true;
+						clearInterval(timer);
+						signal?.removeEventListener("abort", onAbort);
+						// Settle finalize (archive/verify) is async; the report must see its results.
+						await Promise.all(watched.map((t) => t.finalizePromise));
+						// Drop this call's tokens; the last waiter out settles each task. A
+						// non-aborted finish claims the settled ones — the receipt carries the
+						// answer, so the push would be a duplicate. An abort releases them
+						// instead: the tool result may never be read, so the notice goes out
+						// after all. Running tasks are left alone — their settle is still ahead.
+						for (const task of watched) {
+							task.waiters?.delete(token);
+							if (task.state === "running" || task.notified || task.notify === "off") continue;
+							if (aborted) notifyTaskSettled(task);
+							else {
+								task.notified = true;
+								taskRegistry.pendingNotificationIds.delete(task.id);
+							}
+						}
+						resolvePromise({
+							content: [{ type: "text", text: report(timedOut, aborted) }],
+							details: {
+								kind: "external-agent-wait",
+								timedOut,
+								aborted,
+								tasks: watched.map(taskSnapshot),
+							},
+						});
+					};
+					const check = () => {
+						const settled = watched.filter((t) => t.state !== "running");
+						const condition = waitAll ? settled.length === watched.length : settled.length > 0;
+						if (condition) return finish(false, false);
+						if (Date.now() >= deadline) return finish(true, false);
+					};
+					const onAbort = () => finish(false, true);
+					// Ref'd on purpose: an in-flight wait is active work and must keep the
+					// event loop alive (print mode exits once only unref'd handles remain).
+					const timer = setInterval(check, 2_000);
+					signal?.addEventListener("abort", onAbort);
+					check();
+				});
+			} catch (err) {
+				// The wait never started — no timer, no promise handed back — so no
+				// finish will ever claim or release: drop the tokens rather than hold
+				// the tasks until session_start.
+				for (const task of watched) task.waiters?.delete(token);
+				throw err;
+			}
 		},
 	});
 

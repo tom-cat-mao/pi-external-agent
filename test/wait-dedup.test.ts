@@ -148,6 +148,17 @@ function resultText(result: any): string {
 	return (result.content as Array<{ text: string }>).map((block) => block.text).join("\n");
 }
 
+/** Polls status until the task left "running", and returns the state it reached. */
+async function settledState(taskId: string, timeoutMs = 8_000): Promise<string> {
+	const deadline = Date.now() + timeoutMs;
+	while (Date.now() < deadline) {
+		const status = await call("external_agent_status", { taskId });
+		if (status.details.task.state !== "running") return status.details.task.state;
+		await sleep(25);
+	}
+	throw new Error(`${taskId} was still running after ${timeoutMs}ms`);
+}
+
 /** Started gated: the task text is the gate file, so the caller controls the settle. */
 async function startGated(gate: string, extra: Record<string, unknown> = {}): Promise<string> {
 	const start = await call("external_agent_start", { agent: "claude", task: gate, mode: "readonly", ...extra });
@@ -169,6 +180,11 @@ test("wait-dedup: a wait that returns the answer suppresses the settle push", as
 		assert.match(resultText(waited), /DEDUP_OK/);
 		await sleep(200);
 		assert.equal(pushes.length, 0, `expected no push, got: ${pushes.join(" | ")}`);
+		// A claimed task stays silent across a session restart: the second delivery
+		// pass must distinguish "claimed" from "notice lost".
+		armNotifications();
+		await sleep(50);
+		assert.equal(pushes.length, 0, `claimed task was re-delivered: ${pushes.join(" | ")}`);
 	} finally {
 		restore();
 		restorePath();
@@ -195,6 +211,32 @@ test("wait-dedup: an aborted wait releases the notice", async () => {
 		assert.equal(pushes.length, 1);
 		assert.match(pushes[0], new RegExp(taskId));
 		assert.match(pushes[0], /RELEASE_OK/);
+	} finally {
+		restore();
+		restorePath();
+	}
+});
+
+test("wait-dedup: a wait that throws before it starts leaves no token behind", async () => {
+	const dir = makeFixtureDir({ claude: GATED_CLAUDE_MOCK });
+	const gate = path.join(dir, "gate");
+	const restorePath = usePath(dir);
+	const restore = withEnv({ WAIT_MOCK_ANSWER: "THROW_OK" });
+	armNotifications();
+	try {
+		const taskId = await startGated(gate, { cwd: dir });
+		const tool = tools.get("external_agent_wait");
+		// onUpdate is caller code: a throw there must not hold the task forever.
+		await assert.rejects(
+			tool.execute("call-id", { taskIds: [taskId], timeout: 20 }, undefined, () => {
+				throw new Error("onUpdate exploded");
+			}, { cwd: process.cwd() }),
+			/onUpdate exploded/,
+		);
+		writeFileSync(gate, "go");
+		await waitFor(() => pushes.length > 0, "settle push after a failed wait");
+		assert.equal(pushes.length, 1);
+		assert.match(pushes[0], /THROW_OK/);
 	} finally {
 		restore();
 		restorePath();
@@ -273,6 +315,40 @@ test("wait-dedup: concurrent waits settle the task once", async () => {
 	}
 });
 
+test("wait-dedup: a task held by an unfinished wait is re-delivered once by session_start", async () => {
+	const dir = makeFixtureDir({ claude: GATED_CLAUDE_MOCK });
+	const gateA = path.join(dir, "gate-a");
+	const gateB = path.join(dir, "gate-b");
+	const restorePath = usePath(dir);
+	const restore = withEnv({ WAIT_MOCK_ANSWER: "HELD_OK" });
+	armNotifications();
+	const controller = new AbortController();
+	try {
+		const taskA = await startGated(gateA, { cwd: dir });
+		const taskB = await startGated(gateB, { cwd: dir });
+		// "all" mode with B still gated: A's settle does not end the wait, so A stays
+		// held by this call's token instead of being claimed.
+		const waiting = call("external_agent_wait", { taskIds: [taskA, taskB], timeout: 60 }, controller.signal);
+		await sleep(150);
+		writeFileSync(gateA, "go");
+		assert.equal(await settledState(taskA), "done");
+		await sleep(300);
+		assert.equal(pushes.length, 0, `a held settle must not be pushed: ${pushes.join(" | ")}`);
+		armNotifications();
+		await waitFor(() => pushes.length > 0, "re-delivery of the held task");
+		assert.equal(pushes.length, 1);
+		assert.match(pushes[0], new RegExp(taskA));
+		assert.match(pushes[0], /HELD_OK/);
+		// Aborting the leftover wait releases nothing: A was delivered, B is running.
+		controller.abort();
+		await waiting;
+		assert.equal(pushes.length, 1);
+	} finally {
+		restore();
+		restorePath();
+	}
+});
+
 test("wait-dedup: the wait report carries the verify and worktree lines the push carries", async () => {
 	const repo = makeGitRepo();
 	const fixture = makeFixtureDir({ claude: GATED_CLAUDE_MOCK });
@@ -293,6 +369,7 @@ test("wait-dedup: the wait report carries the verify and worktree lines the push
 		assert.match(text, /EVIDENCE_OK/);
 		assert.match(text, /verify: `npm test` — exit 0/);
 		assert.match(text, /worktree: .*\(branch ea-/);
+		assert.match(text, /retained worktrees: ea-/);
 	} finally {
 		restore();
 		restorePath();
