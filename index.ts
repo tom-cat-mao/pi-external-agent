@@ -1024,9 +1024,9 @@ function stallPhrase(task: Task, stall: StallKind, now: number): string {
  * the kind is anchored to — any event for quiet, a meaningful one for
  * struggling — resets the streak; repeats are spaced by the threshold that
  * produced them, the effective silence threshold or the struggle gap, and
- * capped per streak. Shared by the push (notifyWatchdog) and the wait's early
- * return, so the two channels cannot double-report the same stall; note how the
- * struggling anchor ignores error traffic, which would otherwise reset the cap
+ * capped per streak. Shared by the scan (scanWatchdogs/notifyWatchdog) and
+ * the wait's early return, so the two channels cannot double-report the same
+ * stall; note how the struggling anchor ignores error traffic, which would otherwise reset the cap
  * on every retry and turn the notices into a storm. Claiming is separate
  * (claimStallNotice) because a failed delivery must retry on the next scan.
  */

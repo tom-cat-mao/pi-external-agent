@@ -64,4 +64,6 @@ own cadence is.
 - Minute-scale thresholds are testable without waiting: `stallClock` is the one
   injectable clock and `stallTestApi` exposes the production predicates and
   event record to `test/stall-adaptive.test.ts`.
+- The 3m floor wins over a smaller user `watchdog` (e.g. `watchdog: 1` still
+  stalls at 3m once a cadence exists); the ceiling always defers to it.
 - Known debt, unchanged: `external_agent_compare` has no stall early return.
