@@ -10,7 +10,7 @@ All seven agents share one dispatch path; this matrix records what each adapter 
 | `pi` | pi itself, child process (`pi`) | yolo | readonly–yolo | yes — `--tools read,grep,find,ls` | off–max (all seven) | yes | yes | — |
 | `kimi` | Moonshot (`kimi`) | yolo | yolo only (`minMode: "yolo"`) | no | none — every effort request is refused | no | no | — |
 | `codebuddy` | Tencent CodeBuddy (`codebuddy`) | yolo | readonly–yolo | yes, best-effort — `default` mode + `--settings` allow/deny rules + heuristic PreToolUse Bash hook (not a sandbox) | minimal–max (no off) | yes | yes | — |
-| `claude` | Anthropic, via pi's configured gateway (`claude`) | readonly | readonly–write | yes — plan mode | low–max | no | no | — |
+| `claude` | Anthropic, via pi's configured gateway (`claude`) | yolo | readonly–yolo | yes — `dontAsk` / `acceptEdits` / `bypassPermissions` (stream-json) | low–max | yes | yes | — |
 | `reasonix` | DeepSeek-native (`reasonix`) | yolo | readonly–yolo | yes — `--permission-mode manual` | off–max (all seven) | yes | yes | — |
 | `qoder` | Qoder, Alibaba (`qodercli`) | yolo | readonly–yolo | yes — `dont_ask` + built-in tool allowlist | off, low–max (no minimal) | yes, version-gated | yes | — |
 
@@ -29,6 +29,6 @@ Qoder is driven over its documented stream-json channel. `steer` and `followUp` 
 - codex: `--sandbox read-only` / `workspace-write` / `danger-full-access`.
 - pi: readonly restricts `--tools`; there is no sandbox, so write and yolo are equivalent.
 - codebuddy: `default` + `--settings` (readonly) / `acceptEdits` / `bypassPermissions`.
-- claude: plan mode (readonly) / `acceptEdits`; no yolo tier.
+- claude: `dontAsk` / `acceptEdits` / `bypassPermissions` over stream-json; session/persistence enabled.
 - reasonix: `manual` / `acceptEdits` / `bypassPermissions` (deny rules and the OS bash sandbox still apply).
 - qoder: `dont_ask` + built-in allowlist / `accept_edits` / `bypass_permissions`.

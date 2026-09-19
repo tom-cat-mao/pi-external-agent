@@ -421,6 +421,9 @@ function claudeFamily(
 	// instead of plan mode — plan's permission requests, once auto-rejected by
 	// the ACP driver, cancel the whole turn. claude keeps plan.
 	readonlySettings?: () => string,
+	// For stream-json persistent sessions, use dontAsk/acceptEdits/bypassPermissions
+	// mapping; for json one-shot, use plan/acceptEdits/yoloPermissionMode.
+	streamJsonMapping = false,
 ): Adapter {
 	return {
 		id,
@@ -442,14 +445,20 @@ function claudeFamily(
 			// codebuddy readonly overrides plan (readonlySettings set): default mode +
 			// --settings deny rules refuse silently, so a readonly run neither prompts
 			// nor dies on a permission request.
-			const settingsJson = mode === "readonly" ? readonlySettings?.() : undefined;
+			const settingsJson = mode === "readonly" && !streamJsonMapping ? readonlySettings?.() : undefined;
 			const permissionMode = settingsJson
 				? "default"
-				: mode === "readonly"
-					? "plan"
-					: mode === "write"
-						? "acceptEdits"
-						: (yoloPermissionMode ?? "acceptEdits");
+				: streamJsonMapping
+					? mode === "readonly"
+						? "dontAsk"
+						: mode === "write"
+							? "acceptEdits"
+							: "bypassPermissions"
+					: mode === "readonly"
+						? "plan"
+						: mode === "write"
+							? "acceptEdits"
+							: (yoloPermissionMode ?? "acceptEdits");
 			argv.push("--permission-mode", permissionMode);
 			if (settingsJson) argv.push("--settings", settingsJson);
 			if (model) argv.push("--model", model);
@@ -925,9 +934,24 @@ export const ADAPTERS: Record<AgentId, Adapter> = {
 		"claude",
 		"claude",
 		"Anthropic via the gateway pi itself is configured with",
-		"Analysis and planning only; shares pi's own gateway, so it offers no model diversity. Rarely useful.",
+		"Full coding agent aligned with codebuddy status: stream-json driven with session persistence (steer/follow-up), all permission tiers open with yolo default like codex and qoder.",
 		["low", "medium", "high", "xhigh", "max"],
-		"json",
+		"stream-json",
+		// claude-family supports bypassPermissions for yolo mode
+		"bypassPermissions",
+		undefined,
+		// Claude-family supports persistent sessions via stream-json channel;
+		// initialize handshake + system/init + can_use_tool control requests +
+		// user message frames with uuid for steering. Verified against official
+		// docs that describe --input-format stream-json contract.
+		{
+			steer: true,
+			followUp: true,
+			steerNote:
+				"LF-framed user messages with uuid; sent as priority next / shouldQuery false at next step boundary when active turn detected",
+		},
+		undefined, // no readonlySettings for claude
+		true, // use stream-json mapping
 	),
 	reasonix: reasonixAdapter,
 	qoder: qoderAdapter,
