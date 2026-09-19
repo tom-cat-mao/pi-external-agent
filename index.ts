@@ -153,6 +153,8 @@ interface Task {
 	lastWatchdogNoticeAt: number;
 	/** Consecutive stall notices sent during the current quiet streak. */
 	watchdogNotices: number;
+	/** Monotonic count of parsed events, so a wait can report activity inside its own window. */
+	eventSeq: number;
 	/** Per-turn archived answers, appended at each settle; recall pages from the last one. */
 	archives?: StoredAnswer[];
 	/** Set when archiving failed and the answer stayed inline (fail-open, never silent). */
@@ -236,6 +238,8 @@ type ExternalAgentWaitDetails =
 			kind: "external-agent-wait";
 			timedOut: boolean;
 			aborted: boolean;
+			/** True when the wait returned early because every watched task went quiet past its watchdog. */
+			stalled: boolean;
 			tasks: TaskSnapshot[];
 		}
 	| Record<string, never>;
@@ -495,7 +499,11 @@ function dispatchSummary(receipt: DispatchReceipt, taskId?: string): string[] {
 		`model: ${modelDisplay(receipt)}`,
 		`effort: ${effortDisplay(receipt)}`,
 		`notify: ${receipt.notify} (Pi-only; not sent to the target CLI)`,
-		`watchdog: ${receipt.watchdogMs > 0 ? `stall notice after ${fmtDuration(receipt.watchdogMs)} quiet` : "disabled"} (Pi-only)`,
+		// notify "off" means no stall notice will be delivered — the receipt must not
+		// claim otherwise. The quiet clock itself still runs: a blocking wait reads it.
+		receipt.notify === "off"
+			? "watchdog: not delivered (notify off; a blocking wait still returns early when quiet)"
+			: `watchdog: ${receipt.watchdogMs > 0 ? `stall notice after ${fmtDuration(receipt.watchdogMs)} quiet` : "disabled"} (Pi-only)`,
 		`environment: ${escapeTerminalControls(receipt.environment)}`,
 		persistent
 			? `stdio: stdin ${receipt.stdin} (bidirectional session); stdout/stderr piped; prompt sent over the protocol`
@@ -889,8 +897,38 @@ function notifySettled(pi: ExtensionAPI, task: Task): void {
  * settles, never notifies, and a sleeping model would never find out. The scan
  * lives on the shared registry so /reload cannot stack duplicate intervals; the
  * per-session delivery callback is rebound on every session_start exactly like
- * notifySettled. notify "off" is respected: no callbacks means no watchdog.
+ * notifySettled. notify "off" suppresses delivery, never the quiet detection
+ * itself: an off task still ends a blocking wait early, because the wait reads
+ * the clock, not the push channel.
  */
+
+/** The shared stall predicate: watchdog armed and quiet at least that long (0 disables). */
+function stallQuiet(task: Task, now: number): boolean {
+	return task.watchdogMs > 0 && now - task.lastEventAt >= task.watchdogMs;
+}
+
+/**
+ * Whether a stall notice is due for the current quiet streak: new activity
+ * resets the streak, then repeats are spaced by the watchdog and capped per
+ * streak. Shared by the push (notifyWatchdog) and the wait's early return, so
+ * the two channels cannot double-report the same silence. Claiming is separate
+ * (claimStallNotice) because a failed delivery must retry on the next scan.
+ */
+function stallNoticeDue(task: Task, now: number): boolean {
+	if (task.lastWatchdogNoticeAt > 0 && task.lastEventAt > task.lastWatchdogNoticeAt) {
+		task.watchdogNotices = 0;
+	}
+	if (task.watchdogNotices >= MAX_WATCHDOG_NOTICES && task.lastWatchdogNoticeAt > task.lastEventAt) return false;
+	if (task.lastWatchdogNoticeAt > task.lastEventAt && now - task.lastWatchdogNoticeAt < task.watchdogMs) return false;
+	return true;
+}
+
+/** Consume one notice slot for this quiet streak; the caller must deliver or report. */
+function claimStallNotice(task: Task, now: number): void {
+	task.lastWatchdogNoticeAt = now;
+	task.watchdogNotices += 1;
+}
+
 function notifyWatchdog(pi: ExtensionAPI, task: Task, quietMs: number): void {
 	const elapsed = fmtDuration((task.endedAt ?? Date.now()) - task.startedAt);
 	const ordinal = task.watchdogNotices + 1;
@@ -922,31 +960,29 @@ function notifyWatchdog(pi: ExtensionAPI, task: Task, quietMs: number): void {
 				triggerTurn: task.notify !== "nextTurn",
 			},
 		);
-		task.lastWatchdogNoticeAt = Date.now();
-		task.watchdogNotices += 1;
+		claimStallNotice(task, Date.now());
 	} catch {
 		// Delivery failed (e.g. mid-reload); the next scan retries.
 	}
 }
 
-function scanWatchdogs(): void {
+/**
+ * Exported for tests: the interval is 30s, far too slow to exercise live, and
+ * waiting is the one mechanism this scan must not leave uncovered.
+ */
+export function scanWatchdogs(): void {
 	const deliver = taskRegistry.notifyWatchdog;
 	if (!deliver) return;
 	const now = Date.now();
 	for (const task of tasks.values()) {
 		if (task.state !== "running") continue;
 		if (task.notify === "off") continue;
-		if (task.watchdogMs <= 0) continue;
-		const quiet = now - task.lastEventAt;
-		if (quiet < task.watchdogMs) continue;
-		// New activity since the last notice resets the streak.
-		if (task.lastWatchdogNoticeAt > 0 && task.lastEventAt > task.lastWatchdogNoticeAt) {
-			task.watchdogNotices = 0;
-		}
-		if (task.watchdogNotices >= MAX_WATCHDOG_NOTICES && task.lastWatchdogNoticeAt > task.lastEventAt) continue;
-		// Space repeat notices by the same threshold.
-		if (task.lastWatchdogNoticeAt > task.lastEventAt && now - task.lastWatchdogNoticeAt < task.watchdogMs) continue;
-		deliver(task, quiet);
+		// A waiter perceives the same quiet through its own early return; a push
+		// on top of that would be a duplicate delivery, not a safety net.
+		if (task.waiters?.size) continue;
+		if (!stallQuiet(task, now)) continue;
+		if (!stallNoticeDue(task, now)) continue;
+		deliver(task, now - task.lastEventAt);
 	}
 }
 
@@ -1153,6 +1189,7 @@ function createTask(
 		watchdogMs,
 		lastWatchdogNoticeAt: 0,
 		watchdogNotices: 0,
+		eventSeq: 0,
 		relayDepth: 0,
 		relaysReceived: 0,
 	};
@@ -1311,6 +1348,7 @@ function pushEvent(task: Task, event: AgentEvent): void {
 		if (task.answerStartIndex > 0) task.answerStartIndex -= 1;
 	}
 	task.lastEventAt = Date.now();
+	task.eventSeq += 1;
 	meterUsageEvent(task.id, event);
 }
 
@@ -1619,6 +1657,22 @@ function validateDispatch(
 // ---------------------------------------------------------------------------
 // Reporting
 // ---------------------------------------------------------------------------
+
+/**
+ * Bounded one-line event profile for a wait report, counted over the call's own
+ * window (eventSeq delta). It exists so "running but busy" is distinguishable
+ * from "running and quiet" — a retry storm shows up as many tool×N events while
+ * no answer forms. The hub reports the counts; judging them is the model's job.
+ */
+function eventProfileLine(task: Task, during: number): string {
+	const recent = during > 0 ? task.events.slice(-during) : [];
+	const counts = new Map<string, number>();
+	for (const event of recent) counts.set(event.kind, (counts.get(event.kind) ?? 0) + 1);
+	const kinds = [...counts.entries()].map(([kind, n]) => `${kind}×${n}`).join(", ");
+	const last = recent[recent.length - 1];
+	const tail = last ? `; last: ${last.text.replace(/\s+/g, " ").trim().slice(0, 120)}` : "";
+	return `events during wait: ${during}${kinds ? ` (${kinds}${tail})` : " (none)"}`;
+}
 
 /** Newline-prefixed retained-worktree inventory for status output; "" when there is none. */
 async function inventorySuffix(): Promise<string> {
@@ -2395,7 +2449,7 @@ export default function (pi: ExtensionAPI) {
 			watchdog: Type.Optional(
 				Type.Number({
 					description:
-						"Minutes of no activity before a stall notice (default 15; 0 disables; notify off disables it too).",
+						"Minutes of no activity before a stall notice (default 15; 0 disables; notify off suppresses delivery only).",
 				}),
 			),
 			template: Type.Optional(
@@ -2562,7 +2616,9 @@ export default function (pi: ExtensionAPI) {
 								? `No callback was requested, so poll external_agent_status taskId="${task.id}" at sparse intervals (at least 60s apart).`
 								: [
 										`If you need the result in this turn, call external_agent_wait with taskIds=["${task.id}"]; a wait that returns the answer suppresses that task's settle notification.`,
-										`Otherwise end your turn now: you will be notified when it settles, and the stall watchdog (${Math.round(task.watchdogMs / 60_000)}m) will notify you if it goes quiet. Do not sleep-poll.`,
+										task.watchdogMs > 0
+											? `Otherwise end your turn now: you will be notified when it settles, and the stall watchdog (${Math.round(task.watchdogMs / 60_000)}m) will notify you if it goes quiet. Do not sleep-poll.`
+											: "Otherwise end your turn now: you will be notified when it settles. Do not sleep-poll.",
 									].join(" "),
 							sessionNote,
 						]
@@ -2723,9 +2779,9 @@ export default function (pi: ExtensionAPI) {
 		name: "external_agent_wait",
 		label: "External Agent Wait",
 		description: [
-			"Block until external agent tasks settle or the timeout elapses. On settle it returns the answer and",
-			"suppresses that task's settle notification; on timeout a summary, and you may wait again, do other work,",
-			"or end your turn and rely on notifications.",
+			"Block until external agent tasks settle or the timeout elapses; it also returns early once every",
+			"watched task is quiet for its watchdog. On settle it returns the answer and suppresses that task's",
+			"notification; otherwise a summary.",
 		].join(" "),
 		promptSnippet: "Block until external agent tasks settle or time out",
 		parameters: Type.Object({
@@ -2763,11 +2819,16 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const waitAll = params.mode !== "any";
+			// notify "off" suppresses delivery, not the quiet threshold: the wait still
+			// ends early below, only the wording of its advice changes.
+			const allNotifyOff = watched.every((t) => t.notify === "off");
 			// Registered before the first await, so a settle racing this call cannot
 			// slip a notification past the wait. The token is the claim ticket: this
 			// call's receipt replaces the push that notifyTaskSettled would send.
 			const token = Symbol("wait");
 			for (const task of watched) (task.waiters ??= new Set()).add(token);
+			// Event counts are per call: the report's activity line covers this window.
+			const seqAtWait = new Map(watched.map((task) => [task, task.eventSeq]));
 			try {
 				const timeoutS =
 					typeof params.timeout === "number" && Number.isFinite(params.timeout)
@@ -2775,18 +2836,32 @@ export default function (pi: ExtensionAPI) {
 						: WAIT_DEFAULT_TIMEOUT_S;
 				const deadline = Date.now() + timeoutS * 1000;
 
-				const report = (timedOut: boolean, aborted: boolean) => {
+				const report = (timedOut: boolean, aborted: boolean, stalled: boolean) => {
 					const lines: string[] = [];
 					if (unknown.length > 0) lines.push(`Unknown taskIds (ignored): ${unknown.join(", ")}`);
 					if (aborted) {
 						lines.push("Wait aborted before the tasks settled.");
+					} else if (stalled) {
+						// Worded like the timeout report it stands in for: the task may still
+						// be alive, but while this call blocks no stall notice can get through.
+						const quiet = watched.filter((t) => t.state === "running");
+						const quietFor = quiet.map((t) => `${t.id} quiet for ${fmtDuration(Date.now() - t.lastEventAt)}`).join(", ");
+						lines.push(
+							`${quietFor} — ` +
+								(allNotifyOff
+									? "notify is off, so no stall notice will be delivered: wait again, steer/stop it, or poll external_agent_status."
+									: "no stall notice can reach you while this call blocks: wait again, steer/stop it, or end your turn and rely on the watchdog."),
+						);
 					} else if (timedOut) {
 						lines.push(
-							`Still running after ${fmtDuration(timeoutS * 1000)}. Wait again, do other work, or end your turn and rely on completion/stall notifications.`,
+							allNotifyOff
+								? `Still running after ${fmtDuration(timeoutS * 1000)}. Notifications are off for every watched task, so poll external_agent_status at sparse intervals; waiting again only blocks.`
+								: `Still running after ${fmtDuration(timeoutS * 1000)}. Wait again, do other work, or end your turn and rely on completion/stall notifications.`,
 						);
 					}
 					for (const task of watched) {
 						lines.push(summarize(task));
+						lines.push(eventProfileLine(task, task.eventSeq - (seqAtWait.get(task) ?? 0)));
 						if (task.worktree) lines.push(`worktree: ${task.worktree.path} (branch ${task.worktree.branch})`);
 						if (task.state !== "running") {
 							// Settled evidence, worded like the notice this report replaces.
@@ -2824,7 +2899,7 @@ export default function (pi: ExtensionAPI) {
 
 				return await new Promise((resolvePromise) => {
 					let finished = false;
-					const finish = async (timedOut: boolean, aborted: boolean) => {
+					const finish = async (timedOut: boolean, aborted: boolean, stalled: boolean) => {
 						// Idempotent: check and abort can both land before this resolves.
 						if (finished) return;
 						finished = true;
@@ -2847,11 +2922,12 @@ export default function (pi: ExtensionAPI) {
 							}
 						}
 						resolvePromise({
-							content: [{ type: "text", text: report(timedOut, aborted) }],
+							content: [{ type: "text", text: report(timedOut, aborted, stalled) }],
 							details: {
 								kind: "external-agent-wait",
 								timedOut,
 								aborted,
+								stalled,
 								tasks: watched.map(taskSnapshot),
 							},
 						});
@@ -2859,10 +2935,23 @@ export default function (pi: ExtensionAPI) {
 					const check = () => {
 						const settled = watched.filter((t) => t.state !== "running");
 						const condition = waitAll ? settled.length === watched.length : settled.length > 0;
-						if (condition) return finish(false, false);
-						if (Date.now() >= deadline) return finish(true, false);
+						if (condition) return finish(false, false, false);
+						const now = Date.now();
+						if (now >= deadline) return finish(true, false, false);
+						// Third exit: every running task is quiet past its watchdog, so the
+						// stall notice the model is waiting for cannot reach it while this
+						// call blocks. Settle above always wins; a mode "any" batch still
+						// needs all of its tasks quiet. Claiming one notice slot per quiet
+						// streak keeps a wait-again loop from re-reporting the same silence,
+						// and once the streak hits its cap the model has been told, so the
+						// wait stays blocked — continuing is then an informed choice.
+						const running = watched.filter((t) => t.state === "running");
+						if (running.length === 0 || running.some((t) => !stallQuiet(t, now))) return;
+						if (!running.every((t) => stallNoticeDue(t, now))) return;
+						for (const task of running) claimStallNotice(task, now);
+						return finish(false, false, true);
 					};
-					const onAbort = () => finish(false, true);
+					const onAbort = () => finish(false, true, false);
 					// Ref'd on purpose: an in-flight wait is active work and must keep the
 					// event loop alive (print mode exits once only unref'd handles remain).
 					const timer = setInterval(check, 2_000);
