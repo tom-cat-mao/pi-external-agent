@@ -2,3 +2,13 @@ node_modules/
 *.log
 .DS_Store
 dist/
+
+# Local pi project state (project-local packages, SoL-Pi install)
+.pi/
+
+# Local package-manager artifact (this repo is npm-based; package-lock.json is the tracked lockfile)
+bun.lock
+
+# Unreferenced local image drafts — commit explicitly with `git add -f` when one gets referenced
+*.png
+*.jpeg
