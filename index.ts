@@ -21,7 +21,7 @@
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFile, mkdir, readdir, stat } from "node:fs/promises";
+import { appendFile, mkdir, readFile, readdir, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
@@ -1012,12 +1012,31 @@ async function pathExists(target: string): Promise<boolean> {
  * refuses the dispatch with git's own words — a half-made checkout is never left
  * behind, and the caller is told rather than degraded silently.
  */
+/**
+ * Keep hub-created worktrees out of the parent's git status without touching any
+ * tracked file: append `.external-agent/` to `.git/info/exclude` (git's local,
+ * uncommitted ignore list). Idempotent; failures are ignored — a dirty status is
+ * annoying, never a reason to fail a dispatch.
+ */
+async function excludeRuntimeDir(base: string): Promise<void> {
+	try {
+		const gitDir = (await runGit(["-C", base, "rev-parse", "--git-dir"])).stdout.trim();
+		const excludePath = join(resolve(base, gitDir), "info", "exclude");
+		const existing = await readFile(excludePath, "utf8").catch(() => "");
+		if (existing.split("\n").some((line) => line.trim() === ".external-agent/")) return;
+		await appendFile(excludePath, `${existing && !existing.endsWith("\n") ? "\n" : ""}.external-agent/\n`, "utf8");
+	} catch {
+		/* best effort only */
+	}
+}
+
 async function createTaskWorktree(worktree: TaskWorktree): Promise<{ ok: true } | { ok: false; reason: string }> {
 	// A path that already exists belongs to a retained worktree (or a foreign
 	// directory): the hub never deletes those, not even as failure cleanup.
 	const existed = await pathExists(worktree.path);
 	try {
 		await runGit(["-C", worktree.base, "worktree", "add", worktree.path, "-b", worktree.branch]);
+		await excludeRuntimeDir(worktree.base);
 		return { ok: true };
 	} catch (err) {
 		if (!existed) {
