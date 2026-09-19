@@ -1,20 +1,20 @@
 # Architecture
 
-Where each piece lives, and how a dispatch flows through them. Protocol details belong to the code and the focused documents linked at the end.
+Where each piece lives, and how a dispatch flows. Protocol details belong to the code and the focused documents linked below.
 
 ## Dispatch flow
 
-1. **Registration** — `index.ts` registers the seven tools listed in the tool map below with pi.
+1. **Registration** — `index.ts` registers the seven tools in the tool map below.
 2. **Validation** — `validateDispatch(agent, mode, cwd, effort, conflictCwd)` refuses a dispatch before anything is spawned: a mode below the adapter's `minMode` or above its `maxMode`, an effort outside `supportedEfforts` (or an adapter with no effort control), and a second write/yolo task in the worker's effective directory (`conflictCwd`; isolate points it at the fresh worktree).
 3. **Adapter dispatch** — `ADAPTERS[agent].buildDispatch(...)` in `adapters.ts` spells the argv, and returns the prompt argument index, the effective permission policy, and whether model/effort overrides are forwarded.
 4. **Spawn and task registry** — the hub spawns the CLI and records the task under a taskId: state, cwd, mode, transport, event log, session handle, watchdog counters.
-5. **Monitoring** — stdout lines are normalized by the adapter's `parseEvent` into message / reasoning / tool / usage / warning / error events; they feed the status view, the notification callback, and the final answer.
-6. **Watchdog** — a shared scanner notices a task quiet for its `watchdogMs` (default 15m) and notifies the model, at most three times per quiet streak.
-7. **Settle** — on process exit (one-shot) or turn end (persistent), the task settles, its notice fires, and the answer is available through status or the receipt. `isolate` runs the worker in a fresh git worktree that the owner merges or removes. Settle-time finalize then runs four fail-open steps: archive long or Summary+Details answers (recall pages back via `external_agent_status` `offset`), run a known verify command via `pi.exec`, collect the isolated worktree's diff-stat, and append a board row when compare asked for one. CLI-reported usage/cost accumulates in the meter (`/external_agent_stats`). See [capabilities.md](capabilities.md).
+5. **Monitoring** — stdout lines are normalized by the adapter's `parseEvent` into message / reasoning / tool / usage / warning / error events, feeding the status view, the notification callback, and the final answer.
+6. **Watchdog** — a shared scanner notices a task quiet for its `watchdogMs` (default 15m) and notifies the model, at most three times per streak.
+7. **Settle** — on process exit (one-shot) or turn end (persistent), the task settles, its notice fires, and the answer lands in status or the receipt. A wait that observes the settle takes the answer in its receipt instead of that push; an aborted wait releases it, and session_start re-delivers what an unfinished wait held. `isolate` runs the worker in a fresh git worktree that the owner merges or removes. Finalize then runs four fail-open steps: archive long or Summary+Details answers (paged recall via status `offset`), run the verify command via `pi.exec`, collect the isolated worktree's diff-stat, and append a board row if compare asked. CLI-reported usage/cost accumulates in the meter (`/external_agent_stats`). See [capabilities.md](capabilities.md).
 
 ## Receipts
 
-Every dispatch returns a receipt: the exact argv, the effective permission policy, the transport, the watchdog setting, and the model/effort forwarding notes. A persistent session's receipt starts with an empty argv; the driver backfills it once it has built the startup command. Unsupported overrides are reported as not forwarded rather than silently dropped, and a refusal names its reason. The receipt is the honest-reporting contract — what it claims is what the target CLI was actually asked to do.
+Every dispatch returns a receipt: the exact argv, the effective permission policy, the transport, the watchdog setting, and the model/effort forwarding notes. A persistent session's receipt starts with an empty argv; the driver backfills it after building the startup command. Unsupported overrides are reported not forwarded, and a refusal names its reason. The receipt is the honest-reporting contract — what it claims is what the target CLI was actually asked to do.
 
 ## Transports
 

@@ -141,6 +141,12 @@ interface Task {
 	notify: NotifyMode;
 	/** Guards against double-notifying, since close and error can both fire. */
 	notified: boolean;
+	/**
+	 * Tokens of in-flight external_agent_wait calls watching this task. While the
+	 * set is non-empty the settle notice is held back: the waiter's receipt is
+	 * the delivery. settled + not notified is a task in this held state.
+	 */
+	waiters?: Set<symbol>;
 	/** Stall watchdog: notify when quiet this long (ms). 0 disables. */
 	watchdogMs: number;
 	/** Last time a stall notice was sent; compared against lastEventAt to space repeats. */
@@ -803,6 +809,10 @@ function notifyTaskSettled(task: Task): void {
 		task.notified = true;
 		return;
 	}
+	// A waiter holds the notice (no push, no tombstone): its receipt carries the
+	// answer, and it claims the task when it finishes. If that waiter dies without
+	// finishing, session_start drops the tokens and re-delivers the held state.
+	if (task.waiters?.size) return;
 	if (!taskRegistry.notifySettled) {
 		taskRegistry.pendingNotificationIds.add(task.id);
 		return;
@@ -2224,7 +2234,7 @@ async function relayAnswerToTask(params: Record<string, unknown>): Promise<Agent
 	const waiting =
 		target.notify === "off"
 			? `Poll external_agent_status taskId="${target.id}" once it settles: it was dispatched with notify off.`
-			: `Its completion notification will reach you, or call external_agent_wait with taskIds=["${target.id}"].`;
+			: `You will be notified when this turn settles; a wait that returns the answer suppresses that notification.`;
 	const lines = [
 		`relayed ${source.id}→${target.id}: ${bytes} bytes · sha256:${sha256.slice(0, 8)} · via ${via} · hop ${target.relayDepth}`,
 		escapeTerminalControls(excerpt.slice(0, RELAY_RECEIPT_CHARS)),
@@ -2551,7 +2561,7 @@ export default function (pi: ExtensionAPI) {
 							task.notify === "off"
 								? `No callback was requested, so poll external_agent_status taskId="${task.id}" at sparse intervals (at least 60s apart).`
 								: [
-										`If you need the result in this turn, call external_agent_wait with taskIds=["${task.id}"].`,
+										`If you need the result in this turn, call external_agent_wait with taskIds=["${task.id}"]; a wait that returns the answer suppresses that task's settle notification.`,
 										`Otherwise end your turn now: you will be notified when it settles, and the stall watchdog (${Math.round(task.watchdogMs / 60_000)}m) will notify you if it goes quiet. Do not sleep-poll.`,
 									].join(" "),
 							sessionNote,
@@ -2713,9 +2723,9 @@ export default function (pi: ExtensionAPI) {
 		name: "external_agent_wait",
 		label: "External Agent Wait",
 		description: [
-			"Block until external agent tasks settle or the timeout elapses: how to wait inside the current turn. On",
-			"settle it returns the answer; on timeout a summary, and you may wait again, do other work, or end your turn",
-			"and rely on notifications.",
+			"Block until external agent tasks settle or the timeout elapses. On settle it returns the answer and",
+			"suppresses that task's settle notification; on timeout a summary, and you may wait again, do other work,",
+			"or end your turn and rely on notifications.",
 		].join(" "),
 		promptSnippet: "Block until external agent tasks settle or time out",
 		parameters: Type.Object({
@@ -2753,84 +2763,119 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const waitAll = params.mode !== "any";
-			const timeoutS =
-				typeof params.timeout === "number" && Number.isFinite(params.timeout)
-					? Math.min(Math.max(params.timeout, 5), WAIT_MAX_TIMEOUT_S)
-					: WAIT_DEFAULT_TIMEOUT_S;
-			const deadline = Date.now() + timeoutS * 1000;
+			// Registered before the first await, so a settle racing this call cannot
+			// slip a notification past the wait. The token is the claim ticket: this
+			// call's receipt replaces the push that notifyTaskSettled would send.
+			const token = Symbol("wait");
+			for (const task of watched) (task.waiters ??= new Set()).add(token);
+			try {
+				const timeoutS =
+					typeof params.timeout === "number" && Number.isFinite(params.timeout)
+						? Math.min(Math.max(params.timeout, 5), WAIT_MAX_TIMEOUT_S)
+						: WAIT_DEFAULT_TIMEOUT_S;
+				const deadline = Date.now() + timeoutS * 1000;
 
-			const report = (timedOut: boolean, aborted: boolean) => {
-				const lines: string[] = [];
-				if (unknown.length > 0) lines.push(`Unknown taskIds (ignored): ${unknown.join(", ")}`);
-				if (aborted) {
-					lines.push("Wait aborted before the tasks settled.");
-				} else if (timedOut) {
-					lines.push(
-						`Still running after ${fmtDuration(timeoutS * 1000)}. Wait again, do other work, or end your turn and rely on completion/stall notifications.`,
-					);
-				}
-				for (const task of watched) {
-					lines.push(summarize(task));
-					if (task.state !== "running") {
-						if (task.state === "done") {
-							const preview = presentAnswer(task, WAIT_ANSWER_PREVIEW_CHARS);
-							if (preview.text) {
-								lines.push(preview.text);
-								if (preview.truncated) {
-									lines.push(`[preview only — call external_agent_status taskId="${task.id}" for the full answer]`);
+				const report = (timedOut: boolean, aborted: boolean) => {
+					const lines: string[] = [];
+					if (unknown.length > 0) lines.push(`Unknown taskIds (ignored): ${unknown.join(", ")}`);
+					if (aborted) {
+						lines.push("Wait aborted before the tasks settled.");
+					} else if (timedOut) {
+						lines.push(
+							`Still running after ${fmtDuration(timeoutS * 1000)}. Wait again, do other work, or end your turn and rely on completion/stall notifications.`,
+						);
+					}
+					for (const task of watched) {
+						lines.push(summarize(task));
+						if (task.worktree) lines.push(`worktree: ${task.worktree.path} (branch ${task.worktree.branch})`);
+						if (task.state !== "running") {
+							// Settled evidence, worded like the notice this report replaces.
+							if (task.retainedWorktrees) lines.push(task.retainedWorktrees);
+							if (task.state === "done") {
+								if (task.verifyResult) lines.push(verifyLine(task.verifyResult));
+								const preview = presentAnswer(task, WAIT_ANSWER_PREVIEW_CHARS);
+								if (preview.text) {
+									lines.push(preview.text);
+									if (preview.truncated) {
+										lines.push(`[preview only — call external_agent_status taskId="${task.id}" for the full answer]`);
+									}
+								} else {
+									lines.push(`No answer text was parsed. Inspect with external_agent_status taskId="${task.id}".`);
 								}
 							} else {
-								lines.push(`No answer text was parsed. Inspect with external_agent_status taskId="${task.id}".`);
+								const errs = errorsOf(task);
+								if (task.spawnError) lines.push(`spawn error: ${task.spawnError}`);
+								if (errs) lines.push(`errors: ${truncate(errs, 500).text}`);
 							}
-						} else {
-							const errs = errorsOf(task);
-							if (task.spawnError) lines.push(`spawn error: ${task.spawnError}`);
-							if (errs) lines.push(`errors: ${truncate(errs, 500).text}`);
 						}
 					}
-				}
-				return lines.join("\n");
-			};
+					return lines.join("\n");
+				};
 
-			onUpdate?.({
-				content: [
-					{
-						type: "text",
-						text: `Waiting for ${watched.map((t) => t.id).join(", ")} (${waitAll ? "all" : "any"}, timeout ${timeoutS}s)`,
-					},
-				],
-				details: {},
-			});
-
-			return await new Promise((resolvePromise) => {
-				const finish = async (timedOut: boolean, aborted: boolean) => {
-					clearInterval(timer);
-					signal?.removeEventListener("abort", onAbort);
-					// Settle finalize (archive/verify) is async; the report must see its results.
-					await Promise.all(watched.map((t) => t.finalizePromise));
-					resolvePromise({
-						content: [{ type: "text", text: report(timedOut, aborted) }],
-						details: {
-							kind: "external-agent-wait",
-							timedOut,
-							aborted,
-							tasks: watched.map(taskSnapshot),
+				onUpdate?.({
+					content: [
+						{
+							type: "text",
+							text: `Waiting for ${watched.map((t) => t.id).join(", ")} (${waitAll ? "all" : "any"}, timeout ${timeoutS}s)`,
 						},
-					});
-				};
-				const check = () => {
-					const settled = watched.filter((t) => t.state !== "running");
-					const condition = waitAll ? settled.length === watched.length : settled.length > 0;
-					if (condition) return finish(false, false);
-					if (Date.now() >= deadline) return finish(true, false);
-				};
-				const onAbort = () => finish(false, true);
-				// Ref'd on purpose: an in-flight wait is active work and must keep the
-				// event loop alive (print mode exits once only unref'd handles remain).
-				const timer = setInterval(check, 2_000);
-				signal?.addEventListener("abort", onAbort);
-				check();
-			});
+					],
+					details: {},
+				});
+
+				return await new Promise((resolvePromise) => {
+					let finished = false;
+					const finish = async (timedOut: boolean, aborted: boolean) => {
+						// Idempotent: check and abort can both land before this resolves.
+						if (finished) return;
+						finished = true;
+						clearInterval(timer);
+						signal?.removeEventListener("abort", onAbort);
+						// Settle finalize (archive/verify) is async; the report must see its results.
+						await Promise.all(watched.map((t) => t.finalizePromise));
+						// Drop this call's tokens; the last waiter out settles each task. A
+						// non-aborted finish claims the settled ones — the receipt carries the
+						// answer, so the push would be a duplicate. An abort releases them
+						// instead: the tool result may never be read, so the notice goes out
+						// after all. Running tasks are left alone — their settle is still ahead.
+						for (const task of watched) {
+							task.waiters?.delete(token);
+							if (task.state === "running" || task.notified || task.notify === "off") continue;
+							if (aborted) notifyTaskSettled(task);
+							else {
+								task.notified = true;
+								taskRegistry.pendingNotificationIds.delete(task.id);
+							}
+						}
+						resolvePromise({
+							content: [{ type: "text", text: report(timedOut, aborted) }],
+							details: {
+								kind: "external-agent-wait",
+								timedOut,
+								aborted,
+								tasks: watched.map(taskSnapshot),
+							},
+						});
+					};
+					const check = () => {
+						const settled = watched.filter((t) => t.state !== "running");
+						const condition = waitAll ? settled.length === watched.length : settled.length > 0;
+						if (condition) return finish(false, false);
+						if (Date.now() >= deadline) return finish(true, false);
+					};
+					const onAbort = () => finish(false, true);
+					// Ref'd on purpose: an in-flight wait is active work and must keep the
+					// event loop alive (print mode exits once only unref'd handles remain).
+					const timer = setInterval(check, 2_000);
+					signal?.addEventListener("abort", onAbort);
+					check();
+				});
+			} catch (err) {
+				// The wait never started — no timer, no promise handed back — so no
+				// finish will ever claim or release: drop the tokens rather than hold
+				// the tasks until session_start.
+				for (const task of watched) task.waiters?.delete(token);
+				throw err;
+			}
 		},
 	});
 
@@ -3285,7 +3330,7 @@ export default function (pi: ExtensionAPI) {
 							`Continued ${task.id} (${task.agent}) in the same session; it is running again.`,
 							task.notify === "off"
 								? `No callback was requested, so poll external_agent_status taskId="${task.id}".`
-								: `You will be notified when this turn settles. Call external_agent_wait with taskIds=["${task.id}"] if you need it now.`,
+								: `You will be notified when this turn settles; a wait that returns the answer suppresses that notification.`,
 						].join(" "),
 					},
 				],
@@ -3366,10 +3411,19 @@ export default function (pi: ExtensionAPI) {
 		taskRegistry.notifySettled = (task) => notifySettled(pi, task);
 		taskRegistry.notifyWatchdog = (task, quietMs) => notifyWatchdog(pi, task, quietMs);
 		ensureWatchdogTimer();
+		// Waiters belong to the session that started them; a new session inherits no
+		// in-flight wait, so its tokens must not hold notices forever.
+		for (const task of tasks.values()) task.waiters?.clear();
 		for (const taskId of [...taskRegistry.pendingNotificationIds]) {
 			const task = tasks.get(taskId);
 			if (task) notifyTaskSettled(task);
 			else taskRegistry.pendingNotificationIds.delete(taskId);
+		}
+		// Held tasks (settled while a waiter was watching, never pushed) are not in
+		// pendingNotificationIds; with the tokens gone they are ordinary unsettled
+		// notices now.
+		for (const task of tasks.values()) {
+			if (!task.notified && task.state !== "running") notifyTaskSettled(task);
 		}
 	});
 

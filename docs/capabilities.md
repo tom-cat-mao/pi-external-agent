@@ -27,7 +27,7 @@ Persistent sessions archive each turn separately; recall pages the latest.
 `external_agent_start` / `external_agent_compare` accept
 `verify: {command, timeoutSeconds?}`. After settle to done, the hub runs the
 command via `pi.exec` in the task cwd and reports exit code plus a truncated
-output tail — in the settle notice, in status, and per compare slot. The result is
+output tail — in the settle notice, the wait report, status, and per compare slot. The result is
 never interpreted; a non-zero exit means what the caller decides. No rollback.
 
 With no caller command, a worker-declared one from `verify-report`'s `## Suggested
