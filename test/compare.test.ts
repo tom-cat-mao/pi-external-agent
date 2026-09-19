@@ -172,8 +172,8 @@ test("compare: dispatches several agents and returns one aggregated side-by-side
 			{
 				task: "say which module owns the task registry",
 				agents: [
-					{ agent: "kimi", mode: "yolo" },
-					{ agent: "kimi", mode: "yolo" },
+					{ agent: "qodercli", mode: "readonly" },
+					{ agent: "qodercli", mode: "readonly" },
 				],
 			},
 			dir,
@@ -185,7 +185,7 @@ test("compare: dispatches several agents and returns one aggregated side-by-side
 		assert.equal(details.aborted, false);
 		assert.equal(details.results.length, 2);
 
-		const [kimi_first, kimi_second] = details.results;
+// Use codex and qoter - both are persistent like the new claude
 		assert.equal(kimi_first.index, 0);
 		assert.equal(kimi_first.agent, "kimi");
 		assert.equal(claude.refused, false);
@@ -240,7 +240,7 @@ test("compare: a refused spec is recorded while the other specs still run", asyn
 				agents: [
 					{ agent: "kimi", mode: "readonly" },
 					{ agent: "claude", mode: "readonly", effort: "minimal" },
-					{ agent: "kimi", mode: "yolo" },
+					{ agent: "qodercli", mode: "readonly" },
 				],
 			},
 			dir,
@@ -282,8 +282,8 @@ test("compare: a non-readonly spec conflicts with a task already running in that
 			{
 				task: "review the change",
 				agents: [
-					{ agent: "kimi", mode: "yolo" },
-					{ agent: "kimi", mode: "yolo" },
+					{ agent: "qodercli", mode: "readonly" },
+					{ agent: "qodercli", mode: "readonly" },
 				],
 			},
 			dir,
@@ -311,8 +311,8 @@ test("compare: timeout returns the settled answers plus the taskIds still runnin
 			{
 				task: "answer slowly",
 				agents: [
-					{ agent: "kimi", mode: "yolo" },
-					{ agent: "kimi", mode: "yolo" },
+					{ agent: "qodercli", mode: "readonly" },
+					{ agent: "qodercli", mode: "readonly" },
 				],
 				timeout: 5,
 			},
@@ -379,8 +379,8 @@ test("compare: omitted effort adds no flag to any spawn argv while explicit effo
 			{
 				task: "t",
 				agents: [
-					{ agent: "kimi", mode: "yolo" },
-					{ agent: "kimi", mode: "yolo" },
+					{ agent: "qodercli", mode: "readonly" },
+					{ agent: "qodercli", mode: "readonly" },
 				],
 			},
 			dir,
@@ -397,7 +397,7 @@ test("compare: omitted effort adds no flag to any spawn argv while explicit effo
 				task: "t",
 				agents: [
 					{ agent: "claude", mode: "readonly", effort: "high" },
-					{ agent: "kimi", mode: "yolo" },
+					{ agent: "qodercli", mode: "readonly" },
 				],
 			},
 			dir,
@@ -429,7 +429,7 @@ test("compare: a persistent-session agent rides its session driver in the same b
 				task: "name the transport this agent uses",
 				agents: [
 					{ agent: "codex", mode: "yolo", effort: "high" },
-					{ agent: "kimi", mode: "yolo" },
+					{ agent: "qodercli", mode: "readonly" },
 				],
 			},
 			dir,
@@ -487,7 +487,7 @@ test("compare: a codex turn whose completion shares the turn/start response chun
 				task: "name the transport this agent uses",
 				agents: [
 					{ agent: "codex", mode: "yolo" },
-					{ agent: "kimi", mode: "yolo" },
+					{ agent: "qodercli", mode: "readonly" },
 				],
 			},
 			dir,
@@ -519,8 +519,8 @@ test("compare: long answers are trimmed to the preview bound and flagged as trun
 			{
 				task: "t",
 				agents: [
-					{ agent: "kimi", mode: "yolo" },
-					{ agent: "kimi", mode: "yolo" },
+					{ agent: "qodercli", mode: "readonly" },
+					{ agent: "qodercli", mode: "readonly" },
 				],
 			},
 			dir,
