@@ -202,7 +202,7 @@ test("wait-stall: a quiet task ends the wait early, and the claim silences the s
 		const waiting = call("external_agent_wait", { taskIds: [taskId], timeout: 60 }, controller.signal);
 		assert.equal(await stillPending(waiting, 8_000), false, "a quiet task must end the wait early, not hold it for the full timeout");
 		const result = await waiting;
-		assert.equal(result.details.stalled, true);
+		assert.equal(result.details.stalled, "quiet");
 		assert.equal(result.details.timedOut, false);
 		assert.equal(result.details.aborted, false);
 		const text = resultText(result);
@@ -230,10 +230,10 @@ test("wait-stall: an immediate second wait is throttled for the same streak", as
 		const taskId = await startGated(gate, { cwd: dir, watchdog: QUICK_WATCHDOG });
 		const first = call("external_agent_wait", { taskIds: [taskId], timeout: 60 }, firstController.signal);
 		assert.equal(await stillPending(first, 8_000), false);
-		assert.equal((await first).details.stalled, true);
+		assert.equal((await first).details.stalled, "quiet");
 		// Same silence, fresh call: the claimed streak spaces the next report out.
 		// The initial check runs synchronously, so without the claim this returns
-		// at once with stalled: true — the pending assertion is the discriminator.
+		// at once with stalled: quiet — the pending assertion is the discriminator.
 		const second = call("external_agent_wait", { taskIds: [taskId], timeout: 60 }, secondController.signal);
 		assert.equal(await stillPending(second, 400), true, "the same quiet streak must not be re-reported immediately");
 		secondController.abort();
@@ -264,9 +264,9 @@ test("wait-stall: after the per-streak cap the wait blocks again", async () => {
 		};
 		// Three notices per quiet streak; after that the model has been told and
 		// blocking again is its informed choice, not the hub's silence.
-		assert.equal((await earlyReturn()).details.stalled, true);
-		assert.equal((await earlyReturn()).details.stalled, true);
-		assert.equal((await earlyReturn()).details.stalled, true);
+		assert.equal((await earlyReturn()).details.stalled, "quiet");
+		assert.equal((await earlyReturn()).details.stalled, "quiet");
+		assert.equal((await earlyReturn()).details.stalled, "quiet");
 		const fourthController = new AbortController();
 		controllers.push(fourthController);
 		const fourth = call("external_agent_wait", { taskIds: [taskId], timeout: 60 }, fourthController.signal);
@@ -329,7 +329,7 @@ test("wait-stall: notify off suppresses delivery, never the early return", async
 		const waiting = call("external_agent_wait", { taskIds: [taskId], timeout: 60 }, controller.signal);
 		assert.equal(await stillPending(waiting, 8_000), false, "an off task still goes quiet, so the wait still returns");
 		const result = await waiting;
-		assert.equal(result.details.stalled, true);
+		assert.equal(result.details.stalled, "quiet");
 		const text = resultText(result);
 		assert.match(text, /notify is off, so no stall notice will be delivered/);
 		assert.doesNotMatch(text, /rely on the watchdog/);

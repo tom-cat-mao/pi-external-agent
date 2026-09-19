@@ -1,24 +1,24 @@
 # Architecture
 
-Where each piece lives, and how a dispatch flows. Protocol details belong to the code and the focused documents linked below.
+Where each piece lives, and how a dispatch flows. Protocol details live in the code and the linked documents.
 
 ## Dispatch flow
 
 1. **Registration** — `index.ts` registers the seven tools.
-2. **Validation** — `validateDispatch(agent, mode, cwd, effort, conflictCwd)` refuses a dispatch before spawning: modes outside adapter limits, effort outside supported range, or concurrent writes to the same effective directory (`conflictCwd`; isolate points it at a fresh worktree).
-3. **Adapter dispatch** — `ADAPTERS[agent].buildDispatch(...)` in `adapters.ts` spells the argv, returns the prompt argument index, the effective permission policy, and whether model/effort overrides are forwarded.
+2. **Validation** — `validateDispatch(agent, mode, cwd, effort, conflictCwd)` refuses a dispatch before spawning: modes outside adapter limits, effort outside supported range, or concurrent writes to the same effective directory (isolate points it at a fresh worktree).
+3. **Adapter dispatch** — `ADAPTERS[agent].buildDispatch(...)` in `adapters.ts` spells the argv, the prompt argument index, the effective policy, and whether model/effort overrides are forwarded.
 4. **Spawn and task registry** — the hub spawns the CLI and records the task under a taskId: state, cwd, mode, transport, event log, session handle, watchdog counters.
 5. **Monitoring** — stdout lines normalize via the adapter's `parseEvent` into message/reasoning/tool/usage/warning/error events, feeding the status view, notification callback, and final answer.
-6. **Watchdog** — a shared scanner notices tasks quiet for their `watchdogMs` (default 15m) and notifies the model, at most three times per streak. While scanning, tasks observed by `external_agent_wait` are skipped so the waiter can claim silence first.
-7. **Settle** — on process exit (one-shot) or turn end (persistent), the task settles, its notice fires, and the answer lands in status or the receipt. A wait that observes the settle takes the answer in its receipt instead; an aborted wait releases it, and `session_start` re-delivers what an unfinished wait held. When all watched tasks go silent past their `watchdogMs`, `external_agent_wait` returns early with `stalled:true`; the threshold ignores `notify`, which gates only the push channel. `isolate` runs the worker in a fresh git worktree that the owner merges or removes. Finalize then runs four fail-open steps: archive long or Summary+Details answers (paged recall via status `offset`), run the verify command via `pi.exec`, collect the isolated worktree's diff-stat, and append a board row if compare asked. CLI-reported usage/cost accumulates in the meter (`/external_agent_stats`). See [capabilities.md](capabilities.md).
+6. **Watchdog** — a shared scanner notices stalled tasks and notifies the model, at most three times per streak. *Quiet* means no event for the task's effective threshold (its own cadence, clamped to `watchdogMs`); *struggling* means warnings/errors keep arriving while no progress event has for 5m. `external_agent_wait` skips tasks it is watching, so the waiter can claim the stall first.
+7. **Settle** — on process exit (one-shot) or turn end (persistent), the task settles, its notice fires, and the answer lands in status or the receipt. A wait that observes the settle takes the answer in its receipt; an aborted wait releases it, and `session_start` re-delivers what a wait held. When every watched task has stalled, `external_agent_wait` returns early with `stalled:"quiet"|"struggling"`; the thresholds ignore `notify`, which gates only the push channel. `isolate` runs the worker in a fresh git worktree that the owner merges or removes. Finalize then runs four fail-open steps: archive long or Summary+Details answers, run the verify command via `pi.exec`, collect the isolated worktree's diff-stat, and append a board row if compare asked. CLI-reported usage/cost accumulates in the meter (`/external_agent_stats`). See [capabilities.md](capabilities.md).
 
 ## Receipts
 
-Every dispatch returns a receipt: the exact argv, the effective permission policy, the transport, the watchdog setting, and the model/effort forwarding notes. A persistent session's receipt starts with an empty argv; the driver backfills it after building the startup command. Unsupported overrides are reported not forwarded, and a refusal names its reason. The receipt is the honest-reporting contract — what it claims is what the target CLI was actually asked to do.
+Every dispatch returns a receipt: the exact argv, the effective permission policy, the transport, the watchdog setting, and the model/effort forwarding notes. A persistent session's receipt starts with an empty argv; the driver backfills it after building the startup command. Unsupported overrides are reported not forwarded, and a refusal names its reason. The receipt is the honest-reporting contract: it claims what the target CLI was actually asked to do.
 
 ## Transports
 
-- **One-shot** (`adapters.ts`) — a headless process per task; process exit is completion. `buildDispatch` plus `parseEvent` define this transport for every adapter.
+- **One-shot** (`adapters.ts`) — a headless process per task; process exit is completion, defined by `buildDispatch` plus `parseEvent`.
 - **Persistent** (`sessions.ts`) — a long-lived stdio session where turn end, not process exit, is the completion signal, so a follow-up keeps the conversation. Drivers: `PiRpcDriver` (pi `--mode rpc`), `CodexAppServerDriver` (`codex app-server`), `AcpDriver` (reasonix, codebuddy), `QoderStreamJsonDriver` (qoder stream-json). A driver in `SESSION_DRIVERS` (tested by `hasSessionDriver()`) selects this transport; the adapter's `session` flags say whether steer / follow-up exist. Without a driver, one-shot is the only path.
 
 ## Tool map
