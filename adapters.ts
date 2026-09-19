@@ -934,7 +934,7 @@ export const ADAPTERS: Record<AgentId, Adapter> = {
 		"claude",
 		"claude",
 		"Anthropic via the gateway pi itself is configured with",
-		"Full coding agent aligned with codebuddy status: stream-json driven with session persistence (steer/follow-up), all permission tiers open with yolo default like codex and qoder.",
+			"All tiers open; yolo default; stream-json with steer/follow-up like codebuddy.",
 		["low", "medium", "high", "xhigh", "max"],
 		"stream-json",
 		// claude-family supports bypassPermissions for yolo mode
