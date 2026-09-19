@@ -8,7 +8,7 @@
 
 ```bash
 # 锁定版本（推荐，pi update 不会动它）
-pi install git:github.com/tom-cat-mao/pi-external-agent@v0.2.0
+pi install git:github.com/tom-cat-mao/pi-external-agent@v0.4.1
 # 或跟随 main 分支
 pi install git:github.com/tom-cat-mao/pi-external-agent
 ```
@@ -34,7 +34,7 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
 | 参数 | 说明 |
 |---|---|
 | `task` | 发给每个 agent 的指令（必填；与 `external_agent_start` 一样需自包含） |
-| `agents` | 2–8 个 spec：`{ agent, cwd?, mode?, model?, effort? }`。`mode` 默认取该 agent 自身默认值，`cwd` 默认会话目录 |
+| `agents` | 2–8 个 spec：`{ agent, task?, cwd?, mode?, model?, effort? }`；spec 的 `task` 可覆盖共用任务。`mode` 默认取该 agent 自身默认值，`cwd` 默认会话目录 |
 | `timeout` | 整批的等待秒数（可选；默认 600，上限 3600） |
 
 ## 可选能力（opt-in）

@@ -153,12 +153,13 @@ export interface Adapter {
 	/** Known-degraded adapters are still callable but flagged in the tool output. */
 	degraded?: string;
 	/**
-	 * Persistent-session capability. Set only for agents that sessions.ts can
-	 * drive over a long-lived JSON-RPC stdio connection (pi/codex/reasonix/
-	 * codebuddy). Presence selects the persistent transport in index.ts; the
-	 * oneshot buildDispatch/parseEvent pair stays as the fallback path.
-	 * steerNote is surfaced verbatim in the tool description so the caller knows
-	 * what "steer" means for this agent before it tries one.
+	 * Persistent-session capability. Set for every agent sessions.ts drives over
+	 * a long-lived connection (see SESSION_DRIVERS / hasSessionDriver); index.ts
+	 * picks the persistent transport for exactly those agents and the oneshot
+	 * buildDispatch/parseEvent path for the rest — there is no fallback between
+	 * the two. The tool description is built from the adapter table's steer /
+	 * followUp flags and does not include these notes; steerNote feeds the
+	 * receipt's effective-policy line.
 	 */
 	session?: {
 		/** Mid-run guidance is possible for this agent. */

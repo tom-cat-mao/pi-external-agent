@@ -9,12 +9,12 @@ All seven agents share one dispatch path; this matrix records what each adapter 
 | `codex` | OpenAI (`codex`) | yolo | readonly–yolo | yes — `--sandbox read-only` | off, minimal–xhigh (no max) | yes | yes | — |
 | `pi` | pi itself, child process (`pi`) | yolo | readonly–yolo | yes — `--tools read,grep,find,ls` | off–max (all seven) | yes | yes | — |
 | `kimi` | Moonshot (`kimi`) | yolo | yolo only (`minMode: "yolo"`) | no | none — every effort request is refused | no | no | — |
-| `codebuddy` | Tencent CodeBuddy (`codebuddy`) | yolo | readonly–yolo | yes — `default` mode + `--settings` allow/deny rules + PreToolUse Bash hook | minimal–max (no off) | yes | yes | — |
+| `codebuddy` | Tencent CodeBuddy (`codebuddy`) | yolo | readonly–yolo | yes, best-effort — `default` mode + `--settings` allow/deny rules + heuristic PreToolUse Bash hook (not a sandbox) | minimal–max (no off) | yes | yes | — |
 | `claude` | Anthropic, via pi's configured gateway (`claude`) | readonly | readonly–write | yes — plan mode | low–max | no | no | — |
 | `reasonix` | DeepSeek-native (`reasonix`) | yolo | readonly–yolo | yes — `--permission-mode manual` | off–max (all seven) | yes | yes | — |
 | `qoder` | Qoder, Alibaba (`qodercli`) | yolo | readonly–yolo | yes — `dont_ask` + built-in tool allowlist | off, low–max (no minimal) | yes, version-gated | yes | — |
 
-`enforcesReadOnly` is `false` only for kimi. No adapter sets `degraded`, the field that flags a callable-but-known-degraded upstream in tool output. Where a CLI provides no sandbox, `write` and `yolo` are permission-rule tiers rather than an OS boundary.
+`enforcesReadOnly` is `false` only for kimi. No adapter sets `degraded`, the field that flags a callable-but-known-degraded upstream in tool output. Where a CLI provides no sandbox, `write` and `yolo` are permission-rule tiers rather than an OS boundary; codebuddy's readonly Bash hook is likewise a heuristic filter — commands it has to allow can act beyond its patterns, so readonly there is best-effort rather than a guarantee.
 
 ## kimi: yolo-only enforcement
 

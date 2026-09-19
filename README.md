@@ -8,7 +8,7 @@ A [pi](https://github.com/earendil-works/pi) extension that lets pi dispatch cod
 
 ```bash
 # Pin a version (recommended; pi update leaves pinned installs alone)
-pi install git:github.com/tom-cat-mao/pi-external-agent@v0.2.0
+pi install git:github.com/tom-cat-mao/pi-external-agent@v0.4.1
 # Or track main
 pi install git:github.com/tom-cat-mao/pi-external-agent
 ```
@@ -34,7 +34,7 @@ Requires pi ≥ 0.85 and whichever agent CLIs you want to drive (they don't all 
 | Parameter | Meaning |
 |---|---|
 | `task` | The instruction sent to every agent (required; self-contained, like `external_agent_start`) |
-| `agents` | 2–8 specs of `{ agent, cwd?, mode?, model?, effort? }`. `mode` defaults to that agent's own default, `cwd` to the session directory |
+| `agents` | 2–8 specs of `{ agent, task?, cwd?, mode?, model?, effort? }`; a spec's `task` overrides the shared one. `mode` defaults to that agent's own default, `cwd` to the session directory |
 | `timeout` | Seconds to wait for the whole batch (optional; default 600, max 3600) |
 
 ## Capabilities (opt-in)
