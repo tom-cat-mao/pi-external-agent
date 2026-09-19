@@ -40,7 +40,7 @@ const moduleHooks = registerHooks({
 
 // scanWatchdogs is interval-driven at 30s in production: too slow to exercise
 // live, so the module exports it for exactly this suite.
-const hub = (await import("../index.ts")) as {
+const hub = (await import("../src/index.ts")) as {
 	default: (pi: unknown) => void;
 	scanWatchdogs: () => void;
 };

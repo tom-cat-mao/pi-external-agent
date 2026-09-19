@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { applyTemplate, loadTemplate, TASK_PLACEHOLDER } from "../templates.ts";
+import { applyTemplate, loadTemplate, TASK_PLACEHOLDER } from "../src/templates.ts";
 
 const BUILTINS = ["evidence-research", "verify-report", "review-report", "relay-envelope", "board-entry"];
 

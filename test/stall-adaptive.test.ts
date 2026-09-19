@@ -38,7 +38,7 @@ const moduleHooks = registerHooks({
 	},
 });
 
-const hub = (await import("../index.ts")) as any;
+const hub = (await import("../src/index.ts")) as any;
 moduleHooks.deregister();
 
 const MIN = 60_000;

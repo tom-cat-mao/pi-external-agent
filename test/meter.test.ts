@@ -8,8 +8,8 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createMeter } from "../meter.ts";
-import { ADAPTERS } from "../adapters.ts";
+import { createMeter } from "../src/meter.ts";
+import { ADAPTERS } from "../src/adapters.ts";
 
 test("meter: samples for one task accumulate field by field", () => {
 	const meter = createMeter();

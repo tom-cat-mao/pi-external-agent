@@ -4,7 +4,7 @@
  * Each adapter knows two things and nothing else:
  *   - buildDispatch: how to spell and describe a headless, structured-output invocation
  *   - parseEvent: how to turn one stdout line into a normalized event
- * Everything else (spawn, monitoring, abort, bookkeeping) is shared in index.ts.
+ * Everything else (spawn, monitoring, abort, bookkeeping) is shared in hub/registry.ts.
  *
  * Capabilities as currently wired:
  *   codex     -> OpenAI; yolo workhorse with its own sandbox tiers (read-only / workspace-write / danger-full-access)
@@ -21,7 +21,7 @@
  *   qoder     -> yolo default, stream-json driven; steering is version-gated.
  *                Why: .agents/notes/implemented/2026-09-15-qoder-steering-version-gate.md
  *
- * Effort flags as currently supported (index.ts refuses anything else):
+ * Effort flags as currently supported (hub/registry.ts refuses anything else):
  *   pi        -> --thinking <off|minimal|low|medium|high|xhigh|max>
  *   codebuddy -> --effort <minimal|low|medium|high|xhigh|max>
  *   claude    -> --effort <low|medium|high|xhigh|max>
@@ -40,7 +40,7 @@ export type Mode = "readonly" | "write" | "yolo";
 
 /**
  * Reasoning effort, normalized across CLIs. Not every adapter supports every
- * level (or any level): Adapter.supportedEfforts is the allowlist, index.ts
+ * level (or any level): Adapter.supportedEfforts is the allowlist, hub/registry.ts
  * refuses anything outside it. "off" is spelled "none" in the codex family.
  */
 export const EFFORT_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
@@ -48,7 +48,7 @@ export type Effort = (typeof EFFORT_LEVELS)[number];
 
 /**
  * Wire spellings of the normalized effort scale, exported so the persistent
- * session drivers in sessions.ts can map with the same vocabulary the
+ * session drivers in drivers/ can map with the same vocabulary the
  * one-shot buildDispatch paths use instead of re-deriving it.
  *
  * codex: "off" is spelled "none" (both the -c config override and app-server).
@@ -162,9 +162,9 @@ export interface Adapter {
 	/** Known-degraded adapters are still callable but flagged in the tool output. */
 	degraded?: string;
 	/**
-	 * Persistent-session capability. Set for every agent sessions.ts drives over
-	 * a long-lived connection (see SESSION_DRIVERS / hasSessionDriver); index.ts
-	 * picks the persistent transport for exactly those agents and the oneshot
+	 * Persistent-session capability. Set for every agent drivers/ drives over
+	 * a long-lived connection (see SESSION_DRIVERS / hasSessionDriver); the hub's
+	 * registry picks the persistent transport for exactly those agents and the oneshot
 	 * buildDispatch/parseEvent path for the rest — there is no fallback between
 	 * the two. The tool description is built from the adapter table's steer /
 	 * followUp flags and does not include these notes; steerNote feeds the
@@ -336,7 +336,7 @@ function claudeResultEvent(rec: any): AgentEvent {
 /**
  * claude emits its result as ONE compact single-line JSON object (possibly an
  * array of records), so line-framed parsing plus the close-time buffer flush
- * in index.ts works. codebuddy's `--output-format json` is PRETTY-PRINTED
+ * in hub/registry.ts works. codebuddy's `--output-format json` is PRETTY-PRINTED
  * multi-line JSON instead (133 lines for a one-word answer, verified on
  * 2.117.1): every line fails JSON.parse individually and the trailing flush
  * sees only the final "]", so the answer never surfaces. codebuddy therefore
@@ -413,7 +413,7 @@ function parseClaudeFamilyStreamLine(line: string): AgentEvent | null {
  * call time, so it stays correct wherever the extension is installed.
  */
 export function buildReadonlySettings(): string {
-	const hookPath = fileURLToPath(new URL("./hooks/codebuddy-readonly.js", import.meta.url));
+	const hookPath = fileURLToPath(new URL("../hooks/codebuddy-readonly.js", import.meta.url));
 	const quotedHookPath = `'${hookPath.replaceAll("'", `'\\''`)}'`;
 	return JSON.stringify({
 		permissions: {
