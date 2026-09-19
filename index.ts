@@ -133,6 +133,14 @@ interface Task {
 	endedAt?: number;
 	/** Timestamp of the most recent parsed event; drives staleness reporting. */
 	lastEventAt: number;
+	/**
+	 * Timestamp of the most recent message/reasoning/tool event. Usage/warning/
+	 * error events move lastEventAt only: noise can flow while no progress does,
+	 * which is the shape stallStruggling reads. Internal, like the samples below.
+	 */
+	lastMeaningfulEventAt: number;
+	/** Ring of the last meaningful-event gaps (ms); their median is the task's own cadence. */
+	meaningfulIntervals: number[];
 	events: AgentEvent[];
 	stderr: string;
 	exitCode: number | null;
@@ -233,13 +241,16 @@ type ExternalAgentStatusDetails =
 
 type ExternalAgentStopDetails = { stopped: string[] } | { taskId: string; state: TaskState } | Record<string, never>;
 
+/** Why a wait returned early: silence, or noise without progress. False when it did not. */
+type StallKind = "quiet" | "struggling";
+
 type ExternalAgentWaitDetails =
 	| {
 			kind: "external-agent-wait";
 			timedOut: boolean;
 			aborted: boolean;
-			/** True when the wait returned early because every watched task went quiet past its watchdog. */
-			stalled: boolean;
+			/** Truthy when the wait returned early because every watched task had stalled. */
+			stalled: false | StallKind;
 			tasks: TaskSnapshot[];
 		}
 	| Record<string, never>;
@@ -322,7 +333,7 @@ interface SharedTaskRegistry {
 	tasks: Map<string, Task>;
 	sequence: number;
 	notifySettled?: (task: Task) => void;
-	notifyWatchdog?: (task: Task, quietMs: number) => void;
+	notifyWatchdog?: (task: Task, stall: StallKind) => void;
 	/** Single shared watchdog interval; survives /reload like the task map itself. */
 	watchdogTimer?: ReturnType<typeof setInterval>;
 	pendingNotificationIds: Set<string>;
@@ -337,6 +348,13 @@ function getTaskRegistry(): SharedTaskRegistry {
 		if (!(existing.tasks instanceof Map)) existing.tasks = new Map();
 		if (!Number.isInteger(existing.sequence) || (existing.sequence ?? 0) < 0) existing.sequence = 0;
 		if (!(existing.pendingNotificationIds instanceof Set)) existing.pendingNotificationIds = new Set();
+		// /reload carries live tasks across module instances, so a task created by
+		// an older build lacks the stall fields; undefined would crash the scanner
+		// (a median needs an array) on the first tick after a reload.
+		for (const task of existing.tasks.values()) {
+			if (typeof task.lastMeaningfulEventAt !== "number") task.lastMeaningfulEventAt = task.lastEventAt;
+			if (!Array.isArray(task.meaningfulIntervals)) task.meaningfulIntervals = [];
+		}
 		return existing as SharedTaskRegistry;
 	}
 	const created: SharedTaskRegistry = { tasks: new Map(), sequence: 0, pendingNotificationIds: new Set() };
@@ -383,7 +401,23 @@ const MAX_STDERR_CHARS = 8_000;
 const NOTIFY_PREVIEW_CHARS = 4_000; // completion callbacks stay small on purpose
 const DEFAULT_WATCHDOG_MS = 15 * 60_000; // stall notice after 15m quiet
 const WATCHDOG_SCAN_INTERVAL_MS = 30_000;
-const MAX_WATCHDOG_NOTICES = 3; // per quiet streak; then it stays silent
+const MAX_WATCHDOG_NOTICES = 3; // per stall streak (quiet or struggling); then it stays silent
+/**
+ * Adaptive silence threshold: 8× the task's median meaningful-event gap, held
+ * between 3m and the user's watchdog. 8 tolerates one unusually long step; the
+ * floor keeps a single long tool call from reading as a stall; 5 samples keep a
+ * young task on its watchdog until its cadence is actually known.
+ */
+const STALL_FACTOR = 8;
+const STALL_FLOOR_MS = 3 * 60_000;
+const STALL_SAMPLE_MIN = 5;
+const MEANINGFUL_INTERVAL_WINDOW = 16;
+/**
+ * Struggling: no message/reasoning/tool event for this long while warnings or
+ * errors are still arriving is the retry-storm shape. Real reconnect loops
+ * retry every 60–120s, so 5m tolerates 2–3 attempts before reporting.
+ */
+const STRUGGLE_MS = 5 * 60_000;
 const WAIT_DEFAULT_TIMEOUT_S = 600;
 const WAIT_MAX_TIMEOUT_S = 3_600;
 const WAIT_ANSWER_PREVIEW_CHARS = 8_000;
@@ -570,7 +604,7 @@ function usageOf(task: Task): string | undefined {
 
 /** One-line status suitable for both TUI streaming and model consumption. */
 function summarize(task: Task): string {
-	const now = Date.now();
+	const now = stallClock.now();
 	const elapsed = fmtDuration((task.endedAt ?? now) - task.startedAt);
 	const parts = [`[${task.id}] ${task.state} · ${elapsed}`];
 
@@ -897,48 +931,140 @@ function notifySettled(pi: ExtensionAPI, task: Task): void {
  * settles, never notifies, and a sleeping model would never find out. The scan
  * lives on the shared registry so /reload cannot stack duplicate intervals; the
  * per-session delivery callback is rebound on every session_start exactly like
- * notifySettled. notify "off" suppresses delivery, never the quiet detection
- * itself: an off task still ends a blocking wait early, because the wait reads
- * the clock, not the push channel.
+ * notifySettled. notify "off" suppresses delivery, never stall detection itself:
+ * an off task still ends a blocking wait early, because the wait reads the
+ * clocks, not the push channel.
+ *
+ * Two clocks feed one verdict. lastEventAt answers "is anything arriving at
+ * all?" (quiet); lastMeaningfulEventAt answers "is any progress happening?"
+ * (struggling). A task can be busy and stuck at once — that is exactly what a
+ * retry storm under a network outage looks like.
  */
 
-/** The shared stall predicate: watchdog armed and quiet at least that long (0 disables). */
-function stallQuiet(task: Task, now: number): boolean {
-	return task.watchdogMs > 0 && now - task.lastEventAt >= task.watchdogMs;
+/**
+ * The stall clock. Thresholds run to minutes, so time is the one input a suite
+ * cannot produce by waiting; tests replace now(), production only reads it.
+ */
+export const stallClock = { now: (): number => Date.now() };
+
+/** message/reasoning/tool are progress; usage/warning/error are noise around it. */
+function isMeaningfulEvent(event: AgentEvent): boolean {
+	return event.kind === "message" || event.kind === "reasoning" || event.kind === "tool";
+}
+
+/** The last progress signal's text, compacted for the struggle wording. */
+function lastMeaningfulExcerpt(task: Task): string {
+	for (let index = task.events.length - 1; index >= 0; index -= 1) {
+		const event = task.events[index];
+		if (isMeaningfulEvent(event)) return event.text.replace(/\s+/g, " ").trim().slice(0, 120);
+	}
+	return "(none yet)";
+}
+
+/** Median of the samples; an even count averages the two middle ones. */
+function medianOf(samples: number[]): number {
+	const sorted = [...samples].sort((a, b) => a - b);
+	const middle = Math.floor(sorted.length / 2);
+	return sorted.length % 2 === 1 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
 }
 
 /**
- * Whether a stall notice is due for the current quiet streak: new activity
- * resets the streak, then repeats are spaced by the watchdog and capped per
- * streak. Shared by the push (notifyWatchdog) and the wait's early return, so
- * the two channels cannot double-report the same silence. Claiming is separate
+ * The silence threshold. A task with a known cadence is judged against it — 8×
+ * the median meaningful-event gap — so trailing silence is noticed sooner than
+ * the watchdog would; a task without five measured gaps keeps the user's
+ * watchdog. The 3m floor keeps one long tool call from reading as a stall; the
+ * watchdog ceiling keeps the explicit setting as the slowest possible threshold.
+ */
+function effectiveStallMs(task: Task): number {
+	if (task.meaningfulIntervals.length < STALL_SAMPLE_MIN) return task.watchdogMs;
+	return Math.min(
+		Math.max(STALL_FACTOR * medianOf(task.meaningfulIntervals), STALL_FLOOR_MS),
+		task.watchdogMs,
+	);
+}
+
+/** Quiet: no event at all for the effective threshold. watchdogMs 0 disables both detectors. */
+function stallQuiet(task: Task, now: number): boolean {
+	return task.watchdogMs > 0 && now - task.lastEventAt >= effectiveStallMs(task);
+}
+
+/**
+ * Struggling: noise is still arriving (warnings/errors/usage) but nothing
+ * meaningful has for STRUGGLE_MS. A task with no event at all is quiet, not
+ * struggling — pure silence stays the user's watchdog's call.
+ */
+function stallStruggling(task: Task, now: number): boolean {
+	return (
+		task.watchdogMs > 0 &&
+		task.lastEventAt > task.lastMeaningfulEventAt &&
+		now - task.lastMeaningfulEventAt >= STRUGGLE_MS
+	);
+}
+
+/** The stall a task is in, or null. Silence outranks noise: both true reads quiet. */
+function stallKind(task: Task, now: number): StallKind | null {
+	if (stallQuiet(task, now)) return "quiet";
+	if (stallStruggling(task, now)) return "struggling";
+	return null;
+}
+
+/** The clock a kind is measured against; a notice streak resets when it advances. */
+function stallAnchor(task: Task, stall: StallKind): number {
+	return stall === "quiet" ? task.lastEventAt : task.lastMeaningfulEventAt;
+}
+
+/** One report phrase per kind: quiet measures silence, struggling measures noise. */
+function stallPhrase(task: Task, stall: StallKind, now: number): string {
+	if (stall === "quiet") return `quiet for ${fmtDuration(now - task.lastEventAt)}`;
+	return `only warnings/errors for ${fmtDuration(now - task.lastMeaningfulEventAt)}; last meaningful: ${lastMeaningfulExcerpt(task)}`;
+}
+
+/**
+ * Whether a stall notice is due for the current streak of this kind. An event
+ * the kind is anchored to — any event for quiet, a meaningful one for
+ * struggling — resets the streak; repeats are spaced by the threshold that
+ * produced them, the effective silence threshold or the struggle gap, and
+ * capped per streak. Shared by the scan (scanWatchdogs/notifyWatchdog) and
+ * the wait's early return, so the two channels cannot double-report the same
+ * stall; note how the struggling anchor ignores error traffic, which would otherwise reset the cap
+ * on every retry and turn the notices into a storm. Claiming is separate
  * (claimStallNotice) because a failed delivery must retry on the next scan.
  */
-function stallNoticeDue(task: Task, now: number): boolean {
-	if (task.lastWatchdogNoticeAt > 0 && task.lastEventAt > task.lastWatchdogNoticeAt) {
+function stallNoticeDue(task: Task, now: number, stall: StallKind): boolean {
+	const anchor = stallAnchor(task, stall);
+	if (task.lastWatchdogNoticeAt > 0 && anchor > task.lastWatchdogNoticeAt) {
 		task.watchdogNotices = 0;
 	}
-	if (task.watchdogNotices >= MAX_WATCHDOG_NOTICES && task.lastWatchdogNoticeAt > task.lastEventAt) return false;
-	if (task.lastWatchdogNoticeAt > task.lastEventAt && now - task.lastWatchdogNoticeAt < task.watchdogMs) return false;
+	if (task.watchdogNotices >= MAX_WATCHDOG_NOTICES && task.lastWatchdogNoticeAt > anchor) return false;
+	const spacing = stall === "quiet" ? effectiveStallMs(task) : STRUGGLE_MS;
+	if (task.lastWatchdogNoticeAt > anchor && now - task.lastWatchdogNoticeAt < spacing) return false;
 	return true;
 }
 
-/** Consume one notice slot for this quiet streak; the caller must deliver or report. */
+/** Consume one notice slot for this stall streak; the caller must deliver or report. */
 function claimStallNotice(task: Task, now: number): void {
 	task.lastWatchdogNoticeAt = now;
 	task.watchdogNotices += 1;
 }
 
-function notifyWatchdog(pi: ExtensionAPI, task: Task, quietMs: number): void {
-	const elapsed = fmtDuration((task.endedAt ?? Date.now()) - task.startedAt);
+function notifyWatchdog(pi: ExtensionAPI, task: Task, stall: StallKind): void {
+	const now = stallClock.now();
+	const stalledFor = now - stallAnchor(task, stall);
+	const elapsed = fmtDuration((task.endedAt ?? now) - task.startedAt);
+	const reason =
+		stall === "quiet"
+			? `has been quiet for ${fmtDuration(stalledFor)}`
+			: `has shown only warnings/errors for ${fmtDuration(stalledFor)}; last meaningful: ${lastMeaningfulExcerpt(task)}`;
 	const ordinal = task.watchdogNotices + 1;
 	const lines = [
-		`External agent ${task.id} (${task.agent}) is still running but has been quiet for ${fmtDuration(quietMs)} (elapsed ${elapsed}).`,
-		"This is a stall warning, not a completion. No action is required if the quiet is expected.",
+		`External agent ${task.id} (${task.agent}) is still running but ${reason} (elapsed ${elapsed}).`,
+		stall === "quiet"
+			? "This is a stall warning, not a completion. No action is required if the quiet is expected."
+			: "This is a stall warning, not a completion. No action is required if the retries are expected.",
 		`Inspect with external_agent_status taskId="${task.id}", or stop it with external_agent_stop if you judge it stuck.`,
 	];
 	if (ordinal >= MAX_WATCHDOG_NOTICES) {
-		lines.push(`This is stall notice ${ordinal}; further notices for this quiet streak are suppressed.`);
+		lines.push(`This is stall notice ${ordinal}; further notices for this stall streak are suppressed.`);
 	}
 	try {
 		pi.sendMessage(
@@ -951,7 +1077,8 @@ function notifyWatchdog(pi: ExtensionAPI, task: Task, quietMs: number): void {
 					taskId: task.id,
 					agent: task.agent,
 					state: task.state,
-					quietMs,
+					stall,
+					stalledForMs: stalledFor,
 					task: taskSnapshot(task),
 				},
 			},
@@ -960,7 +1087,7 @@ function notifyWatchdog(pi: ExtensionAPI, task: Task, quietMs: number): void {
 				triggerTurn: task.notify !== "nextTurn",
 			},
 		);
-		claimStallNotice(task, Date.now());
+		claimStallNotice(task, now);
 	} catch {
 		// Delivery failed (e.g. mid-reload); the next scan retries.
 	}
@@ -973,18 +1100,34 @@ function notifyWatchdog(pi: ExtensionAPI, task: Task, quietMs: number): void {
 export function scanWatchdogs(): void {
 	const deliver = taskRegistry.notifyWatchdog;
 	if (!deliver) return;
-	const now = Date.now();
+	const now = stallClock.now();
 	for (const task of tasks.values()) {
 		if (task.state !== "running") continue;
 		if (task.notify === "off") continue;
-		// A waiter perceives the same quiet through its own early return; a push
+		// A waiter perceives the same stall through its own early return; a push
 		// on top of that would be a duplicate delivery, not a safety net.
 		if (task.waiters?.size) continue;
-		if (!stallQuiet(task, now)) continue;
-		if (!stallNoticeDue(task, now)) continue;
-		deliver(task, now - task.lastEventAt);
+		const stall = stallKind(task, now);
+		if (!stall) continue;
+		if (!stallNoticeDue(task, now, stall)) continue;
+		deliver(task, stall);
 	}
 }
+
+/**
+ * Exported for tests: stall suites drive the clock and the event record
+ * directly, because thresholds run to minutes and no target CLI emits
+ * warning/error streams on stdout (kimi writes them to stderr). The predicates
+ * are the production ones.
+ */
+export const stallTestApi = {
+	task: (id: string): Task | undefined => tasks.get(id),
+	record: (task: Task, event: AgentEvent): void => pushEvent(task, event),
+	quiet: stallQuiet,
+	struggling: stallStruggling,
+	kind: stallKind,
+	effectiveMs: effectiveStallMs,
+};
 
 function ensureWatchdogTimer(): void {
 	if (taskRegistry.watchdogTimer) return;
@@ -1167,6 +1310,9 @@ function createTask(
 	// Isolate hands in the id it already used to name the worktree; everyone else
 	// gets the next one here, exactly as before.
 	const id = preallocatedId ?? nextId(agent);
+	// One clock read for the whole prologue: startedAt and both event clocks must
+	// agree, or a fresh task would look stalled before its first event lands.
+	const startedAt = stallClock.now();
 	const task: Task = {
 		id,
 		agent,
@@ -1179,8 +1325,10 @@ function createTask(
 		transport,
 		answerStartIndex: 0,
 		sessionAlive: transport === "persistent",
-		startedAt: Date.now(),
-		lastEventAt: Date.now(),
+		startedAt,
+		lastEventAt: startedAt,
+		lastMeaningfulEventAt: startedAt,
+		meaningfulIntervals: [],
 		events: [],
 		stderr: "",
 		exitCode: null,
@@ -1347,7 +1495,15 @@ function pushEvent(task: Task, event: AgentEvent): void {
 		task.events.shift();
 		if (task.answerStartIndex > 0) task.answerStartIndex -= 1;
 	}
-	task.lastEventAt = Date.now();
+	const now = stallClock.now();
+	if (isMeaningfulEvent(event)) {
+		// The gap since the previous meaningful event (start counts as one) is
+		// this task's cadence sample; only the recent window is kept.
+		task.meaningfulIntervals.push(now - task.lastMeaningfulEventAt);
+		if (task.meaningfulIntervals.length > MEANINGFUL_INTERVAL_WINDOW) task.meaningfulIntervals.shift();
+		task.lastMeaningfulEventAt = now;
+	}
+	task.lastEventAt = now;
 	task.eventSeq += 1;
 	meterUsageEvent(task.id, event);
 }
@@ -1404,7 +1560,11 @@ function beginFollowUpTurn(task: Task): void {
 	task.notified = false;
 	task.exitCode = null;
 	task.spawnError = undefined;
-	task.lastEventAt = Date.now();
+	// Both clocks restart with the turn: the idle gap between turns is neither
+	// silence nor struggle, and counting it would fire a notice on a fresh turn.
+	const now = stallClock.now();
+	task.lastEventAt = now;
+	task.lastMeaningfulEventAt = now;
 	task.watchdogNotices = 0;
 	clearIdleReap(task);
 }
@@ -2819,7 +2979,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const waitAll = params.mode !== "any";
-			// notify "off" suppresses delivery, not the quiet threshold: the wait still
+			// notify "off" suppresses delivery, not stall detection: the wait still
 			// ends early below, only the wording of its advice changes.
 			const allNotifyOff = watched.every((t) => t.notify === "off");
 			// Registered before the first await, so a settle racing this call cannot
@@ -2834,9 +2994,9 @@ export default function (pi: ExtensionAPI) {
 					typeof params.timeout === "number" && Number.isFinite(params.timeout)
 						? Math.min(Math.max(params.timeout, 5), WAIT_MAX_TIMEOUT_S)
 						: WAIT_DEFAULT_TIMEOUT_S;
-				const deadline = Date.now() + timeoutS * 1000;
+				const deadline = stallClock.now() + timeoutS * 1000;
 
-				const report = (timedOut: boolean, aborted: boolean, stalled: boolean) => {
+				const report = (timedOut: boolean, aborted: boolean, stalled: false | StallKind) => {
 					const lines: string[] = [];
 					if (unknown.length > 0) lines.push(`Unknown taskIds (ignored): ${unknown.join(", ")}`);
 					if (aborted) {
@@ -2844,10 +3004,13 @@ export default function (pi: ExtensionAPI) {
 					} else if (stalled) {
 						// Worded like the timeout report it stands in for: the task may still
 						// be alive, but while this call blocks no stall notice can get through.
-						const quiet = watched.filter((t) => t.state === "running");
-						const quietFor = quiet.map((t) => `${t.id} quiet for ${fmtDuration(Date.now() - t.lastEventAt)}`).join(", ");
+						const now = stallClock.now();
+						const stalledFor = watched
+							.filter((t) => t.state === "running")
+							.map((t) => `${t.id} ${stallPhrase(t, stallKind(t, now) ?? stalled, now)}`)
+							.join(", ");
 						lines.push(
-							`${quietFor} — ` +
+							`${stalledFor} — ` +
 								(allNotifyOff
 									? "notify is off, so no stall notice will be delivered: wait again, steer/stop it, or poll external_agent_status."
 									: "no stall notice can reach you while this call blocks: wait again, steer/stop it, or end your turn and rely on the watchdog."),
@@ -2899,7 +3062,7 @@ export default function (pi: ExtensionAPI) {
 
 				return await new Promise((resolvePromise) => {
 					let finished = false;
-					const finish = async (timedOut: boolean, aborted: boolean, stalled: boolean) => {
+					const finish = async (timedOut: boolean, aborted: boolean, stalled: false | StallKind) => {
 						// Idempotent: check and abort can both land before this resolves.
 						if (finished) return;
 						finished = true;
@@ -2936,20 +3099,24 @@ export default function (pi: ExtensionAPI) {
 						const settled = watched.filter((t) => t.state !== "running");
 						const condition = waitAll ? settled.length === watched.length : settled.length > 0;
 						if (condition) return finish(false, false, false);
-						const now = Date.now();
+						const now = stallClock.now();
 						if (now >= deadline) return finish(true, false, false);
-						// Third exit: every running task is quiet past its watchdog, so the
+						// Third exit: every running task has stalled — quiet past its
+						// effective threshold, or struggling past the meaningful gap — so the
 						// stall notice the model is waiting for cannot reach it while this
 						// call blocks. Settle above always wins; a mode "any" batch still
-						// needs all of its tasks quiet. Claiming one notice slot per quiet
-						// streak keeps a wait-again loop from re-reporting the same silence,
-						// and once the streak hits its cap the model has been told, so the
-						// wait stays blocked — continuing is then an informed choice.
+						// needs all of its tasks stalled. Claiming one notice slot per stall
+						// streak, shared with the scanner, keeps a wait-again loop from
+						// re-reporting a stall already reported, and once the streak hits
+						// its cap the model has been told: continuing is then an informed
+						// choice. A mixed batch reports the worse of the two kinds.
 						const running = watched.filter((t) => t.state === "running");
-						if (running.length === 0 || running.some((t) => !stallQuiet(t, now))) return;
-						if (!running.every((t) => stallNoticeDue(t, now))) return;
+						if (running.length === 0) return;
+						const stalls = running.map((t) => stallKind(t, now));
+						if (stalls.some((stall) => stall === null)) return;
+						if (!running.every((task, index) => stallNoticeDue(task, now, stalls[index]!))) return;
 						for (const task of running) claimStallNotice(task, now);
-						return finish(false, false, true);
+						return finish(false, false, stalls.every((stall) => stall === "quiet") ? "quiet" : "struggling");
 					};
 					const onAbort = () => finish(false, true, false);
 					// Ref'd on purpose: an in-flight wait is active work and must keep the
@@ -3498,7 +3665,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", () => {
 		taskRegistry.notifySettled = (task) => notifySettled(pi, task);
-		taskRegistry.notifyWatchdog = (task, quietMs) => notifyWatchdog(pi, task, quietMs);
+		taskRegistry.notifyWatchdog = (task, stall) => notifyWatchdog(pi, task, stall);
 		ensureWatchdogTimer();
 		// Waiters belong to the session that started them; a new session inherits no
 		// in-flight wait, so its tokens must not hold notices forever.
