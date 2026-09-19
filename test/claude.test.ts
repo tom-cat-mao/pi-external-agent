@@ -6,10 +6,12 @@ import { SESSION_DRIVERS, STEER_AGENT_IDS, FOLLOWUP_AGENT_IDS } from "../session
 test("claude adapter basics", () => {
 	const a = ADAPTERS.claude;
 	assert.equal(a.bin, "claude");
-	assert.equal(a.provider, "Anthropic via the gateway pi itself is configured with");
+	assert.equal(a.provider, "Anthropic");
 	assert.equal(a.defaultMode, "yolo");
 	assert.equal(a.maxMode, "yolo");
 	assert.equal(a.enforcesReadOnly, true);
+	assert.equal(a.driverEnforcedReadOnly, true);
+	assert.equal(a.degraded, "unverified against a real endpoint; fixture-tested only");
 	assert.equal(a.session?.steer, true);
 	assert.equal(a.session?.followUp, true);
 	assert.match(a.session?.steerNote ?? "", /LF-framed user messages/);
@@ -22,13 +24,14 @@ test("claude is steerable and follow-up capable in the capability lists", () => 
 	assert.equal(FOLLOWUP_AGENT_IDS.includes("claude"), true);
 });
 
-test("claude one-shot dispatch: mode mapping to permission modes", () => {
+test("claude stream-json mapping: mode to permission flags, readonly to driver enforcement", () => {
 	const ro = ADAPTERS.claude.buildDispatch({ task: "audit", cwd: "/tmp", mode: "readonly" });
 	assert.deepEqual(ro.argv.slice(0, 3), ["-p", "audit", "--output-format"]);
 	assert.equal(ro.argv[3], "stream-json");
 	assert.equal(ro.argv[ro.argv.indexOf("--permission-mode") + 1], "dontAsk");
 	assert.equal(ro.promptArgIndex, 1);
-	assert.equal(ro.readOnlyEnforcement, "harness-enforced");
+	// readonly is answered by the driver's can_use_tool deny, not by the CLI
+	assert.equal(ro.readOnlyEnforcement, "driver-enforced");
 	assert.match(ro.effectivePolicy ?? "", /dontAsk/);
 
 	const write = ADAPTERS.claude.buildDispatch({ task: "t", cwd: "/tmp", mode: "write" });
@@ -54,7 +57,7 @@ test("claude model and effort receipts", () => {
 
 test("claude parser: init noise, assistant text skip, tool_use, result, error", () => {
 	const parse = ADAPTERS.claude.parseEvent;
-	// system/init should be dropped (no signal in one-shot mode)
+	// system/init is handshake noise on the session channel, not an event
 	assert.equal(parse('{"type":"system","subtype":"init"}'), null);
 	// Assistant text (single block) is skipped in stream mode
 	assert.equal(parse('{"type":"assistant","message":{"content":[{"type":"text","text":"PONG"}]}}'), null);
@@ -125,31 +128,41 @@ test("claude steer message: priority next with shouldQuery false, never now", as
 	assert.equal(typeof sent[0].uuid, "string");
 });
 
-test("claude can_use_tool control request respects mode", async () => {
-	const driver = SESSION_DRIVERS.claude!() as any;
-	const events: any[] = [];
-	driver.onEvent((event: unknown) => events.push(event));
-	const written: any[] = [];
-	driver.writeLine = (obj: unknown) => written.push(obj);
-	driver.proc = { stdin: {}, on: () => {} };
-	driver.active = true;
-	driver.turnStarted = true;
-	driver.mode = "readonly";
+test("claude can_use_tool: readonly denies, write and yolo allow", () => {
+	// One dispatch per mode: readonly is fail-closed because nothing else
+	// bounds the run; write/yolo run under their own CLI permission mode, the
+	// same split the ACP driver makes.
+	const answer = (mode: string) => {
+		const driver = SESSION_DRIVERS.claude!() as any;
+		const written: any[] = [];
+		driver.writeLine = (obj: unknown) => written.push(obj);
+		driver.proc = { stdin: {}, on: () => {} };
+		driver.active = true;
+		driver.turnStarted = true;
+		driver.mode = mode;
+		driver.handleLine(JSON.stringify({
+			type: "control_request",
+			request_id: "c1",
+			request: { subtype: "can_use_tool", tool_use_id: "tool_123", input: { file: "x" } },
+		}));
+		return written;
+	};
 
-	// Trigger can_use_tool in readonly mode
-	driver.handleLine(JSON.stringify({
-		type: "control_request",
-		request_id: "c1",
-		request: { subtype: "can_use_tool", tool_use_id: "tool_123", input: { file: "x" } },
-	}));
+	const readonly = answer("readonly");
+	assert.equal(readonly.length, 1);
+	assert.equal(readonly[0].type, "control_response");
+	assert.equal(readonly[0].response.subtype, "success");
+	assert.equal(readonly[0].response.request_id, "c1");
+	assert.equal(readonly[0].response.response.behavior, "deny");
+	assert.equal(readonly[0].response.response.message?.includes("readonly"), true);
+	assert.equal(readonly[0].response.response.toolUseID, "tool_123");
 
-	// Verify response was written with deny behavior for readonly mode
-	assert.equal(written.length, 1);
-	assert.equal(written[0].type, "control_response");
-	assert.equal(written[0].response.subtype, "success");
-	assert.equal(written[0].response.request_id, "c1");
-	assert.equal(written[0].response.response.behavior, "deny");
-	assert.equal(written[0].response.response.message?.includes("readonly"), true);
+	for (const mode of ["write", "yolo"]) {
+		const allowed = answer(mode);
+		assert.equal(allowed.length, 1, `${mode}: one response`);
+		assert.equal(allowed[0].response.response.behavior, "allow", `${mode} allows the tool`);
+		assert.deepEqual(allowed[0].response.response.updatedInput, { file: "x" });
+	}
 });
 
 test("claude child assistant errors do not settle the main turn", () => {
@@ -182,16 +195,23 @@ test("claude a later complete main assistant message clears earlier truncation",
 	assert.deepEqual(turns, [{ status: "done" }]);
 });
 
-test("claude api_retry events are handled as warnings", () => {
+test("claude api_retry events surface as warnings with attempt/max_retries", () => {
 	const driver = SESSION_DRIVERS.claude!() as any;
 	const events: any[] = [];
+	const turns: any[] = [];
 	driver.onEvent((event: unknown) => events.push(event));
+	driver.onTurnEnd((turn: unknown) => turns.push(turn));
 	driver.active = true;
+	driver.turnStarted = true;
 	driver.handleLine(JSON.stringify({
 		type: "assistant",
 		message: { content: [] },
 		api_retry: { attempt: 1, max_retries: 10, error_status: 524, category: "timeout" },
 	}));
-	// api_retry would surface as warning if parsed
-	assert.equal(true, true); // placeholder for api_retry handling verification
+	assert.equal(events.length, 1);
+	assert.equal(events[0].kind, "warning");
+	assert.match(events[0].text, /api retry 1\/10/);
+	assert.match(events[0].text, /status 524/);
+	// A retry is not a settle signal: the turn is still running.
+	assert.deepEqual(turns, []);
 });

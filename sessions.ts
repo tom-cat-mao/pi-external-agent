@@ -8,7 +8,7 @@
  * signal moves from "process exited" to "turn ended" while the process stays up
  * for follow-ups.
  *
- * Four wire protocols, one interface:
+ * Five wire protocols, one interface:
  *
  *   PiRpcDriver           pi --mode rpc        — line JSON commands + events
  *   CodexAppServerDriver  codex app-server     — JSON-RPC 2.0, experimental
@@ -101,7 +101,7 @@ export interface SessionDriver {
 // ---------------------------------------------------------------------------
 
 /**
- * spawn + strict LF framing + stderr capture, shared by all three protocols.
+ * spawn + strict LF framing + stderr capture, shared by every driver.
  *
  * LF only, never `readline`: pi's rpc docs call out that Node's readline also
  * splits on U+2028/U+2029, which are legal inside JSON strings.
@@ -1334,14 +1334,20 @@ class ClaudeStreamJsonDriver extends StdioProcess implements SessionDriver {
 			this.kill();
 			return;
 		}
-		// Handle can_use_tool per mode (same logic as qoder)
+		// can_use_tool answers follow the tier the same way the ACP driver does:
+		// readonly fails closed because nothing else bounds the run, while write
+		// and yolo already run under their own CLI-side permission mode.
 		if (subtype === "can_use_tool") {
 			const response =
-				this.mode === "yolo"
-					? { behavior: "allow", updatedInput: request.input ?? {}, ...(typeof request.tool_use_id === "string" ? { toolUseID: request.tool_use_id } : {}) }
-					: {
+				this.mode === "readonly"
+					? {
 							behavior: "deny",
 							message: `${this.mode} mode does not auto-allow this tool, and pi-external-agent exposes no permission prompt channel.`,
+							...(typeof request.tool_use_id === "string" ? { toolUseID: request.tool_use_id } : {}),
+						}
+					: {
+							behavior: "allow",
+							updatedInput: request.input ?? {},
 							...(typeof request.tool_use_id === "string" ? { toolUseID: request.tool_use_id } : {}),
 						};
 			this.writeLine({ type: "control_response", response: { subtype: "success", request_id: requestId, response } });

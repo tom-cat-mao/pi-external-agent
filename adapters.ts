@@ -14,7 +14,9 @@
  *   codebuddy -> Tencent; Claude-Code-compatible surface, yolo default (all tiers open);
  *                readonly runs default mode with a runtime-built --settings hook.
  *                Why: .agents/notes/implemented/2026-09-07-codebuddy-readonly-hook.md
- *   claude    -> readonly default, capped at write; shares pi's own gateway
+ *   claude    -> Anthropic; Claude-Code-compatible surface via pi's own gateway, yolo default
+ *                (all tiers open), driven as a stream-json persistent session.
+ *                Why: .agents/notes/implemented/2026-09-19-claude-adapter-modernization.md
  *   reasonix  -> DeepSeek-native harness (prefix-cache tuned), yolo default
  *   qoder     -> yolo default, stream-json driven; steering is version-gated.
  *                Why: .agents/notes/implemented/2026-09-15-qoder-steering-version-gate.md
@@ -120,7 +122,7 @@ export interface AdapterDispatch {
 	promptArgIndex: number;
 	cwdForwardedToCli: boolean;
 	effectivePolicy: string | null;
-	readOnlyEnforcement: "harness-enforced" | "not-enforced" | "not-applicable";
+	readOnlyEnforcement: "harness-enforced" | "driver-enforced" | "not-enforced" | "not-applicable";
 	model: {
 		requested?: string;
 		forwarded: boolean;
@@ -150,6 +152,13 @@ export interface Adapter {
 	supportedEfforts?: readonly Effort[];
 	/** Whether the agent's harness can actually enforce read-only. */
 	enforcesReadOnly: boolean;
+	/**
+	 * Set when the persistent driver, not the target harness, is the readonly
+	 * enforcement point: it answers the CLI's can_use_tool permission requests
+	 * with a deny itself (claude). Receipts label such a readonly turn
+	 * "driver-enforced" instead of "harness-enforced".
+	 */
+	driverEnforcedReadOnly?: boolean;
 	/** Known-degraded adapters are still callable but flagged in the tool output. */
 	degraded?: string;
 	/**
@@ -369,6 +378,20 @@ function parseClaudeFamilyStreamLine(line: string): AgentEvent | null {
 
 	if (obj.type === "result") return claudeResultEvent(obj);
 
+	// An API-level retry rides along on an assistant record. It is not an
+	// answer and not an error — the CLI is still working — but a silent
+	// retry loop looks like a stalled task, so surface it as a warning.
+	if (obj.api_retry && typeof obj.api_retry === "object") {
+		const retry = obj.api_retry;
+		const detail = [retry.error_status ? `status ${retry.error_status}` : "", retry.category ? String(retry.category) : ""]
+			.filter(Boolean)
+			.join(", ");
+		return {
+			kind: "warning",
+			text: `api retry ${retry.attempt ?? "?"}/${retry.max_retries ?? "?"}${detail ? ` (${detail})` : ""}`,
+		};
+	}
+
 	if (obj.type === "assistant" && Array.isArray(obj.message?.content)) {
 		const calls = obj.message.content
 			.filter((b: any) => b?.type === "tool_use")
@@ -410,20 +433,25 @@ function claudeFamily(
 	useFor: string,
 	supportedEfforts: readonly Effort[],
 	outputFormat: "json" | "stream-json",
-	// When set, the yolo tier opens and becomes the default (codebuddy); without
-	// it the adapter stays capped at write (claude).
+	// When set, the yolo tier opens and becomes the default (codebuddy, claude);
+	// unset leaves the adapter capped at write.
 	yoloPermissionMode?: string,
 	degraded?: string,
-	// Only codebuddy is driven over ACP today; claude stays one-shot.
+	// Persistent-session capability: codebuddy over ACP, claude over the
+	// stream-json channel. Unset leaves the adapter on the one-shot path.
 	session?: Adapter["session"],
 	// codebuddy only: when set, the readonly tier runs default mode with this
 	// runtime-built --settings JSON (silent allow/deny rules + Bash hook)
 	// instead of plan mode — plan's permission requests, once auto-rejected by
-	// the ACP driver, cancel the whole turn. claude keeps plan.
+	// the ACP driver, cancel the whole turn.
 	readonlySettings?: () => string,
 	// For stream-json persistent sessions, use dontAsk/acceptEdits/bypassPermissions
 	// mapping; for json one-shot, use plan/acceptEdits/yoloPermissionMode.
 	streamJsonMapping = false,
+	// Set when the persistent driver answers the CLI's can_use_tool requests
+	// itself, so a readonly turn is enforced by driver code (claude) rather
+	// than by the target harness's own permission layer.
+	driverEnforcedReadOnly = false,
 ): Adapter {
 	return {
 		id,
@@ -435,6 +463,7 @@ function claudeFamily(
 		supportedEfforts,
 		session,
 		enforcesReadOnly: true,
+		driverEnforcedReadOnly,
 		degraded,
 		buildDispatch({ task, mode, model, effort }) {
 			const argv = ["-p", task, "--output-format", outputFormat];
@@ -470,7 +499,8 @@ function claudeFamily(
 				effectivePolicy: settingsJson
 					? "--permission-mode default --settings (allow/deny rules + PreToolUse Bash hook; denies are silent)"
 					: `--permission-mode ${permissionMode}`,
-				readOnlyEnforcement: mode === "readonly" ? "harness-enforced" : "not-applicable",
+				readOnlyEnforcement:
+					mode === "readonly" ? (driverEnforcedReadOnly ? "driver-enforced" : "harness-enforced") : "not-applicable",
 				model: model
 					? { requested: model, forwarded: true, note: "Passed to the target CLI as --model." }
 					: { forwarded: false, note: "No model override requested; target CLI/config selects the model." },
@@ -492,7 +522,7 @@ const kimiAdapter: Adapter = {
 	useFor:
 		"Execution workhorse like codex and pi: code writing and task execution. " +
 		"yolo only — kimi-code 0.41.0 rejects every permission flag with -p, so a headless run " +
-		"always executes under kimi's config permission mode. readonly/write requests are refused.",
+		"always executes under kimi's config permission mode.",
 	defaultMode: "yolo",
 	maxMode: "yolo",
 	// yolo-only by design (user decision 2026-09-07): kimi's headless surface has
@@ -739,8 +769,8 @@ const qoderAdapter: Adapter = {
 	provider: "Qoder (Alibaba)",
 	useFor:
 		"Full coding agent with a Claude-Code-compatible CLI surface. All tiers are open and yolo is the default, like codex; " +
-		"readonly is harness-enforced through dont_ask plus a built-in tool allowlist. Reach for it when a third independent " +
-		"executor or reviewer is useful, or when the user names Qoder.",
+		"readonly is harness-enforced through dont_ask plus a built-in tool allowlist. Reach for it for a third independent " +
+		"executor or reviewer, or when the user names Qoder.",
 	defaultMode: "yolo",
 	maxMode: "yolo",
 	supportedEfforts: ["off", "low", "medium", "high", "xhigh", "max"],
@@ -933,13 +963,17 @@ export const ADAPTERS: Record<AgentId, Adapter> = {
 	claude: claudeFamily(
 		"claude",
 		"claude",
-		"Anthropic via the gateway pi itself is configured with",
-			"All tiers open; yolo default; stream-json with steer/follow-up like codebuddy.",
+		"Anthropic",
+		"Full coding agent on the Claude Code CLI, driven over stream-json with steer/follow-up like codebuddy: all tiers open, " +
+			"yolo default. Shares pi's own gateway, so no model diversity.",
 		["low", "medium", "high", "xhigh", "max"],
 		"stream-json",
 		// claude-family supports bypassPermissions for yolo mode
 		"bypassPermissions",
-		undefined,
+		// Callable, but nothing here has met a real claude endpoint yet: the
+		// stream-json session work is fixture-tested only, so the tool output
+		// carries that caveat until a live run retires it.
+		"unverified against a real endpoint; fixture-tested only",
 		// Claude-family supports persistent sessions via stream-json channel;
 		// initialize handshake + system/init + can_use_tool control requests +
 		// user message frames with uuid for steering. Verified against official
@@ -952,6 +986,7 @@ export const ADAPTERS: Record<AgentId, Adapter> = {
 		},
 		undefined, // no readonlySettings for claude
 		true, // use stream-json mapping
+		true, // readonly is driver-enforced: can_use_tool comes back denied
 	),
 	reasonix: reasonixAdapter,
 	qoder: qoderAdapter,

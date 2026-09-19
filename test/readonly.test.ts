@@ -1,7 +1,7 @@
 /**
  * Regression tests for the codebuddy readonly mapping (default mode +
  * runtime-built --settings allow/deny rules + PreToolUse Bash hook) and the
- * claude plan-mode mapping.
+ * claude stream-json readonly mapping.
  *
  * Run with `node --test test/readonly.test.ts` on Node 22.18+ / 26 (native
  * TypeScript type stripping) or any TS loader.

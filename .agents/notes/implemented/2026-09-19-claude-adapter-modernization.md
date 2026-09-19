@@ -20,7 +20,7 @@ Upgrade claude to first-class citizen status:
 2. **Driver (`sessions.ts`)**
    - New `ClaudeStreamJsonDriver` based on Qoder pattern
    - Initialize handshake → system/init → user frames with UUID
-   - `can_use_tool` control requests per mode (allow in yolo, deny otherwise)
+   - `can_use_tool` control requests per mode (deny in readonly, allow in write/yolo)
    - Result parsing with usage/cost from Claude-Code schema
    - No version gate (claude always supports stream-json steering)
 
@@ -56,7 +56,7 @@ Upgrade claude to first-class citizen status:
 **Verification checklist when endpoint is ready**:
 - [ ] Dispatch read/write/yolo modes successfully
 - [ ] Verify stream-json events flow correctly (initialize, result, tool calls)
-- [ ] Confirm can_use_tool respects permission mode (deny in readonly, allow in yolo)
+- [ ] Confirm can_use_tool respects permission mode (deny in readonly, allow in write/yolo)
 - [ ] Validate effort levels accepted by CLI
 - [ ] Test steer message delivery during active turn
 - [ ] Verify follow-up continues same session context
