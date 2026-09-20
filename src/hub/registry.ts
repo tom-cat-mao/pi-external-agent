@@ -51,6 +51,7 @@ import {
 	stallClock,
 	taskSnapshot,
 	truncate,
+	warningsOf,
 	type DispatchExtras,
 	type DispatchReceipt,
 	type NotifyMode,
@@ -377,6 +378,12 @@ function notifySettled(pi: ExtensionAPI, task: Task): void {
 	if (task.spawnError) lines.push(`spawn error: ${task.spawnError}`);
 	const errs = errorsOf(task);
 	if (errs) lines.push(`errors: ${truncate(errs, 500).text}`);
+	// Non-fatal notices (dsh: the harness home's credentials fork) belong on the
+	// push too, not only in external_agent_status: a caller that ends its turn and
+	// waits for this notice would otherwise never learn of them. Same wording as
+	// the status report, and a line only when there is something to say.
+	const warns = warningsOf(task);
+	if (warns) lines.push(`non-fatal warnings: ${truncate(warns, 400).text}`);
 	if (task.worktree) lines.push(`worktree: ${task.worktree.path} (branch ${task.worktree.branch})`);
 
 	if (task.state === "done") {

@@ -18,11 +18,15 @@ radius wider than `JsonRpcConnection` has.
   credentials) and reported: `ensureDshHome` returns a `warning` naming the file and the fix
   ("delete it to re-link"). The warning rides the existing non-fatal channel: `AdapterDispatch.warning`
   for the one-shot path, the ACP dialect `prepare` hook (renamed from `env`) for sessions, both
-  landing as a task `warning` event, which `external_agent_status` already prints as "non-fatal warnings".
+  landing as a task `warning` event. Every surface that reports a task carries it in the status
+  report's wording — `external_agent_status`, the settle notice (`notifySettled`) and the
+  `external_agent_wait` report — so a caller that never polls still learns of it.
 - Provisioning tolerates the one race it can lose: on `EEXIST` it re-inspects the entry, and a
   correct link by then is the peer's success, not our failure (`linkDshCredentials`).
-- The harness home is created `0o700`, and a symlinked home path fails provisioning with the reason
-  instead of being followed.
+- The harness home is created `0o700` and forced back to `0o700` on every provisioning run (a
+  best-effort chmod, never a failure: mkdir's mode is masked by the umask and an existing directory
+  keeps its bits), and a symlinked home path fails provisioning with the reason instead of being
+  followed.
 - The dsh session policy states fail-closed escalations for readonly only; write/yolo say the driver
   allows the escalations that tier permits, because that is what `AcpDriver.autoPermission` does.
 - A dispatch refused via `AdapterDispatch.refusal` is not a dispatch: it is counted under the
@@ -52,10 +56,11 @@ radius wider than `JsonRpcConnection` has.
 
 ## Consequences
 
-Benefit: the receipt and the stats stay honest — a forked credentials file is visible with its fix,
-a refused dispatch is counted as a refusal, and the dsh session policy claims fail-closed escalations
-only where the driver provides them. Provisioning is race-safe against a second pi process, and the
-harness home is owner-only and never provisioned through a symlink.
+Benefit: the receipt and the stats stay honest — a forked credentials file is visible with its fix on
+every surface that reports the task, including the settle notice and the wait report, a refused
+dispatch is counted as a refusal, and the dsh session policy claims fail-closed escalations only
+where the driver provides them. Provisioning is race-safe against a second pi process, and the
+harness home is owner-only — new or pre-existing — and never provisioned through a symlink.
 
 Cost: a second way for credentials to live (a warning to read, not a failure to fix); `AcpDialect`'s
 `env` hook became `prepare` returning env plus warning, so a dialect with a start-time notice has a

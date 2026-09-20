@@ -24,7 +24,7 @@
  * re-links the user's file.
  */
 
-import { existsSync, lstatSync, mkdirSync, readlinkSync, symlinkSync, unlinkSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readlinkSync, symlinkSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -92,6 +92,21 @@ function isSymlink(path: string): boolean {
 }
 
 /**
+ * Force the home to 0o700. mkdir's mode is masked by the umask and an existing
+ * directory keeps whatever bits it has — a home created at 0o755 by an earlier
+ * build would stay world-readable otherwise. Best effort only, like the
+ * artifact store's mode fix: the home's job is to work, not to fail over a mode
+ * bit, so an error here never fails provisioning.
+ */
+function tightenHomeMode(home: string): void {
+	try {
+		chmodSync(home, 0o700);
+	} catch {
+		/* best effort: the run does not depend on the mode bits */
+	}
+}
+
+/**
  * Create the credentials link, tolerating the one race lazy provisioning can
  * lose: a second pi process that provisioned the same home between our check and
  * our symlinkSync makes that call fail with EEXIST. An entry that is the correct
@@ -143,11 +158,13 @@ export function ensureDshHome(options: DshHomeOptions = {}): DshHomeResult {
 
 	try {
 		// 0o700: the home holds dsh's settings and a credentials entry. The mode
-		// applies to the directories mkdir creates; an existing home keeps its own.
+		// applies to the directories mkdir creates; an existing home keeps its own,
+		// so the bits are forced below.
 		mkdirSync(home, { recursive: true, mode: 0o700 });
 	} catch (err) {
 		return { ok: false, reason: `could not create the dsh harness home ${home}: ${describe(err)}` };
 	}
+	tightenHomeMode(home);
 
 	const credentials = join(home, DSH_CREDENTIALS_LINK_NAME);
 	try {

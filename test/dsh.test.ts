@@ -95,13 +95,18 @@ const hub = (await import("../src/index.ts")) as { default: (pi: unknown) => voi
 moduleHooks.deregister();
 const tools = new Map<string, any>();
 const lifecycle = new Map<string, (event: { reason: string }) => void>();
+/** Text of every settle/watchdog push; the surfaces a caller sees without polling. */
+const pushes: string[] = [];
 hub.default({
 	registerTool: (tool: any) => tools.set(tool.name, tool),
 	registerMessageRenderer: () => {},
 	on: (event: string, handler: (event: { reason: string }) => void) => lifecycle.set(event, handler),
-	sendMessage: () => {},
+	sendMessage: (message: any) => pushes.push(String(message?.content ?? "")),
 });
-afterEach(() => lifecycle.get("session_shutdown")!({ reason: "quit" }));
+afterEach(() => {
+	pushes.length = 0;
+	lifecycle.get("session_shutdown")!({ reason: "quit" });
+});
 
 function withEnv(values: Record<string, string>): () => void {
 	const previous = new Map<string, string | undefined>();
@@ -916,6 +921,24 @@ test("ensureDshHome: the harness home is created 0o700", () => {
 	assert.equal(mode & 0o077, 0, `group/other must have no access (mode ${mode.toString(8)})`);
 });
 
+test("ensureDshHome: a home left world-readable by an earlier build is tightened to 0o700", () => {
+	const root = mkdtempSync(path.join(tmpdir(), "dsh-provision-"));
+	const homeDir = path.join(root, "harness-home");
+	const credentialsSource = path.join(root, "dsh", ".credentials.yaml");
+	mkdirSync(path.dirname(credentialsSource), { recursive: true });
+	writeFileSync(credentialsSource, "token: test\n");
+	// The previous dev build created the home without a mode (0o755 under a
+	// typical umask); mkdir's mode never revisits an existing directory.
+	mkdirSync(homeDir, { recursive: true });
+	chmodSync(homeDir, 0o755);
+
+	const result = ensureDshHome({ homeDir, credentialsSource });
+	assert.equal(result.ok, true);
+	const mode = lstatSync(homeDir).mode & 0o777;
+	assert.equal(mode & 0o700, 0o700, `owner needs full access (mode ${mode.toString(8)})`);
+	assert.equal(mode & 0o077, 0, `group/other must have no access (mode ${mode.toString(8)})`);
+});
+
 test("ensureDshHome: a symlinked home path fails provisioning instead of writing through it", () => {
 	const root = mkdtempSync(path.join(tmpdir(), "dsh-provision-"));
 	const elsewhere = path.join(root, "elsewhere");
@@ -1325,16 +1348,21 @@ test("dsh ACP: a readonly session rejects a permission escalation; yolo allows i
 // A session start is told about its forked credentials, and stays running
 // ---------------------------------------------------------------------------
 
-/** Poll a task's event stream until the predicate holds (the warning lands async). */
-async function waitForEvent(task: Task, predicate: (event: { kind: string; text: string }) => boolean, timeoutMs = 5_000): Promise<void> {
+/** Poll until the predicate holds (driver start, settle finalize and pushes are async). */
+async function waitFor(predicate: () => boolean, label: string, timeoutMs = 5_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
-	while (!task.events.some(predicate)) {
-		if (Date.now() > deadline) throw new Error(`timed out waiting for the event (stderr: ${task.stderr})`);
+	while (!predicate()) {
+		if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
 		await new Promise((resolve) => setTimeout(resolve, 20));
 	}
 }
 
-test("dsh ACP session: a forked credentials copy warns into the task's warning stream", async () => {
+/** Poll a task's event stream until the predicate holds (the warning lands async). */
+function waitForEvent(task: Task, predicate: (event: { kind: string; text: string }) => boolean, timeoutMs = 5_000): Promise<void> {
+	return waitFor(() => task.events.some(predicate), `the task's warning event (stderr: ${task.stderr})`, timeoutMs);
+}
+
+test("dsh ACP session: a forked credentials copy reaches status, the settle notice and the wait report", async () => {
 	const dir = makeFixtureDir({ dsh: DSH_ACP_MOCK });
 	const home = makeHome(true);
 	// What dsh's atomic credential write leaves behind in the harness home.
@@ -1344,8 +1372,12 @@ test("dsh ACP session: a forked credentials copy warns into the task's warning s
 	writeFileSync(fork, "token: older\n");
 	const restorePath = usePath(dir);
 	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: path.join(dir, "dsh-log.jsonl") });
+	// Arm the settle push the way a session start does, then forget anything
+	// earlier tests left queued in the registry.
+	lifecycle.get("session_start")!({ reason: "" });
+	pushes.length = 0;
 	try {
-		const task = startTask("dsh", "do the thing", dir, "yolo", "off", 0);
+		const task = startTask("dsh", "do the thing", dir, "yolo", "steer", 0);
 		await waitForEvent(task, (event) => String(event.kind) === "warning");
 		// The existing warning surface — what external_agent_status prints as
 		// "non-fatal warnings" — carries the notice and the fix.
@@ -1356,6 +1388,18 @@ test("dsh ACP session: a forked credentials copy warns into the task's warning s
 		// The session was not failed or blocked over it, and the copy is intact.
 		assert.equal(readFileSync(fork, "utf8"), "token: older\n");
 		assert.notEqual(task.state, "failed");
+
+		// A caller that ends its turn instead of polling gets the same line on the
+		// settle notice...
+		await waitFor(() => pushes.length > 0, "the settle notification");
+		assert.match(pushes.join("\n"), /non-fatal warnings: .*local credentials copy/);
+		// ...and one that blocks in external_agent_wait gets it in the report that
+		// replaces that notice. Both surfaces truncate the line like the status
+		// report does, so the head is what a caller reads here; the untruncated
+		// text above already names the fix.
+		const report = await call("external_agent_wait", { taskIds: [task.id], mode: "any", timeout: 5 });
+		assert.match(report.content[0].text, /non-fatal warnings: .*local credentials copy/);
+		assert.ok(report.content[0].text.includes(fork), "the report names the file to delete");
 		task.driver?.kill();
 	} finally {
 		restorePath();
