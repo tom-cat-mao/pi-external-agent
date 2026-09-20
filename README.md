@@ -8,7 +8,7 @@ A [pi](https://github.com/earendil-works/pi) extension that lets pi dispatch cod
 
 ```bash
 # Pin a version (recommended; pi update leaves pinned installs alone)
-pi install git:github.com/tom-cat-mao/pi-external-agent@v0.6.0
+pi install git:github.com/tom-cat-mao/pi-external-agent@v0.6.1
 # Or track main
 pi install git:github.com/tom-cat-mao/pi-external-agent
 ```
