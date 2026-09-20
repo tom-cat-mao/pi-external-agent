@@ -199,8 +199,8 @@ export interface AdapterDispatch {
 	 * this reason instead of spawning a process that cannot work, so a refusal
 	 * is never a silent drop. dsh returns it for an effort request on the
 	 * one-shot path (no effort knob exists there) and for a harness home that
-	 * cannot be provisioned (a symlinked or unusable path); absent credentials
-	 * are a warning, not a refusal.
+	 * cannot be created at all (an unusable path); absent credentials are a
+	 * warning, not a refusal.
 	 */
 	refusal?: string;
 }

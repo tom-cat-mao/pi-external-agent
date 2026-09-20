@@ -95,21 +95,14 @@ function isLinkTo(path: string, target: string): boolean {
 	}
 }
 
-/** True when the path itself is a symlink, whatever it points at. */
-function isSymlink(path: string): boolean {
-	try {
-		return lstatSync(path).isSymbolicLink();
-	} catch {
-		return false;
-	}
-}
-
 /**
  * Force the home to 0o700. mkdir's mode is masked by the umask and an existing
  * directory keeps whatever bits it has — a home created at 0o755 by an earlier
  * build would stay world-readable otherwise. Best effort only, like the
  * artifact store's mode fix: the home's job is to work, not to fail over a mode
- * bit, so an error here never fails provisioning.
+ * bit, so an error here never fails provisioning. When the home path is a
+ * symlink the chmod follows it and applies to the target directory, which is
+ * the directory dsh reads and writes.
  */
 function tightenHomeMode(home: string): void {
 	try {
@@ -146,9 +139,13 @@ export function linkDshCredentials(
  *
  * The home comes first, because it is what carries the requested tier: refusing
  * to create it over a credentials file that may not even be needed would cost
- * the run its sandbox. A symlinked home path is refused rather than followed:
- * provisioning through it would place dsh's settings and credentials wherever
- * the link points, outside the path this module can vouch for. A missing source
+ * the run its sandbox. A home path that is itself a symlink is FOLLOWED, like
+ * dsh follows it: `@deepseek-ai/dsh-home-paths` resolves the home through
+ * realpath (configured path > `$DSH_HOME` > `~/.dsh`, no link rejection), and
+ * dsh's SAFETY.md documents no symlink or path hardening and disclaims being a
+ * security boundary — so a dotfiles-style layout pointing the home at another
+ * volume is a legitimate arrangement, not an attack. mkdir is a no-op through
+ * the link, and the mode fix reaches the linked directory. A missing source
  * links nothing — the home is returned with the warning that says so instead.
  * With a source, an existing link to the right target is left alone; a link to
  * somewhere else is replaced (the harness home is ours to manage, and a stale
@@ -160,13 +157,6 @@ export function ensureDshHome(options: DshHomeOptions = {}): DshHomeResult {
 	const home = options.homeDir ?? dshHomeDir();
 	const credentialsSource = options.credentialsSource ?? dshCredentialsSource();
 	const credentials = join(home, DSH_CREDENTIALS_LINK_NAME);
-
-	if (isSymlink(home)) {
-		return {
-			ok: false,
-			reason: `the dsh harness home ${home} is a symlink; remove it so provisioning can create a real directory instead of writing through the link.`,
-		};
-	}
 
 	try {
 		// 0o700: the home holds dsh's settings and a credentials entry. The mode

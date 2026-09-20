@@ -25,8 +25,8 @@ radius wider than `JsonRpcConnection` has.
   correct link by then is the peer's success, not our failure (`linkDshCredentials`).
 - The harness home is created `0o700` and forced back to `0o700` on every provisioning run (a
   best-effort chmod, never a failure: mkdir's mode is masked by the umask and an existing directory
-  keeps its bits), and a symlinked home path fails provisioning with the reason instead of being
-  followed.
+  keeps its bits). A symlinked home path is provisioned through the link like dsh would use it, not
+  refused — see the amendment below.
 - The dsh session policy states fail-closed escalations for readonly only; write/yolo say the driver
   allows the escalations that tier permits, because that is what `AcpDriver.autoPermission` does.
 - A dispatch refused via `AdapterDispatch.refusal` is not a dispatch: it is counted under the
@@ -38,6 +38,7 @@ radius wider than `JsonRpcConnection` has.
 - The routing note's scope is corrected: `JsonRpcConnection`'s subclasses are codex app-server and
   ACP; pi-rpc and the two stream-json drivers extend `StdioProcess` and never matched replies
   through the pending table.
+- Amended 2026-09-21 — the symlinked-home REFUSAL is dropped. Evidence: dsh's SAFETY.md documents no symlink or path hardening and disclaims being a security boundary, and `@deepseek-ai/dsh-home-paths` canonicalizes paths via realpath (configured path > `$DSH_HOME` > `~/.dsh`) with no symlink rejection, so the rule mirrored nothing of dsh's own model and its threat required an attacker who already owns the user's home directory. `ensureDshHome` now follows the link: mkdir is a no-op through it, the 0o700 fix reaches the linked directory, and nothing else changes.
 - Amended 2026-09-21 — the missing-credentials REFUSAL was too strict and is now a best-effort
   link. Evidence against the hard prerequisite: a completely EMPTY `DSH_HOME` completes
   `dsh --profile headless` on the default deepseek-official route with zero credentials
@@ -59,8 +60,8 @@ radius wider than `JsonRpcConnection` has.
    Why rejected: it makes the drift the default instead of an accident, and the note's own alternative 3 already rejected copies for that reason.
 4. **Retry provisioning from the top on `EEXIST`.** Strongest reason: one code path handles every failure, and the retry re-reads the world.
    Why rejected: a retry re-runs the source check and the unlink of a wrong link, so two racing processes could trade deletions; re-inspecting the single entry is both smaller and safer.
-5. **Follow a symlinked harness home (or chmod it) instead of refusing.** Strongest reason: a user who linked the home has a reason, and refusing costs them the adapter.
-   Why rejected: provisioning would then write dsh's settings and credentials wherever the link points, outside the path this module can vouch for; the reason text names the removal that fixes it.
+5. **Refuse a symlinked harness home (the original call).** Strongest reason: provisioning through a link writes dsh's settings and credentials wherever it points, outside the path this module could vouch for, and a real home is one `rm` plus one dispatch away.
+   Why rejected: dsh's own model has no such hardening to mirror — SAFETY.md documents no symlink or path defense and explicitly disclaims being a security boundary, and `@deepseek-ai/dsh-home-paths` canonicalizes paths via realpath and resolves the home as configured path > `$DSH_HOME` > `~/.dsh` without rejecting links. The threat the refusal imagined required an attacker who already owned the user's home directory, while the legitimate "dotfiles symlinked to another volume" setup it broke is real.
 6. **Keep counting refused dispatches, noting the refusal in the receipt.** Strongest reason: no meter change, and the task does exist in the registry.
    Why rejected: `/external_agent_stats` would report work that never ran; a refusal is precisely the case where the counter must not move.
 
@@ -70,7 +71,8 @@ Benefit: the receipt and the stats stay honest — a forked credentials file is 
 every surface that reports the task, including the settle notice and the wait report, a refused
 dispatch is counted as a refusal, and the dsh session policy claims fail-closed escalations only
 where the driver provides them. Provisioning is race-safe against a second pi process, and the
-harness home is owner-only — new or pre-existing — and never provisioned through a symlink. Missing
+harness home is owner-only — new or pre-existing — and a symlinked home path is followed rather than
+refused, so a dotfiles layout pointing the home at another volume keeps working. Missing
 credentials are a warning rather than a wall: only a provider key kept in that file makes the link
 matter, so a user without one still dispatches, unlinked and counted as a dispatch.
 

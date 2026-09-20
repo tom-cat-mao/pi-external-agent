@@ -1000,24 +1000,39 @@ test("ensureDshHome: a home left world-readable by an earlier build is tightened
 	assert.equal(mode & 0o077, 0, `group/other must have no access (mode ${mode.toString(8)})`);
 });
 
-test("ensureDshHome: a symlinked home path fails provisioning instead of writing through it", () => {
+test("ensureDshHome: a symlinked home path is provisioned through the link, not refused", () => {
+	// dsh's own home resolution canonicalizes paths (realpath) and its SAFETY.md
+	// claims no symlink hardening, so `~/dotfiles -> another volume` is a
+	// legitimate layout: the link stays a link and the home is provisioned where
+	// it points.
 	const root = mkdtempSync(path.join(tmpdir(), "dsh-provision-"));
 	const elsewhere = path.join(root, "elsewhere");
 	mkdirSync(elsewhere, { recursive: true });
+	writeFileSync(path.join(elsewhere, "existing.txt"), "user data\n");
 	const homeDir = path.join(root, "harness-home");
 	symlinkSync(elsewhere, homeDir);
 	const credentialsSource = path.join(root, "dsh", ".credentials.yaml");
 	mkdirSync(path.dirname(credentialsSource), { recursive: true });
 	writeFileSync(credentialsSource, "token: test\n");
 
-	const result = ensureDshHome({ homeDir, credentialsSource });
-	assert.equal(result.ok, false);
-	if (result.ok) return;
-	assert.match(result.reason, /symlink/);
-	assert.ok(result.reason.includes(homeDir), "the reason names the path to remove");
-	// Nothing was provisioned through the link, and the link itself is untouched.
-	assert.deepEqual(readdirSync(elsewhere), []);
+	const first = ensureDshHome({ homeDir, credentialsSource });
+	assert.equal(first.ok, true);
+	if (!first.ok) return;
+	assert.equal(first.home, homeDir);
+	assert.equal(lstatSync(homeDir).isSymbolicLink(), true, "the link is ours to follow, not to replace");
+	assert.equal(readlinkSync(homeDir), elsewhere);
+	const link = path.join(elsewhere, DSH_CREDENTIALS_LINK_NAME);
+	assert.equal(readlinkSync(link), credentialsSource);
+	assert.deepEqual(readdirSync(elsewhere).sort(), [DSH_CREDENTIALS_LINK_NAME, "existing.txt"], "pre-existing data untouched");
+
+	// Idempotent through the link, and the mode fix reaches the target directory
+	// dsh actually uses without breaking the link.
+	const second = ensureDshHome({ homeDir, credentialsSource });
+	assert.equal(second.ok, true);
 	assert.equal(lstatSync(homeDir).isSymbolicLink(), true);
+	assert.equal(readlinkSync(link), credentialsSource);
+	const mode = lstatSync(elsewhere).mode & 0o777;
+	assert.equal(mode & 0o077, 0, `the linked directory is not owner-only (mode ${mode.toString(8)})`);
 });
 
 test("ensureDshHome: the default paths hang off HOME, and the warning names the file and the fix", () => {
