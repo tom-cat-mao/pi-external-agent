@@ -289,6 +289,24 @@ abstract class JsonRpcConnection extends StdioProcess {
 		}
 		if (!msg || typeof msg !== "object") return;
 
+		// A message carrying a method is a request or a notification, never a
+		// response — even when its id matches a request we are waiting on. Both
+		// sides number their requests independently, so a harness counting its
+		// permission requests from its own small counter (dsh escalates several
+		// times inside one turn) eventually hands one the id of the pending
+		// session/prompt; reading that as the reply settles the turn early and
+		// leaves the escalation unanswered.
+		if (typeof msg.method === "string") {
+			// A message carrying both method and id is a request we must answer;
+			// without an id it is a fire-and-forget notification.
+			if (typeof msg.id === "number") {
+				for (const cb of this.requestCbs) cb(msg);
+				return;
+			}
+			for (const cb of this.notificationCbs) cb(msg.method, msg.params);
+			return;
+		}
+
 		if (typeof msg.id === "number" && this.pending.has(msg.id)) {
 			const entry = this.pending.get(msg.id)!;
 			this.pending.delete(msg.id);
@@ -299,17 +317,7 @@ abstract class JsonRpcConnection extends StdioProcess {
 			} else {
 				entry.resolve(msg.result);
 			}
-			return;
 		}
-
-		if (typeof msg.method !== "string") return;
-		// A message carrying both method and id is a request we must answer;
-		// without an id it is a fire-and-forget notification.
-		if (typeof msg.id === "number") {
-			for (const cb of this.requestCbs) cb(msg);
-			return;
-		}
-		for (const cb of this.notificationCbs) cb(msg.method, msg.params);
 	}
 }
 
