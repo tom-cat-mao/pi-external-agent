@@ -15,7 +15,7 @@ import { appendFile, mkdir, readFile, readdir, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionAPI, SessionShutdownEvent } from "@earendil-works/pi-coding-agent";
-import { ADAPTERS, AGENT_IDS, type AgentEvent, type AgentId, type Effort, type Mode } from "../adapters.ts";
+import { ADAPTERS, AGENT_IDS, dshEffortToken, type AgentEvent, type AgentId, type Effort, type Mode } from "../adapters.ts";
 import { ensureStored, extractSummary, placeholderFor } from "../artifacts.ts";
 import {
 	FOLLOWUP_AGENT_IDS,
@@ -904,7 +904,7 @@ function startPersistentTask(
 		effectivePolicy: adapter.sessionPolicy?.(mode) ?? `${adapter.session?.steerNote ?? "session"} (persistent session)`,
 		readOnlyEnforcement: sessionReadOnlyEnforcement(agent, mode),
 		model: model
-			? { requested: model, forwarded: true, note: "Passed to the persistent session at startup." }
+			? { requested: model, forwarded: modelForwardedOnSession(agent), note: modelSessionNote(agent, model) }
 			: { forwarded: false, note: "No model override requested; target CLI/config selects the model." },
 		effort: effort
 			? {
@@ -977,7 +977,27 @@ export function effortSessionNote(agent: AgentId, effort: Effort): string {
 	if (agent === "reasonix") {
 		return `requested "${effort}"; NOT forwarded — reasonix --acp accepts no effort flag (the one-shot path would have passed --effort).`;
 	}
+	if (agent === "dsh") {
+		return `Set inside the ACP session as session/set_config_option reasoning_effort=${dshEffortToken(effort)}; dsh accepts effort only there, never on its one-shot path.`;
+	}
 	return `Passed to the persistent session for "${effort}".`;
+}
+
+/**
+ * Whether the persistent path forwards a model override. dsh takes its model
+ * from the run profile (`--profile` is the whole entry point, verified
+ * 0.1.5-rc.2) and no session-start model flag is verified, so a request is
+ * reported as not forwarded rather than claimed.
+ */
+export function modelForwardedOnSession(agent: AgentId): boolean {
+	return agent !== "dsh";
+}
+
+export function modelSessionNote(agent: AgentId, model: string): string {
+	if (agent === "dsh") {
+		return `requested "${model}"; NOT forwarded — dsh selects its model from the run profile, not from a session-start flag.`;
+	}
+	return "Passed to the persistent session at startup.";
 }
 
 /** Append an event, keeping the ring cap and the current-turn window aligned. */
@@ -1109,13 +1129,27 @@ function startOneshotTask(
 	const task = createTask(agent, taskText, cwd, mode, notify, watchdogMs, dispatch, "oneshot", extras.taskId);
 	applyExtras(task, extras);
 
+	// An adapter that cannot honour the request says so instead of spelling out a
+	// command whose result would mislead the caller (dsh: an effort request on a
+	// path with no effort knob, or a harness home with no credentials yet). It
+	// fails like a spawn that never started — reason recorded, nothing spawned.
+	if (adapterDispatch.refusal) {
+		task.state = "failed";
+		task.endedAt = Date.now();
+		task.spawnError = adapterDispatch.refusal;
+		return task;
+	}
+
 	let proc: ChildProcess;
 	try {
 		// No shell: args are passed as an array so task text cannot inject commands.
 		proc = spawn(task.dispatch.executable, task.dispatch.argv, {
 			cwd: task.dispatch.cwd,
 			stdio: ["ignore", "pipe", "pipe"],
-			env: process.env,
+			// Adapter-contributed env is merged OVER the inherited environment,
+			// never a replacement: it carries what the CLI needs (dsh's DSH_HOME
+			// and DSH_PERMISSION_MODE) without removing the rest.
+			env: adapterDispatch.env ? { ...process.env, ...adapterDispatch.env } : process.env,
 		});
 	} catch (err) {
 		task.state = "failed";

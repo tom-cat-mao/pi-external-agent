@@ -1,15 +1,18 @@
 /**
- * ACP over stdio (reasonix, codebuddy).
+ * ACP over stdio (reasonix, codebuddy, dsh).
  *
  * reasonix initialize advertises _meta["reasonix.io"].sessionSteer.method; read
  * the advertised name, never hardcode it. `--acp` accepts --model but rejects
  * --permission-mode and --effort (verified v1.38.1: "flag provided but not
  * defined"), so permissions are answered over session/request_permission and
  * effort cannot be forwarded. codebuddy is plain ACP: steering is a second
- * session/prompt on the active session.
+ * session/prompt on the active session. dsh spells the same entry point as a
+ * profile (`--profile acp`, verified 0.1.5-rc.2) and has no effort flag either,
+ * but its session exposes a reasoning_effort config option, so effort is
+ * forwarded with session/set_config_option.
  */
 
-import { ADAPTERS, type AgentEvent, type AgentId, type Mode } from "../adapters.ts";
+import { ADAPTERS, type AgentEvent, type AgentId, type Effort, type Mode } from "../adapters.ts";
 import {
 	BaseSessionDriver,
 	COMMAND_TIMEOUT_MS,
@@ -21,23 +24,47 @@ import {
 } from "./base.ts";
 
 // ---------------------------------------------------------------------------
-// ACP (reasonix, codebuddy)
+// ACP (reasonix, codebuddy, dsh)
 // ---------------------------------------------------------------------------
 
 export interface AcpDialect {
 	id: AgentId;
-	/** Extra argv appended after --acp. */
+	/**
+	 * The whole ACP entry argv. Every dialect but dsh speaks ACP behind a bare
+	 * `--acp` (the default); dsh spells it as `--profile acp`, and a dialect
+	 * replaces the entry instead of appending to a hardcoded flag.
+	 */
+	acpArgv?: string[];
+	/** Extra argv appended after the ACP entry. */
 	baseArgv: (input: SessionStartInput) => string[];
+	/**
+	 * Extra environment for this dialect's process, merged over process.env by
+	 * spawnProcess (never a replacement). dsh uses it to point DSH_HOME at the
+	 * dedicated harness home and to carry the tier as DSH_PERMISSION_MODE;
+	 * throwing here fails the session start with that reason, before anything is
+	 * spawned.
+	 */
+	env?: (input: SessionStartInput) => Record<string, string> | undefined;
 	failClosedPermissionModes?: Mode[];
+	/**
+	 * Effort forwarding over the protocol, for dialects whose CLI has no effort
+	 * flag (dsh: set reasoning_effort to the mapped level after session/new).
+	 * Dialects with a real flag (codebuddy) carry it in baseArgv and leave this
+	 * unset. A rejected set_config_option fails the session start — the turn
+	 * must never run at a default the caller did not ask for.
+	 */
+	effort?: { configId: string; token: (effort: Effort) => string };
 }
 
-const ACP_FLAG = "--acp";
+/** The ACP entry flag every dialect but dsh uses. */
+const DEFAULT_ACP_ARGV = ["--acp"];
 
 const ACP_METHODS = {
 	initialize: "initialize",
 	sessionNew: "session/new",
 	sessionPrompt: "session/prompt",
 	sessionCancel: "session/cancel",
+	sessionSetConfigOption: "session/set_config_option",
 	requestPermission: "session/request_permission",
 } as const;
 
@@ -78,7 +105,7 @@ export class AcpDriver extends BaseSessionDriver implements SessionDriver {
 	}
 
 	buildArgv(input: SessionStartInput): string[] {
-		return [ACP_FLAG, ...this.dialect.baseArgv(input)];
+		return [...(this.dialect.acpArgv ?? DEFAULT_ACP_ARGV), ...this.dialect.baseArgv(input)];
 	}
 
 	async start(input: SessionStartInput): Promise<void> {
@@ -90,7 +117,11 @@ export class AcpDriver extends BaseSessionDriver implements SessionDriver {
 		// rejecting a codebuddy ACP request cancels the whole turn, which is
 		// exactly why readonly moved off plan mode).
 		this.autoPermission = (this.dialect.failClosedPermissionModes ?? ["readonly"]).includes(input.mode) ? "reject" : "allow";
-		this.spawnProcess(ADAPTERS[this.dialect.id].bin, this.buildArgv(input), input.cwd);
+		// The dialect's env hook runs before the spawn: a dialect that cannot
+		// provision what its process needs (dsh: the harness home) throws here,
+		// and the session start fails with that reason instead of running a
+		// process that cannot work.
+		this.spawnProcess(ADAPTERS[this.dialect.id].bin, this.buildArgv(input), input.cwd, this.dialect.env?.(input));
 		this.onNotification((method, params) => this.handleNotification(method, params));
 		this.onRequest((msg) => this.handleRequest(msg));
 
@@ -120,6 +151,19 @@ export class AcpDriver extends BaseSessionDriver implements SessionDriver {
 		const created = await this.request(ACP_METHODS.sessionNew, { cwd: input.cwd, mcpServers: [] }, HANDSHAKE_TIMEOUT_MS);
 		this.sessionId = created?.sessionId;
 		if (!this.sessionId) throw new Error(`${this.dialect.id} ACP returned no sessionId`);
+
+		// Effort, for dialects whose CLI has no flag for it: set the session
+		// config option before the first turn. The rejection is deliberately not
+		// caught — the session start fails with the CLI's own error, so a run
+		// never proceeds at a default the caller did not ask for.
+		const effort = this.dialect.effort;
+		if (input.effort && effort) {
+			await this.request(
+				ACP_METHODS.sessionSetConfigOption,
+				{ sessionId: this.sessionId, configId: effort.configId, value: effort.token(input.effort) },
+				HANDSHAKE_TIMEOUT_MS,
+			);
+		}
 
 		this.startPrompt(input.task);
 	}

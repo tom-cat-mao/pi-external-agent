@@ -19,6 +19,8 @@ import {
 	beginFollowUpTurn,
 	effortForwardedOnSession,
 	effortSessionNote,
+	modelForwardedOnSession,
+	modelSessionNote,
 	presentAnswer,
 	pushEvent,
 	requireCapableTask,
@@ -244,7 +246,7 @@ export function receiptFromStartArgs(args: Record<string, unknown>, fallbackCwd:
 			effectivePolicy: adapter.sessionPolicy?.(mode) ?? `${adapter.session?.steerNote ?? "session"} (persistent session)`,
 			readOnlyEnforcement: sessionReadOnlyEnforcement(agent, mode),
 			model: model
-				? { requested: model, forwarded: true, note: "Passed to the persistent session at startup." }
+				? { requested: model, forwarded: modelForwardedOnSession(agent), note: modelSessionNote(agent, model) }
 				: { forwarded: false, note: "No model override requested; target CLI/config selects the model." },
 			effort: effort
 				? { requested: effort, forwarded: effortForwardedOnSession(agent), note: effortSessionNote(agent, effort) }

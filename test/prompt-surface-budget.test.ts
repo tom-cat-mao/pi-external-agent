@@ -67,7 +67,13 @@ function surfaceChars(tool: any): number {
 
 // Measured 2026-09-19 after the archive/verify/template wave: see
 // .agents/notes/implemented/2026-09-19-answer-archive-verify-templates.md.
-const PROMPT_SURFACE_BUDGET_CHARS = 8_900;
+// Raised from 8_900 on 2026-09-20 for the dsh agent line in the
+// external_agent_start table ("dsh = DeepSeek harness (dsh) — <useFor>
+// [default: yolo; effort: off..max; steer+follow-up]", 187 chars with its
+// separator; the dsh useFor text is already trimmed to one sentence, and any
+// shorter would drop what the table is for). Measured total after the raise:
+// 9_070. The next agent pays the same way: raise deliberately, never drift.
+const PROMPT_SURFACE_BUDGET_CHARS = 9_100;
 
 test("prompt surface stays within budget", () => {
 	let total = 0;

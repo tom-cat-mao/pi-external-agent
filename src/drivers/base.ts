@@ -91,13 +91,18 @@ export abstract class StdioProcess {
 		return this.spawnErrorMessage;
 	}
 
-	protected spawnProcess(executable: string, argv: string[], cwd: string): void {
+	/**
+	 * `extraEnv` is merged OVER process.env, never a replacement: a dialect
+	 * contributes what its CLI needs (dsh: DSH_HOME and DSH_PERMISSION_MODE)
+	 * without taking away the environment the process has to run in at all.
+	 */
+	protected spawnProcess(executable: string, argv: string[], cwd: string, extraEnv?: Record<string, string>): void {
 		this.spawnArgv = argv;
 		const proc = spawn(executable, argv, {
 			cwd,
 			// stdin is a live protocol channel here, not the "ignore" of the one-shot path.
 			stdio: ["pipe", "pipe", "pipe"],
-			env: process.env,
+			env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
 		});
 		this.proc = proc;
 
