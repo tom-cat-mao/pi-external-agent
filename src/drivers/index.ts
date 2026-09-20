@@ -115,11 +115,15 @@ export const SESSION_DRIVERS: Partial<Record<AgentId, () => SessionDriver>> = {
 			// under the shared home would not be bounded by the requested tier at
 			// all. Provisioning runs before the spawn and is lazy/idempotent; a
 			// failure (no credentials yet) fails the session start with the reason,
-			// which tells the user to sign in.
-			env: (input) => {
+			// which tells the user to sign in. A home that already holds a local
+			// credentials copy still starts, with the warning attached.
+			prepare: (input) => {
 				const home = ensureDshHome();
 				if (!home.ok) throw new Error(home.reason);
-				return { DSH_HOME: home.home, DSH_PERMISSION_MODE: dshPermissionMode(input.mode) };
+				return {
+					env: { DSH_HOME: home.home, DSH_PERMISSION_MODE: dshPermissionMode(input.mode) },
+					warning: home.warning,
+				};
 			},
 			// No effort flag exists on this CLI: the session sets the config option
 			// instead. A rejected set_config_option fails the session start, so the

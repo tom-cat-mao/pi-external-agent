@@ -13,6 +13,15 @@
  * keeps a single source of truth, and when that source does not exist yet the
  * whole provisioning fails with the sign-in instruction instead of handing dsh a
  * home that cannot authenticate.
+ *
+ * The link is not the only possible arrangement. dsh writes its credentials
+ * through an atomic rename whose documented behavior REPLACES a symlink with a
+ * real file (verified in @deepseek-ai/dsh-atomic-write), so after such a write —
+ * a credentials layout migration, say — the harness home holds its own copy that
+ * drifts as the user's credentials rotate. That copy is never deleted (it may be
+ * the user's only working credentials), but it is reported: the result carries a
+ * warning naming the one-line fix, which is deleting it so the next spawn
+ * re-links the user's file.
  */
 
 import { existsSync, lstatSync, mkdirSync, readlinkSync, symlinkSync, unlinkSync } from "node:fs";
@@ -36,7 +45,9 @@ export interface DshHomeOptions {
 	credentialsSource?: string;
 }
 
-export type DshHomeResult = { ok: true; home: string; credentials: string } | { ok: false; reason: string };
+export type DshHomeResult =
+	| { ok: true; home: string; credentials: string; warning?: string }
+	| { ok: false; reason: string };
 
 /** The harness home for the current user; the value handed to dsh as DSH_HOME. */
 export function dshHomeDir(): string {
@@ -49,16 +60,71 @@ export function dshCredentialsSource(): string {
 }
 
 /**
+ * The warning a provisioned home carries when its credentials entry is a local
+ * copy rather than the link: dsh's atomic credential write replaced the symlink,
+ * so this copy no longer follows the user's rotations. The entry is kept (it may
+ * be the only credentials that work), and the text names the one-line fix.
+ */
+export function dshCredentialsForkWarning(credentials: string, credentialsSource: string): string {
+	return (
+		`${credentials} is a local credentials copy, not a link to ${credentialsSource}: dsh's atomic credential write ` +
+		`replaces a symlink with a real file, so this copy can go stale as the user's credentials rotate. ` +
+		`Delete ${credentials} to re-link it.`
+	);
+}
+
+/** True when the path exists and is a symlink to exactly that target. */
+function isLinkTo(path: string, target: string): boolean {
+	try {
+		return lstatSync(path).isSymbolicLink() && readlinkSync(path) === target;
+	} catch {
+		return false;
+	}
+}
+
+/** True when the path itself is a symlink, whatever it points at. */
+function isSymlink(path: string): boolean {
+	try {
+		return lstatSync(path).isSymbolicLink();
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Create the credentials link, tolerating the one race lazy provisioning can
+ * lose: a second pi process that provisioned the same home between our check and
+ * our symlinkSync makes that call fail with EEXIST. An entry that is the correct
+ * link by the time we re-inspect is that process's success, not our failure;
+ * anything else is reported with the original error.
+ */
+export function linkDshCredentials(
+	credentialsSource: string,
+	credentials: string,
+): { ok: true } | { ok: false; reason: string } {
+	try {
+		symlinkSync(credentialsSource, credentials);
+		return { ok: true };
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException)?.code === "EEXIST" && isLinkTo(credentials, credentialsSource)) return { ok: true };
+		return { ok: false, reason: `could not link ${credentials} to ${credentialsSource}: ${describe(err)}` };
+	}
+}
+
+/**
  * Lazy, idempotent provisioning, called on every dsh spawn: create the harness
  * home when it is missing, and make sure `.credentials.yaml` is a symlink to
  * the user's credentials.
  *
  * The source is checked first so a failure leaves nothing behind — a dangling
- * link would only hide the missing sign-in. An existing link to the right
- * target is left alone; a link to somewhere else is replaced (the harness home
- * is ours to manage, and a stale target means dsh gets no credentials); a real
- * file or directory at that name is left untouched, because it is not ours to
- * delete.
+ * link would only hide the missing sign-in. A symlinked home path is refused
+ * rather than followed: provisioning through it would place dsh's settings and
+ * credentials wherever the link points, outside the path this module can vouch
+ * for. An existing link to the right target is left alone; a link to somewhere
+ * else is replaced (the harness home is ours to manage, and a stale target means
+ * dsh gets no credentials); a real file or directory at that name is left
+ * untouched, because it is not ours to delete — and when it is a real file it is
+ * reported as the fork it is.
  */
 export function ensureDshHome(options: DshHomeOptions = {}): DshHomeResult {
 	const home = options.homeDir ?? dshHomeDir();
@@ -68,8 +134,17 @@ export function ensureDshHome(options: DshHomeOptions = {}): DshHomeResult {
 		return { ok: false, reason: `dsh has no credentials at ${credentialsSource}: ${DSH_SIGNIN_INSTRUCTION}` };
 	}
 
+	if (isSymlink(home)) {
+		return {
+			ok: false,
+			reason: `the dsh harness home ${home} is a symlink; remove it so provisioning can create a real directory instead of writing through the link.`,
+		};
+	}
+
 	try {
-		mkdirSync(home, { recursive: true });
+		// 0o700: the home holds dsh's settings and a credentials entry. The mode
+		// applies to the directories mkdir creates; an existing home keeps its own.
+		mkdirSync(home, { recursive: true, mode: 0o700 });
 	} catch (err) {
 		return { ok: false, reason: `could not create the dsh harness home ${home}: ${describe(err)}` };
 	}
@@ -81,19 +156,18 @@ export function ensureDshHome(options: DshHomeOptions = {}): DshHomeResult {
 			if (readlinkSync(credentials) === credentialsSource) return { ok: true, home, credentials };
 			unlinkSync(credentials);
 		} else {
-			// A real file or directory: the user's own arrangement, never deleted.
-			return { ok: true, home, credentials };
+			// A real file or directory: the user's data, never deleted. A real FILE
+			// is what dsh's atomic credential write leaves behind when it replaces
+			// the link, so that case is reported as the fork it is.
+			const warning = existing.isFile() ? dshCredentialsForkWarning(credentials, credentialsSource) : undefined;
+			return { ok: true, home, credentials, ...(warning ? { warning } : {}) };
 		}
 	} catch {
 		/* absent: create the link below */
 	}
 
-	try {
-		symlinkSync(credentialsSource, credentials);
-	} catch (err) {
-		return { ok: false, reason: `could not link ${credentials} to ${credentialsSource}: ${describe(err)}` };
-	}
-	return { ok: true, home, credentials };
+	const linked = linkDshCredentials(credentialsSource, credentials);
+	return linked.ok ? { ok: true, home, credentials } : { ok: false, reason: linked.reason };
 }
 
 function describe(err: unknown): string {

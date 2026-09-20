@@ -18,8 +18,11 @@ Route by shape first. A message carrying `method` is a request when it also
 carries an `id`, and a notification when it does not; both go to their callbacks.
 Only a message without a method is a candidate reply, matched against the pending
 table by id. A reply never carries a method, so every dialect keeps the behavior
-it had for replies, and the collision case is fixed once for all four wire
-protocols (pi-rpc, codex app-server, ACP, stream-json).
+it had for replies, and the collision case is removed where it can occur: the
+`JsonRpcConnection` dialects, which are codex app-server and ACP (reasonix,
+codebuddy, dsh). pi-rpc and the two stream-json drivers extend `StdioProcess`
+directly, so they never matched a reply through that pending table and this
+change does not reach them.
 
 Request ids are routed only when numeric. JSON-RPC 2.0 also permits string ids;
 the ACP dialects (reasonix, codebuddy, dsh) number requests with integers, which
@@ -40,9 +43,10 @@ ACP contract, documented in the code rather than guessed around.
 
 ## Consequences
 
-Benefit: a harness request can no longer be consumed as a reply, for any dialect,
-and a turn settles only on a real result. dsh's multi-escalation turns — the case
-that exposed it — answer every request and settle once.
+Benefit: a harness request can no longer be consumed as a reply, for any
+`JsonRpcConnection` dialect, and a turn settles only on a real result. dsh's
+multi-escalation turns — the case that exposed it — answer every request and
+settle once.
 
 Cost: `handleLine` now relies on the protocol rule "a reply carries no method"
 instead of on local bookkeeping; a dialect that echoed a method on a response

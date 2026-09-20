@@ -38,13 +38,16 @@ export interface AcpDialect {
 	/** Extra argv appended after the ACP entry. */
 	baseArgv: (input: SessionStartInput) => string[];
 	/**
-	 * Extra environment for this dialect's process, merged over process.env by
-	 * spawnProcess (never a replacement). dsh uses it to point DSH_HOME at the
-	 * dedicated harness home and to carry the tier as DSH_PERMISSION_MODE;
-	 * throwing here fails the session start with that reason, before anything is
-	 * spawned.
+	 * Everything this dialect settles before its process is spawned. `env` is
+	 * merged over process.env by spawnProcess (never a replacement); dsh uses it
+	 * to point DSH_HOME at the dedicated harness home and to carry the tier as
+	 * DSH_PERMISSION_MODE. `warning` is a non-fatal notice about the start (dsh:
+	 * the harness home holds a local credentials copy instead of the link) that
+	 * the driver emits into the task's warning stream, where
+	 * external_agent_status reports it. Throwing here fails the session start
+	 * with that reason, before anything is spawned.
 	 */
-	env?: (input: SessionStartInput) => Record<string, string> | undefined;
+	prepare?: (input: SessionStartInput) => { env?: Record<string, string>; warning?: string } | undefined;
 	failClosedPermissionModes?: Mode[];
 	/**
 	 * Effort forwarding over the protocol, for dialects whose CLI has no effort
@@ -117,13 +120,18 @@ export class AcpDriver extends BaseSessionDriver implements SessionDriver {
 		// rejecting a codebuddy ACP request cancels the whole turn, which is
 		// exactly why readonly moved off plan mode).
 		this.autoPermission = (this.dialect.failClosedPermissionModes ?? ["readonly"]).includes(input.mode) ? "reject" : "allow";
-		// The dialect's env hook runs before the spawn: a dialect that cannot
+		// The dialect's prepare hook runs before the spawn: a dialect that cannot
 		// provision what its process needs (dsh: the harness home) throws here,
 		// and the session start fails with that reason instead of running a
 		// process that cannot work.
-		this.spawnProcess(ADAPTERS[this.dialect.id].bin, this.buildArgv(input), input.cwd, this.dialect.env?.(input));
+		const prepared = this.dialect.prepare?.(input);
+		this.spawnProcess(ADAPTERS[this.dialect.id].bin, this.buildArgv(input), input.cwd, prepared?.env);
 		this.onNotification((method, params) => this.handleNotification(method, params));
 		this.onRequest((msg) => this.handleRequest(msg));
+		// A dialect-level warning about this start (dsh: credentials fork) rides
+		// the task's warning stream — the hub's existing surface for non-fatal
+		// notices — rather than being dropped or promoted to a failure.
+		if (prepared?.warning) this.emit({ kind: "warning", text: prepared.warning });
 
 		const init = await this.request(
 			ACP_METHODS.initialize,

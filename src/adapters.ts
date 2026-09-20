@@ -184,6 +184,14 @@ export interface AdapterDispatch {
 	 */
 	env?: Record<string, string>;
 	/**
+	 * A non-fatal notice about this dispatch's environment. hub/registry.ts
+	 * records it as a task warning event, which is where non-fatal notices are
+	 * surfaced (external_agent_status: "non-fatal warnings"). dsh returns it when
+	 * its harness home holds a local credentials copy instead of the link to the
+	 * user's file — the run still works, but that copy can be stale.
+	 */
+	warning?: string;
+	/**
 	 * Set when this dispatch cannot run as asked — not a bad argv, but a request
 	 * the adapter refuses to spell out. hub/registry.ts fails the dispatch with
 	 * this reason instead of spawning a process that cannot work, so a refusal
@@ -912,7 +920,13 @@ const dshAdapter: Adapter = {
 		steerNote: "second session/prompt on the active session; injected at the next model step boundary",
 	},
 	sessionPolicy: (mode) =>
-		`DSH_PERMISSION_MODE=${dshPermissionMode(mode)} under a dedicated DSH_HOME (dsh's own sandbox enforces the tier; escalations fail closed)`,
+		// "Fail closed" is a readonly fact only: the ACP driver auto-denies
+		// session/request_permission for readonly and auto-allows it for
+		// write/yolo, where the requested tier permits the escalation.
+		`DSH_PERMISSION_MODE=${dshPermissionMode(mode)} under a dedicated DSH_HOME (dsh's own sandbox enforces the tier; ` +
+		(mode === "readonly"
+			? "the driver denies session/request_permission escalations, so readonly fails closed)"
+			: "escalations the harness raises are allowed by the driver, as this tier permits)"),
 	enforcesReadOnly: true,
 	buildDispatch({ task, mode, model, effort }) {
 		const argv = ["--profile", "headless", task];
@@ -939,7 +953,11 @@ const dshAdapter: Adapter = {
 		if (effort) return { ...dispatch, refusal: DSH_ONESHOT_EFFORT_REFUSAL };
 		const home = ensureDshHome();
 		if (!home.ok) return { ...dispatch, refusal: home.reason };
-		return { ...dispatch, env: { DSH_HOME: home.home, DSH_PERMISSION_MODE: dshPermissionMode(mode) } };
+		return {
+			...dispatch,
+			...(home.warning ? { warning: home.warning } : {}),
+			env: { DSH_HOME: home.home, DSH_PERMISSION_MODE: dshPermissionMode(mode) },
+		};
 	},
 	// Plain-text stdout: no --json exists in this release, so every non-empty
 	// line is answer prose, and hub/registry.ts joins the message events back

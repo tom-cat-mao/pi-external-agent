@@ -834,7 +834,9 @@ function createTask(
 		relaysReceived: 0,
 	};
 	tasks.set(task.id, task);
-	meter.recordDispatch(task.id);
+	// Dispatch counting belongs to the start paths, not here: a task can be
+	// created and immediately refused (AdapterDispatch.refusal), and a refused
+	// dispatch never ran — see startOneshotTask.
 	ensureWatchdogTimer();
 	return task;
 }
@@ -923,6 +925,9 @@ function startPersistentTask(
 
 	const task = createTask(agent, taskText, cwd, mode, notify, watchdogMs, dispatch, "persistent", extras.taskId);
 	applyExtras(task, extras);
+	// The session is started below, so this is a dispatch that runs (a start
+	// failure is a failed dispatch, not a refusal the hub decided on).
+	meter.recordDispatch(task.id);
 	task.driver = driver;
 
 	driver.onEvent((event) => {
@@ -1150,7 +1155,18 @@ function startOneshotTask(
 	// command whose result would mislead the caller (dsh: an effort request on a
 	// path with no effort knob, or a harness home with no credentials yet). It
 	// fails like a spawn that never started — reason recorded, nothing spawned.
-	if (adapterDispatch.refusal) return failBeforeStart(task, adapterDispatch.refusal);
+	if (adapterDispatch.refusal) {
+		// A refused dispatch is not a dispatch: counting it would inflate the
+		// meter's dispatchTotal. It is recorded under its own label instead, which
+		// is what /external_agent_stats prints under "refusals".
+		meter.recordRefused("adapter refusal");
+		return failBeforeStart(task, adapterDispatch.refusal);
+	}
+	// Non-fatal dispatch-time notices (dsh: the harness home holds a local
+	// credentials copy) ride the task's warning stream, where the status report
+	// already surfaces them as "non-fatal warnings".
+	if (adapterDispatch.warning) pushEvent(task, { kind: "warning", text: adapterDispatch.warning });
+	meter.recordDispatch(task.id);
 
 	let proc: ChildProcess;
 	try {

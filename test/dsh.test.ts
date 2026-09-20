@@ -46,14 +46,24 @@ import {
 	type Mode,
 } from "../src/adapters.ts";
 import { SESSION_DRIVERS } from "../src/drivers/index.ts";
-import { answerOf, type Task } from "../src/hub/shared.ts";
-import { startTask, tasks, validateDispatch, effortForwardedOnSession, effortSessionNote, modelForwardedOnSession, modelSessionNote } from "../src/hub/registry.ts";
+import { answerOf, warningsOf, type Task } from "../src/hub/shared.ts";
+import {
+	startTask,
+	tasks,
+	validateDispatch,
+	effortForwardedOnSession,
+	effortSessionNote,
+	meter,
+	modelForwardedOnSession,
+	modelSessionNote,
+} from "../src/hub/registry.ts";
 import {
 	DSH_CREDENTIALS_LINK_NAME,
 	DSH_HARNESS_HOME_NAME,
 	dshCredentialsSource,
 	dshHomeDir,
 	ensureDshHome,
+	linkDshCredentials,
 } from "../src/dsh-home.ts";
 
 const STUBS: Record<string, string> = {
@@ -164,6 +174,18 @@ test("dsh adapter: yolo default, every tier enforced, all seven effort levels", 
 	assert.match(adapter.sessionPolicy!("yolo"), /DSH_PERMISSION_MODE=danger-full-access/);
 });
 
+test("dsh session policy: fail-closed is a readonly fact, not a claim for write/yolo", () => {
+	// The ACP driver auto-denies session/request_permission for readonly and
+	// auto-allows it for write/yolo, so the receipt may only promise
+	// fail-closed escalation where that is what the driver does.
+	const policy = ADAPTERS.dsh.sessionPolicy!;
+	assert.match(policy("readonly"), /denies session\/request_permission escalations, so readonly fails closed/);
+	assert.doesNotMatch(policy("write"), /fails closed|denies session\/request_permission/);
+	assert.doesNotMatch(policy("yolo"), /fails closed|denies session\/request_permission/);
+	assert.match(policy("write"), /allowed by the driver/);
+	assert.match(policy("yolo"), /allowed by the driver/);
+});
+
 test("dsh one-shot dispatch: profile argv, dedicated harness home, and the mode's permission env", () => {
 	const home = makeHome(true);
 	const restoreHome = withEnv({ HOME: home });
@@ -252,6 +274,27 @@ test("dsh one-shot dispatch fails with the sign-in instruction when credentials 
 	}
 });
 
+test("dsh one-shot dispatch: a forked credentials copy is a warning, not a refusal", () => {
+	const home = makeHome(true);
+	// dsh's atomic credential write leaves a real file where the link was.
+	mkdirSync(path.join(home, DSH_HARNESS_HOME_NAME), { recursive: true });
+	const fork = path.join(home, DSH_HARNESS_HOME_NAME, DSH_CREDENTIALS_LINK_NAME);
+	writeFileSync(fork, "token: older\n");
+	const restoreHome = withEnv({ HOME: home });
+	try {
+		const dispatch = ADAPTERS.dsh.buildDispatch({ task: "t", cwd: "/tmp", mode: "write" });
+		// The run is still spelled out and still gets its home: the copy works,
+		// it may just be stale.
+		assert.equal(dispatch.refusal, undefined);
+		assert.equal(dispatch.env?.DSH_HOME, path.join(home, DSH_HARNESS_HOME_NAME));
+		assert.match(dispatch.warning ?? "", /local credentials copy/);
+		assert.match(dispatch.warning ?? "", /Delete .*\.credentials\.yaml to re-link it/);
+		assert.equal(readFileSync(fork, "utf8"), "token: older\n");
+	} finally {
+		restoreHome();
+	}
+});
+
 test("dsh reports a model override as not forwarded rather than claiming it traveled", () => {
 	const home = makeHome(true);
 	const restoreHome = withEnv({ HOME: home });
@@ -326,6 +369,75 @@ test("ensureDshHome replaces a link that points elsewhere and leaves real files 
 	const kept = ensureDshHome({ homeDir, credentialsSource });
 	assert.equal(kept.ok, true);
 	assert.equal(lstatSync(link).isSymbolicLink(), false);
+	assert.equal(readFileSync(link, "utf8"), "hand-managed\n");
+});
+
+test("ensureDshHome: a local credentials copy is kept and warned about, with the one-line fix", () => {
+	const root = mkdtempSync(path.join(tmpdir(), "dsh-provision-"));
+	const homeDir = path.join(root, "harness-home");
+	const credentialsSource = path.join(root, "dsh", ".credentials.yaml");
+	mkdirSync(path.dirname(credentialsSource), { recursive: true });
+	writeFileSync(credentialsSource, "token: user\n");
+	mkdirSync(homeDir, { recursive: true });
+	const link = path.join(homeDir, ".credentials.yaml");
+	// What a dsh-side credentials write leaves behind: a real file where the
+	// symlink used to be, holding a copy that drifts as the user's file rotates.
+	writeFileSync(link, "token: older\n");
+
+	const result = ensureDshHome({ homeDir, credentialsSource });
+	assert.equal(result.ok, true);
+	if (!result.ok) return;
+	assert.equal(result.credentials, link);
+	// Provisioning succeeds and never clobbers the copy: it may be the only
+	// credentials that still work.
+	assert.equal(lstatSync(link).isSymbolicLink(), false);
+	assert.equal(readFileSync(link, "utf8"), "token: older\n");
+	assert.ok(result.warning, "a local copy must be reported, not silently accepted");
+	assert.match(result.warning, /local credentials copy/);
+	assert.ok(result.warning.includes(link), "the warning names the file to delete");
+	assert.ok(result.warning.includes(credentialsSource), "and the file it should be linked to");
+
+	// Doing exactly what the warning says is the whole fix.
+	unlinkSync(link);
+	const relinked = ensureDshHome({ homeDir, credentialsSource });
+	assert.equal(relinked.ok, true);
+	if (!relinked.ok) return;
+	assert.equal(relinked.warning, undefined, "a correct link carries no warning");
+	assert.equal(readlinkSync(link), credentialsSource);
+});
+
+test("linkDshCredentials: losing the provisioning race to a correct link is not a failure", () => {
+	const root = mkdtempSync(path.join(tmpdir(), "dsh-race-"));
+	const homeDir = path.join(root, "harness-home");
+	mkdirSync(homeDir, { recursive: true });
+	const credentialsSource = path.join(root, "dsh", ".credentials.yaml");
+	mkdirSync(path.dirname(credentialsSource), { recursive: true });
+	writeFileSync(credentialsSource, "token: test\n");
+	const link = path.join(homeDir, ".credentials.yaml");
+
+	// A second pi process provisioned the same home between our check and our
+	// symlinkSync: EEXIST, with the correct link now present. That is the race.
+	symlinkSync(credentialsSource, link);
+	assert.deepEqual(linkDshCredentials(credentialsSource, link), { ok: true });
+	assert.equal(readlinkSync(link), credentialsSource);
+
+	// A link to somewhere else is not a peer's success: report it, touch nothing.
+	const other = path.join(root, "other.yaml");
+	writeFileSync(other, "token: other\n");
+	unlinkSync(link);
+	symlinkSync(other, link);
+	const wrong = linkDshCredentials(credentialsSource, link);
+	assert.equal(wrong.ok, false);
+	if (wrong.ok) return;
+	assert.match(wrong.reason, /could not link/);
+	assert.ok(wrong.reason.includes(link));
+	assert.equal(readlinkSync(link), other);
+
+	// A real file cannot be displaced by a link either.
+	unlinkSync(link);
+	writeFileSync(link, "hand-managed\n");
+	const realFile = linkDshCredentials(credentialsSource, link);
+	assert.equal(realFile.ok, false);
 	assert.equal(readFileSync(link, "utf8"), "hand-managed\n");
 });
 
@@ -787,6 +899,43 @@ test("ensureDshHome: a dangling credentials source is as good as missing", () =>
 	assert.equal(existsSync(homeDir), false);
 });
 
+test("ensureDshHome: the harness home is created 0o700", () => {
+	const root = mkdtempSync(path.join(tmpdir(), "dsh-provision-"));
+	const homeDir = path.join(root, "harness-home");
+	const credentialsSource = path.join(root, "dsh", ".credentials.yaml");
+	mkdirSync(path.dirname(credentialsSource), { recursive: true });
+	writeFileSync(credentialsSource, "token: test\n");
+
+	const result = ensureDshHome({ homeDir, credentialsSource });
+	assert.equal(result.ok, true);
+	// The home holds dsh's settings and a credentials entry, so nobody else gets
+	// to read or write it. mkdir's mode is masked by the umask, so assert the
+	// property that matters: owner rwx, nothing for group/other.
+	const mode = lstatSync(homeDir).mode & 0o777;
+	assert.equal(mode & 0o700, 0o700, `owner needs full access (mode ${mode.toString(8)})`);
+	assert.equal(mode & 0o077, 0, `group/other must have no access (mode ${mode.toString(8)})`);
+});
+
+test("ensureDshHome: a symlinked home path fails provisioning instead of writing through it", () => {
+	const root = mkdtempSync(path.join(tmpdir(), "dsh-provision-"));
+	const elsewhere = path.join(root, "elsewhere");
+	mkdirSync(elsewhere, { recursive: true });
+	const homeDir = path.join(root, "harness-home");
+	symlinkSync(elsewhere, homeDir);
+	const credentialsSource = path.join(root, "dsh", ".credentials.yaml");
+	mkdirSync(path.dirname(credentialsSource), { recursive: true });
+	writeFileSync(credentialsSource, "token: test\n");
+
+	const result = ensureDshHome({ homeDir, credentialsSource });
+	assert.equal(result.ok, false);
+	if (result.ok) return;
+	assert.match(result.reason, /symlink/);
+	assert.ok(result.reason.includes(homeDir), "the reason names the path to remove");
+	// Nothing was provisioned through the link, and the link itself is untouched.
+	assert.deepEqual(readdirSync(elsewhere), []);
+	assert.equal(lstatSync(homeDir).isSymbolicLink(), true);
+});
+
 test("ensureDshHome: the default paths hang off HOME, and the fix is the file the reason names", () => {
 	const home = mkdtempSync(path.join(tmpdir(), "dsh-user-home-"));
 	const restoreHome = withEnv({ HOME: home });
@@ -908,6 +1057,7 @@ test("hub one-shot dsh: an effort request fails the dispatch with the transport 
 	const restorePath = usePath(dir);
 	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: log });
 	const restoreDrivers = withoutDshDriver();
+	const before = meter.snapshot();
 	try {
 		const started = await call("external_agent_start", {
 			agent: "dsh",
@@ -925,6 +1075,16 @@ test("hub one-shot dsh: an effort request fails the dispatch with the transport 
 		assert.equal(tasks.get(started.details.task.taskId)?.proc, null);
 		assert.deepEqual(mockLog(log), []);
 		assert.equal(existsSync(path.join(home, DSH_HARNESS_HOME_NAME)), false);
+		// ...and it is not a dispatch the meter counts: the refusal is reported
+		// under its own label, so /external_agent_stats never claims a run that
+		// was refused before it existed.
+		const after = meter.snapshot();
+		assert.equal(after.dispatchTotal, before.dispatchTotal, "a refused dispatch must not raise dispatchTotal");
+		assert.equal(
+			after.refusedTotal["adapter refusal"] ?? 0,
+			(before.refusedTotal["adapter refusal"] ?? 0) + 1,
+			"the refusal is counted as a refusal",
+		);
 
 		// A caller that waits on the dispatch anyway gets the reason back at once
 		// instead of a timeout: the refusal settled the task synchronously.
@@ -1056,6 +1216,31 @@ test("hub one-shot dsh: a reasoning line misrouted to stdout is kept out of the 
 	}
 });
 
+test("hub one-shot dsh: a forked credentials copy rides the task's warning stream", async () => {
+	const dir = makeFixtureDir({ dsh: DSH_ONESHOT_MOCK });
+	const home = makeHome(true);
+	mkdirSync(path.join(home, DSH_HARNESS_HOME_NAME), { recursive: true });
+	const fork = path.join(home, DSH_HARNESS_HOME_NAME, DSH_CREDENTIALS_LINK_NAME);
+	writeFileSync(fork, "token: older\n");
+	const restorePath = usePath(dir);
+	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: path.join(dir, "dsh-log.jsonl") });
+	const restoreDrivers = withoutDshDriver();
+	try {
+		const task = startTask("dsh", "t", dir, "readonly", "off", 0);
+		await settle(task);
+
+		// The run happened; the warning is a notice on it, not a failure of it.
+		assert.equal(task.state, "done");
+		assert.match(warningsOf(task), /local credentials copy/);
+		assert.ok(warningsOf(task).includes(fork));
+		assert.equal(readFileSync(fork, "utf8"), "token: older\n");
+	} finally {
+		restoreDrivers();
+		restorePath();
+		restoreEnv();
+	}
+});
+
 // ---------------------------------------------------------------------------
 // ACP: effort over the protocol, and the tier at the permission request
 // ---------------------------------------------------------------------------
@@ -1130,6 +1315,48 @@ test("dsh ACP: a readonly session rejects a permission escalation; yolo allows i
 		const both = await waitForLog(log, (records) => records.filter(isResponse).length === 2);
 		assert.deepEqual(both.filter(isResponse)[1].result, { outcome: { outcome: "selected", optionId: "allow-once" } });
 		yolo.kill();
+	} finally {
+		restorePath();
+		restoreEnv();
+	}
+});
+
+// ---------------------------------------------------------------------------
+// A session start is told about its forked credentials, and stays running
+// ---------------------------------------------------------------------------
+
+/** Poll a task's event stream until the predicate holds (the warning lands async). */
+async function waitForEvent(task: Task, predicate: (event: { kind: string; text: string }) => boolean, timeoutMs = 5_000): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+	while (!task.events.some(predicate)) {
+		if (Date.now() > deadline) throw new Error(`timed out waiting for the event (stderr: ${task.stderr})`);
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+}
+
+test("dsh ACP session: a forked credentials copy warns into the task's warning stream", async () => {
+	const dir = makeFixtureDir({ dsh: DSH_ACP_MOCK });
+	const home = makeHome(true);
+	// What dsh's atomic credential write leaves behind in the harness home.
+	const harnessHome = path.join(home, DSH_HARNESS_HOME_NAME);
+	mkdirSync(harnessHome, { recursive: true });
+	const fork = path.join(harnessHome, DSH_CREDENTIALS_LINK_NAME);
+	writeFileSync(fork, "token: older\n");
+	const restorePath = usePath(dir);
+	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: path.join(dir, "dsh-log.jsonl") });
+	try {
+		const task = startTask("dsh", "do the thing", dir, "yolo", "off", 0);
+		await waitForEvent(task, (event) => String(event.kind) === "warning");
+		// The existing warning surface — what external_agent_status prints as
+		// "non-fatal warnings" — carries the notice and the fix.
+		const warnings = warningsOf(task);
+		assert.match(warnings, /local credentials copy/);
+		assert.ok(warnings.includes(fork), "the warning names the file to delete");
+		assert.match(warnings, /Delete .*\.credentials\.yaml to re-link it/);
+		// The session was not failed or blocked over it, and the copy is intact.
+		assert.equal(readFileSync(fork, "utf8"), "token: older\n");
+		assert.notEqual(task.state, "failed");
+		task.driver?.kill();
 	} finally {
 		restorePath();
 		restoreEnv();
