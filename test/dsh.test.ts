@@ -264,16 +264,27 @@ test("dsh one-shot refuses an effort request instead of dropping it", () => {
 	}
 });
 
-test("dsh one-shot dispatch fails with the sign-in instruction when credentials are missing", () => {
+test("dsh one-shot dispatch proceeds without a credentials link, warning with the remedy", () => {
+	// A user with no ~/.dsh/.credentials.yaml is not a user who cannot run: an
+	// empty harness home completes a headless run on the default provider route
+	// (verified 0.1.5-rc.2), and dsh reads project/user `.env` fallbacks too.
 	const home = makeHome(false);
 	const restoreHome = withEnv({ HOME: home });
 	try {
 		const dispatch = ADAPTERS.dsh.buildDispatch({ task: "t", cwd: "/tmp", mode: "write" });
-		assert.match(dispatch.refusal ?? "", /dsh web/);
-		assert.match(dispatch.refusal ?? "", /sign in/);
-		assert.equal(dispatch.env, undefined);
-		// A refusal never invents a home: nothing was provisioned.
-		assert.equal(existsSync(path.join(home, DSH_HARNESS_HOME_NAME)), false);
+		assert.equal(dispatch.refusal, undefined);
+		assert.equal(dispatch.env?.DSH_HOME, path.join(home, DSH_HARNESS_HOME_NAME));
+		assert.equal(dispatch.env?.DSH_PERMISSION_MODE, "workspace-write");
+		const warning = dispatch.warning ?? "";
+		assert.match(warning, /no .*\.credentials\.yaml to link/);
+		assert.ok(warning.includes(path.join(home, ".dsh", ".credentials.yaml")), "the warning names the file that is missing");
+		assert.match(warning, /default provider route or \.env must carry auth/);
+		assert.match(warning, /run `dsh web` once to manage credentials/);
+		// The home is still provisioned — the requested tier needs it — but there
+		// is no credentials entry at all, which is the state a credential-less dsh
+		// run works in: never a dangling link for dsh to read.
+		assert.equal(lstatSync(path.join(home, DSH_HARNESS_HOME_NAME)).isDirectory(), true);
+		assert.throws(() => lstatSync(path.join(home, DSH_HARNESS_HOME_NAME, DSH_CREDENTIALS_LINK_NAME)), /ENOENT/);
 	} finally {
 		restoreHome();
 	}
@@ -446,14 +457,34 @@ test("linkDshCredentials: losing the provisioning race to a correct link is not 
 	assert.equal(readFileSync(link, "utf8"), "hand-managed\n");
 });
 
-test("ensureDshHome fails with the sign-in instruction, and creates nothing, without credentials", () => {
+test("ensureDshHome: no credentials to link succeeds with the remedy, and links nothing", () => {
 	const root = mkdtempSync(path.join(tmpdir(), "dsh-provision-"));
 	const homeDir = path.join(root, "harness-home");
-	const result = ensureDshHome({ homeDir, credentialsSource: path.join(root, "dsh", ".credentials.yaml") });
-	if (result.ok) throw new Error("expected provisioning to fail without a credentials source");
-	assert.match(result.reason, /dsh web/);
-	assert.match(result.reason, /sign in/);
-	assert.equal(existsSync(homeDir), false);
+	const credentialsSource = path.join(root, "dsh", ".credentials.yaml");
+	const result = ensureDshHome({ homeDir, credentialsSource });
+	assert.equal(result.ok, true);
+	if (!result.ok) return;
+	assert.equal(result.home, homeDir);
+	assert.equal(result.credentials, path.join(homeDir, DSH_CREDENTIALS_LINK_NAME));
+	const warning = result.warning ?? "";
+	assert.match(warning, /no .*\.credentials\.yaml to link/);
+	assert.ok(warning.includes(credentialsSource), "the warning names the missing source");
+	assert.match(warning, /default provider route or \.env must carry auth/);
+	assert.match(warning, /run `dsh web` once to manage credentials/);
+	// The home exists — the requested tier needs it — and holds no credentials
+	// entry, so dsh reads no broken link.
+	assert.equal(lstatSync(homeDir).isDirectory(), true);
+	assert.throws(() => lstatSync(path.join(homeDir, DSH_CREDENTIALS_LINK_NAME)), /ENOENT/);
+	assert.equal(existsSync(credentialsSource), false, "provisioning never invents the user's file");
+
+	// The next run links by itself once the file exists: the source is the switch.
+	mkdirSync(path.dirname(credentialsSource), { recursive: true });
+	writeFileSync(credentialsSource, "token: test\n");
+	const linked = ensureDshHome({ homeDir, credentialsSource });
+	assert.equal(linked.ok, true);
+	if (!linked.ok) return;
+	assert.equal(linked.warning, undefined);
+	assert.equal(readlinkSync(path.join(homeDir, DSH_CREDENTIALS_LINK_NAME)), credentialsSource);
 });
 
 // ---------------------------------------------------------------------------
@@ -594,17 +625,31 @@ test("dsh ACP session: a rejected set_config_option fails the session start", as
 	}
 });
 
-test("dsh ACP session: missing credentials fail the session start with the sign-in instruction", async () => {
+test("dsh ACP session: a home without credentials starts unlinked, with the remedy as a warning", async () => {
 	const dir = makeFixtureDir({ dsh: DSH_ACP_MOCK });
 	const home = makeHome(false);
+	const log = path.join(dir, "dsh-log.jsonl");
 	const restorePath = usePath(dir);
-	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: path.join(dir, "dsh-log.jsonl") });
+	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: log });
 	const driver = SESSION_DRIVERS.dsh!();
+	const warnings: string[] = [];
+	driver.onEvent((event) => {
+		if (event.kind === "warning") warnings.push(event.text);
+	});
 	try {
-		await assert.rejects(() => driver.start({ task: "t", cwd: dir, mode: "yolo" }), /dsh web/);
-		// Nothing was spawned: the env hook runs before the process exists.
-		assert.deepEqual(mockLog(path.join(dir, "dsh-log.jsonl")), []);
-		assert.equal(driver.alive, false);
+		// Never refused: dsh's default provider route needs no credentials, so the
+		// session starts in the dedicated home and the notice travels alongside it.
+		await driver.start({ task: "t", cwd: dir, mode: "yolo" });
+
+		const [spawned] = mockLog(log);
+		assert.deepEqual(spawned.argv, ["--profile", "acp"]);
+		assert.equal(spawned.env.DSH_HOME, path.join(home, DSH_HARNESS_HOME_NAME));
+		assert.equal(spawned.env.DSH_PERMISSION_MODE, "danger-full-access");
+		assert.throws(() => lstatSync(path.join(home, DSH_HARNESS_HOME_NAME, DSH_CREDENTIALS_LINK_NAME)), /ENOENT/);
+		assert.equal(warnings.length, 1, `expected one warning, got ${JSON.stringify(warnings)}`);
+		assert.match(warnings[0], /no .*\.credentials\.yaml to link/);
+		assert.match(warnings[0], /default provider route or \.env must carry auth/);
+		assert.match(warnings[0], /run `dsh web` once to manage credentials/);
 	} finally {
 		driver.kill();
 		restoreEnv();
@@ -890,18 +935,34 @@ test("ensureDshHome: an unusable home path fails with a reason instead of throwi
 	assert.equal(readFileSync(homeDir, "utf8"), "a real file where the home should be\n");
 });
 
-test("ensureDshHome: a dangling credentials source is as good as missing", () => {
+test("ensureDshHome: a dangling credentials source is as good as missing, and clears a link of ours", () => {
 	const root = mkdtempSync(path.join(tmpdir(), "dsh-provision-"));
 	const homeDir = path.join(root, "harness-home");
 	const credentialsSource = path.join(root, "credentials.yaml");
 	symlinkSync(path.join(root, "gone.yaml"), credentialsSource);
 
 	const result = ensureDshHome({ homeDir, credentialsSource });
-	assert.equal(result.ok, false);
-	if (result.ok) return;
-	assert.match(result.reason, /dsh web/);
-	// A dangling link would only hide the missing sign-in: nothing was created.
-	assert.equal(existsSync(homeDir), false);
+	assert.equal(result.ok, true);
+	if (!result.ok) return;
+	assert.match(result.warning ?? "", /no .*credentials\.yaml to link/);
+	const link = path.join(homeDir, DSH_CREDENTIALS_LINK_NAME);
+	assert.throws(() => lstatSync(link), /ENOENT/);
+
+	// A home that had linked the source before it went away does not keep a
+	// dangling entry: dsh gets either a working credentials file or none.
+	symlinkSync(credentialsSource, link);
+	const relinked = ensureDshHome({ homeDir, credentialsSource });
+	assert.equal(relinked.ok, true);
+	assert.throws(() => lstatSync(link), /ENOENT/);
+
+	// And a link of the user's own, pointing at a file that does exist, is not
+	// ours to clear while the source is missing.
+	const other = path.join(root, "other.yaml");
+	writeFileSync(other, "token: other\n");
+	symlinkSync(other, link);
+	const kept = ensureDshHome({ homeDir, credentialsSource });
+	assert.equal(kept.ok, true);
+	assert.equal(readlinkSync(link), other);
 });
 
 test("ensureDshHome: the harness home is created 0o700", () => {
@@ -959,7 +1020,7 @@ test("ensureDshHome: a symlinked home path fails provisioning instead of writing
 	assert.equal(lstatSync(homeDir).isSymbolicLink(), true);
 });
 
-test("ensureDshHome: the default paths hang off HOME, and the fix is the file the reason names", () => {
+test("ensureDshHome: the default paths hang off HOME, and the warning names the file and the fix", () => {
 	const home = mkdtempSync(path.join(tmpdir(), "dsh-user-home-"));
 	const restoreHome = withEnv({ HOME: home });
 	try {
@@ -967,17 +1028,19 @@ test("ensureDshHome: the default paths hang off HOME, and the fix is the file th
 		assert.equal(dshCredentialsSource(), path.join(home, ".dsh", DSH_CREDENTIALS_LINK_NAME));
 
 		const missing = ensureDshHome();
-		assert.equal(missing.ok, false);
-		if (missing.ok) return;
-		assert.ok(missing.reason.includes(dshCredentialsSource()), "the reason must name the file, not just the directory");
-		assert.match(missing.reason, /dsh web/);
+		assert.equal(missing.ok, true);
+		if (!missing.ok) return;
+		assert.equal(missing.home, dshHomeDir());
+		assert.ok((missing.warning ?? "").includes(dshCredentialsSource()), "the warning must name the file, not just the directory");
+		assert.match(missing.warning ?? "", /run `dsh web` once to manage credentials/);
 
-		// Doing exactly what the reason says is the whole fix.
+		// Doing exactly what the warning says is the whole fix.
 		mkdirSync(path.join(home, ".dsh"), { recursive: true });
 		writeFileSync(dshCredentialsSource(), "token: test\n");
 		const provisioned = ensureDshHome();
 		assert.equal(provisioned.ok, true);
 		if (!provisioned.ok) return;
+		assert.equal(provisioned.warning, undefined, "a correct link carries no warning");
 		assert.equal(
 			readlinkSync(path.join(provisioned.home, DSH_CREDENTIALS_LINK_NAME)),
 			dshCredentialsSource(),
@@ -1232,6 +1295,38 @@ test("hub one-shot dsh: a reasoning line misrouted to stdout is kept out of the 
 			["reasoning", "message", "message"],
 		);
 		assert.equal(answerOf(task), "First line of the answer.\nSecond line with no trailing newline.");
+	} finally {
+		restoreDrivers();
+		restorePath();
+		restoreEnv();
+	}
+});
+
+test("hub one-shot dsh: a home without credentials dispatches, warned and counted, never refused", async () => {
+	const dir = makeFixtureDir({ dsh: DSH_ONESHOT_MOCK });
+	const home = makeHome(false);
+	const restorePath = usePath(dir);
+	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: path.join(dir, "dsh-log.jsonl") });
+	const restoreDrivers = withoutDshDriver();
+	const before = meter.snapshot();
+	try {
+		// An id no earlier test can have used: dispatchTotal counts distinct task
+		// ids, and registry ids restart with each session.
+		const task = startTask("dsh", "t", dir, "readonly", "off", 0, undefined, undefined, { taskId: "dsh-no-credentials" });
+		await settle(task);
+
+		// No credentials file, and the run still happened.
+		assert.equal(task.state, "done");
+		assert.equal(task.exitCode, 0);
+		assert.match(warningsOf(task), /no .*\.credentials\.yaml to link/);
+		assert.match(warningsOf(task), /default provider route or \.env must carry auth/);
+		assert.equal(existsSync(path.join(home, DSH_HARNESS_HOME_NAME, DSH_CREDENTIALS_LINK_NAME)), false);
+		// A warned dispatch is a dispatch: the meter files it as one and leaves the
+		// refusals alone, which is what this path did before the link went
+		// best-effort.
+		const after = meter.snapshot();
+		assert.equal(after.dispatchTotal, before.dispatchTotal + 1, "a warned dispatch must be counted as a dispatch");
+		assert.deepEqual(after.refusedTotal, before.refusedTotal, "absent credentials are not a refusal");
 	} finally {
 		restoreDrivers();
 		restorePath();

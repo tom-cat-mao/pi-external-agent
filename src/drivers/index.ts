@@ -113,10 +113,12 @@ export const SESSION_DRIVERS: Partial<Record<AgentId, () => SessionDriver>> = {
 			// DSH_HOME must be the dedicated harness home (src/dsh-home.ts): the
 			// user's shared ~/.dsh settings outrank DSH_PERMISSION_MODE, so a run
 			// under the shared home would not be bounded by the requested tier at
-			// all. Provisioning runs before the spawn and is lazy/idempotent; a
-			// failure (no credentials yet) fails the session start with the reason,
-			// which tells the user to sign in. A home that already holds a local
-			// credentials copy still starts, with the warning attached.
+			// all. Provisioning runs before the spawn and is lazy/idempotent; it
+			// fails the session start only when the home itself cannot exist (a
+			// symlinked or unusable path). Missing credentials never do: dsh runs
+			// credential-less on its default provider route, so the home is started
+			// unlinked and the warning carries the remedy — as does a home that
+			// already holds a local credentials copy.
 			prepare: (input) => {
 				const home = ensureDshHome();
 				if (!home.ok) throw new Error(home.reason);

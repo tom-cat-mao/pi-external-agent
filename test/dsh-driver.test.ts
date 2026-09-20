@@ -27,12 +27,12 @@
  */
 import { afterEach, test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { ADAPTERS, EFFORT_LEVELS, type Effort, type Mode } from "../src/adapters.ts";
 import { SESSION_DRIVERS, type SessionDriver, type TurnOutcome } from "../src/drivers/index.ts";
-import { DSH_HARNESS_HOME_NAME } from "../src/dsh-home.ts";
+import { DSH_CREDENTIALS_LINK_NAME, DSH_HARNESS_HOME_NAME } from "../src/dsh-home.ts";
 
 /**
  * A fake ACP harness for both dsh and reasonix. It records every frame it
@@ -340,20 +340,35 @@ test("dsh ACP session env: dedicated DSH_HOME and the mode's DSH_PERMISSION_MODE
 	}
 });
 
-test("dsh ACP session: a provisioning failure refuses the start and spawns nothing", async () => {
+test("dsh ACP session: a home without credentials still starts, unlinked, with the remedy as a warning", async () => {
 	const home = makeHome(false);
 	const harness = makeHarness("dsh", { home });
+	const warnings: string[] = [];
+	harness.driver.onEvent((event) => {
+		if (event.kind === "warning") warnings.push(event.text);
+	});
 	try {
-		await assert.rejects(async () => await harness.start({ mode: "yolo" }), (err: Error) => {
-			assert.match(err.message, /dsh web/);
-			assert.match(err.message, /sign in/);
-			return true;
-		});
-		// The env hook runs before spawn: no process, no argv, nothing left behind.
-		assert.deepEqual(harness.records(), []);
-		assert.equal(harness.driver.alive, false);
-		assert.deepEqual(harness.driver.argv, []);
-		assert.equal(existsSync(path.join(home, DSH_HARNESS_HOME_NAME)), false);
+		// Not a provisioning failure: dsh completes a run credential-less on its
+		// default provider route (verified 0.1.5-rc.2 against an empty home), so
+		// the session starts in the dedicated home and links nothing.
+		await harness.start({ mode: "yolo" });
+
+		const spawn = await waitFor("the spawn record", () => harness.records()[0]);
+		assert.equal(spawn.kind, "spawn");
+		assert.equal(spawn.env.DSH_HOME, path.join(home, DSH_HARNESS_HOME_NAME), "the tier still needs its home");
+		assert.equal(spawn.env.DSH_PERMISSION_MODE, "danger-full-access");
+		// The home exists and holds no credentials entry, so dsh reads no broken
+		// link — the arrangement an empty harness home runs on.
+		assert.equal(lstatSync(path.join(home, DSH_HARNESS_HOME_NAME)).isDirectory(), true);
+		assert.throws(() => lstatSync(path.join(home, DSH_HARNESS_HOME_NAME, DSH_CREDENTIALS_LINK_NAME)), /ENOENT/);
+
+		// The turn runs, and the notice says what has to carry auth instead.
+		await waitFor("the first session/prompt", () => ofKind(harness.records(), "prompt")[0]);
+		assert.equal(harness.driver.alive, true);
+		assert.equal(warnings.length, 1, `expected one warning, got ${JSON.stringify(warnings)}`);
+		assert.match(warnings[0], /no .*\.credentials\.yaml to link/);
+		assert.match(warnings[0], /default provider route or \.env must carry auth/);
+		assert.match(warnings[0], /run `dsh web` once to manage credentials/);
 	} finally {
 		harness.stop();
 	}

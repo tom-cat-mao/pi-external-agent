@@ -10,7 +10,7 @@ Working rules for agents editing this repository.
 - `src/hub/reporting.ts` — caller-facing text: status report, dispatch receipts, compare report, relay receipt.
 - `src/hub/shared.ts` — task/receipt types, hub constants, pure formatting helpers and input predicates.
 - `src/adapters.ts` — per-CLI one-shot adapters: argv spelling and stdout parsing (incl. usage/cost), plus the `ADAPTERS` registry.
-- `src/dsh-home.ts` — the dedicated `DSH_HOME` every dsh spawn gets: lazy, idempotent provisioning, a `.credentials.yaml` symlink to the user's own file, and a failure carrying the `dsh web` sign-in instruction.
+- `src/dsh-home.ts` — the dedicated `DSH_HOME` every dsh spawn gets: lazy, idempotent provisioning, a best-effort `.credentials.yaml` symlink to the user's own file, and a warning (never a failure) when there is nothing to link.
 - `src/drivers/` — persistent session drivers for steer / follow-up: `base.ts` (stdio + JSON-RPC plumbing), one file per wire protocol (`pi-rpc`, `codex-app-server`, `acp`, `stream-json`), and `index.ts` (`SESSION_DRIVERS`).
 - `src/artifacts.ts` — answer archive: settle-time content-addressed store, inline placeholder, paged recall.
 - `src/templates.ts` + `templates/` — task-template loading (project > user > builtin) and the five builtins.

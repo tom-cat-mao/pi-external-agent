@@ -38,6 +38,16 @@ radius wider than `JsonRpcConnection` has.
 - The routing note's scope is corrected: `JsonRpcConnection`'s subclasses are codex app-server and
   ACP; pi-rpc and the two stream-json drivers extend `StdioProcess` and never matched replies
   through the pending table.
+- Amended 2026-09-21 — the missing-credentials REFUSAL was too strict and is now a best-effort
+  link. Evidence against the hard prerequisite: a completely EMPTY `DSH_HOME` completes
+  `dsh --profile headless` on the default deepseek-official route with zero credentials
+  (verified 0.1.5-rc.2), a real user's `~/.dsh/.credentials.yaml` holds only a
+  `client-connection/browser-session` record (the web UI's browser secret, not a provider key),
+  and dsh reads project and user `.env` fallbacks. `ensureDshHome` therefore links when the source
+  exists — fork behavior unchanged — and otherwise skips the link, SUCCEEDS, and returns
+  `dshCredentialsMissingWarning` naming the remedy; an existing link of ours whose source went away
+  is cleared rather than left dangling. Both start paths carry that warning through the channel
+  above, never as a refusal, so such a dispatch is counted as a dispatch and not as a refusal.
 
 ## Alternatives considered
 
@@ -60,10 +70,12 @@ Benefit: the receipt and the stats stay honest — a forked credentials file is 
 every surface that reports the task, including the settle notice and the wait report, a refused
 dispatch is counted as a refusal, and the dsh session policy claims fail-closed escalations only
 where the driver provides them. Provisioning is race-safe against a second pi process, and the
-harness home is owner-only — new or pre-existing — and never provisioned through a symlink.
+harness home is owner-only — new or pre-existing — and never provisioned through a symlink. Missing
+credentials are a warning rather than a wall: only a provider key kept in that file makes the link
+matter, so a user without one still dispatches, unlinked and counted as a dispatch.
 
-Cost: a second way for credentials to live (a warning to read, not a failure to fix); `AcpDialect`'s
-`env` hook became `prepare` returning env plus warning, so a dialect with a start-time notice has a
-channel but also one more shape to fill; and the meter's dispatch count now depends on the start
-paths calling `recordDispatch` rather than on task creation, which the comment at `createTask`
-records.
+Cost: a second way for credentials to live, plus an unlinked home to explain, both a warning to read
+rather than a failure to fix; `AcpDialect`'s `env` hook became `prepare` returning env plus warning,
+so a dialect with a start-time notice has a channel but also one more shape to fill; and the meter's
+dispatch count now depends on the start paths calling `recordDispatch` rather than on task creation,
+which the comment at `createTask` records.

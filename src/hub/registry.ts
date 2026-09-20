@@ -1160,8 +1160,9 @@ function startOneshotTask(
 
 	// An adapter that cannot honour the request says so instead of spelling out a
 	// command whose result would mislead the caller (dsh: an effort request on a
-	// path with no effort knob, or a harness home with no credentials yet). It
-	// fails like a spawn that never started — reason recorded, nothing spawned.
+	// path with no effort knob, or a harness home that cannot be provisioned at
+	// all). It fails like a spawn that never started — reason recorded, nothing
+	// spawned.
 	if (adapterDispatch.refusal) {
 		// A refused dispatch is not a dispatch: counting it would inflate the
 		// meter's dispatchTotal. It is recorded under its own label instead, which
@@ -1170,8 +1171,9 @@ function startOneshotTask(
 		return failBeforeStart(task, adapterDispatch.refusal);
 	}
 	// Non-fatal dispatch-time notices (dsh: the harness home holds a local
-	// credentials copy) ride the task's warning stream, where the status report
-	// already surfaces them as "non-fatal warnings".
+	// credentials copy, or had no user credentials file to link) ride the task's
+	// warning stream, where the status report already surfaces them as "non-fatal
+	// warnings". Such a dispatch IS a dispatch: it is counted like any other.
 	if (adapterDispatch.warning) pushEvent(task, { kind: "warning", text: adapterDispatch.warning });
 	meter.recordDispatch(task.id);
 

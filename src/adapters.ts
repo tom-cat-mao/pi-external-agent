@@ -186,9 +186,11 @@ export interface AdapterDispatch {
 	/**
 	 * A non-fatal notice about this dispatch's environment. hub/registry.ts
 	 * records it as a task warning event, which is where non-fatal notices are
-	 * surfaced (external_agent_status: "non-fatal warnings"). dsh returns it when
-	 * its harness home holds a local credentials copy instead of the link to the
-	 * user's file — the run still works, but that copy can be stale.
+	 * surfaced (external_agent_status: "non-fatal warnings"). dsh returns it from
+	 * provisioning: the harness home holds a local credentials copy instead of
+	 * the link to the user's file (the run still works, but that copy can be
+	 * stale), or there was no ~/.dsh/.credentials.yaml to link at all (the
+	 * default provider route or `.env` has to carry auth).
 	 */
 	warning?: string;
 	/**
@@ -196,8 +198,9 @@ export interface AdapterDispatch {
 	 * the adapter refuses to spell out. hub/registry.ts fails the dispatch with
 	 * this reason instead of spawning a process that cannot work, so a refusal
 	 * is never a silent drop. dsh returns it for an effort request on the
-	 * one-shot path (no effort knob exists there) and for a harness home whose
-	 * credentials are still missing.
+	 * one-shot path (no effort knob exists there) and for a harness home that
+	 * cannot be provisioned (a symlinked or unusable path); absent credentials
+	 * are a warning, not a refusal.
 	 */
 	refusal?: string;
 }
@@ -949,7 +952,9 @@ const dshAdapter: Adapter = {
 		};
 		// The transport split first (it is the caller's to fix, and independent of
 		// this machine's state), then provisioning. Both are refusals, not throws:
-		// hub/registry.ts fails the dispatch with the reason they carry.
+		// hub/registry.ts fails the dispatch with the reason they carry. A missing
+		// ~/.dsh/.credentials.yaml is NOT one of them — dsh runs credential-less on
+		// its default provider route, so that case comes back as a warning.
 		if (effort) return { ...dispatch, refusal: DSH_ONESHOT_EFFORT_REFUSAL };
 		const home = ensureDshHome();
 		if (!home.ok) return { ...dispatch, refusal: home.reason };

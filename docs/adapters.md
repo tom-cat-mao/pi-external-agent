@@ -27,11 +27,11 @@ Qoder is driven over its documented stream-json channel; a steer is sent only wh
 
 ## dsh: dedicated harness home
 
-Every dsh spawn carries `DSH_HOME=~/.dsh-external-agent`, provisioned lazily by `ensureDshHome()` (0o700; symlinked homes are refused), with `.credentials.yaml` symlinked to the user's own file. The home is load-bearing: `~/.dsh/settings.yaml`'s `permission.defaultPreset` outranks `DSH_PERMISSION_MODE` and `--patch` alike, so the shared home would leave the requested tier unenforced. dsh's atomic credential write replaces the symlink with a real file, so the home can hold a local credentials copy that drifts as credentials rotate; provisioning keeps it and warns, naming the file to delete and re-link. An unsigned-in user gets the `dsh web` instruction.
+Every dsh spawn carries `DSH_HOME=~/.dsh-external-agent`, provisioned lazily by `ensureDshHome()` (0o700; symlinked homes refused). The home is load-bearing: `~/.dsh/settings.yaml`'s `permission.defaultPreset` outranks `DSH_PERMISSION_MODE` and `--patch`, so the shared home would leave the tier unenforced. Credentials are best-effort: `~/.dsh/.credentials.yaml` is symlinked when present and merely warned about when absent — an empty home completes a headless run on the default provider route, and `.env` fallbacks carry auth, so the file matters only for a provider key kept in it (`dsh web` manages it). A local copy left by dsh's atomic credential write is kept, with the delete-to-re-link warning.
 
-Effort travels only over ACP (`session/set_config_option`, configId `reasoning_effort`); the one-shot profile has no knob, so such a request is refused rather than dropped.
+Effort travels only over ACP (`session/set_config_option`, configId `reasoning_effort`); the one-shot profile has no knob and refuses rather than drops it.
 
-Verified against dsh 0.1.5-rc.2; upgrades re-run the smoke checklist (headless text/exit code, ACP handshake, `set_config_option`, read-only write denial). One-shot answers are plain stdout; the parse moves to NDJSON when `--json`/`--session-id` arrive.
+Verified against dsh 0.1.5-rc.2; upgrades re-run the smoke checklist (headless text/exit code, ACP handshake, `set_config_option`, readonly denial). One-shot answers are plain stdout (NDJSON once `--json`/`--session-id` land).
 
 ## Permission mappings
 

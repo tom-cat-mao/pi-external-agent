@@ -13,7 +13,7 @@ pi install git:github.com/tom-cat-mao/pi-external-agent@v0.6.1
 pi install git:github.com/tom-cat-mao/pi-external-agent
 ```
 
-要求 pi ≥ 0.85，以及按需安装的各 agent CLI（不需要全部装齐）。Qoder 需要 `qodercli` 在 `PATH` 上并已登录；steer 还要求 CLI 声明的稳定版本 ≥ 1.1.49（见 [docs/qoder.md](docs/qoder.md)）。dsh 需要先运行一次 `dsh web`：它专用的 harness home 会从 `~/.dsh` 软链你的凭据。
+要求 pi ≥ 0.85，以及按需安装的各 agent CLI（不需要全部装齐）。Qoder 需要 `qodercli` 在 `PATH` 上并已登录；steer 还要求 CLI 声明的稳定版本 ≥ 1.1.49（见 [docs/qoder.md](docs/qoder.md)）。dsh 仅在 provider 密钥存放在 `~/.dsh/.credentials.yaml` 时才需要 `dsh web`：专用 harness home 在该文件存在时软链它，否则在默认 provider 路由或 `.env` 下无凭据运行。
 
 发布由 tag 自动完成：推送 `vX.Y.Z` 后先跑测试与类型检查，通过即创建 GitHub Release。
 
