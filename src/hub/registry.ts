@@ -1081,6 +1081,23 @@ export function beginFollowUpTurn(task: Task): void {
 	clearIdleReap(task);
 }
 
+/**
+ * A dispatch that fails before it spawns is reported by its tool result, not by
+ * a notification: the caller already holds the reason, exactly as a wait receipt
+ * claims a settled task instead of letting its notice fire. Marking the task
+ * settled here is what keeps that failure from being replayed — session_start
+ * re-delivers every task that is neither running nor notified, so a task left
+ * unnotified would come back as a stale failure notice after a /reload.
+ */
+function failBeforeStart(task: Task, reason: string): Task {
+	task.state = "failed";
+	task.endedAt = Date.now();
+	task.spawnError = reason;
+	task.notified = true;
+	task.finalizePromise = Promise.resolve();
+	return task;
+}
+
 function startOneshotTask(
 	agent: AgentId,
 	taskText: string,
@@ -1133,12 +1150,7 @@ function startOneshotTask(
 	// command whose result would mislead the caller (dsh: an effort request on a
 	// path with no effort knob, or a harness home with no credentials yet). It
 	// fails like a spawn that never started — reason recorded, nothing spawned.
-	if (adapterDispatch.refusal) {
-		task.state = "failed";
-		task.endedAt = Date.now();
-		task.spawnError = adapterDispatch.refusal;
-		return task;
-	}
+	if (adapterDispatch.refusal) return failBeforeStart(task, adapterDispatch.refusal);
 
 	let proc: ChildProcess;
 	try {
@@ -1152,10 +1164,7 @@ function startOneshotTask(
 			env: adapterDispatch.env ? { ...process.env, ...adapterDispatch.env } : process.env,
 		});
 	} catch (err) {
-		task.state = "failed";
-		task.endedAt = Date.now();
-		task.spawnError = err instanceof Error ? err.message : String(err);
-		return task;
+		return failBeforeStart(task, err instanceof Error ? err.message : String(err));
 	}
 
 	task.proc = proc;

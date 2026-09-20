@@ -298,7 +298,12 @@ abstract class JsonRpcConnection extends StdioProcess {
 		// leaves the escalation unanswered.
 		if (typeof msg.method === "string") {
 			// A message carrying both method and id is a request we must answer;
-			// without an id it is a fire-and-forget notification.
+			// without an id it is a fire-and-forget notification. Only NUMERIC
+			// ids are routed as requests: JSON-RPC 2.0 also allows string ids,
+			// and the ACP dialects (reasonix, codebuddy, dsh) number their
+			// requests with integers, which is the type respond() replies in. A
+			// string-id request would fall through to the notification callback
+			// and never be answered — the ACP contract, not a case to guess at.
 			if (typeof msg.id === "number") {
 				for (const cb of this.requestCbs) cb(msg);
 				return;
