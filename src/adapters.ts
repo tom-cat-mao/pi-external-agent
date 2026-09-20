@@ -952,7 +952,10 @@ const dshAdapter: Adapter = {
 		const trimmed = line.trim();
 		if (!trimmed) return null;
 		const reasoning = /^dsh:\s*reasoning:\s*(.*)$/.exec(trimmed);
-		if (reasoning) return { kind: "reasoning", text: reasoning[1] };
+		// A bare prefix carries no thinking text. Reporting it would put an empty
+		// event into the log, and the hub counts reasoning as progress for the
+		// stall watchdog, so noise would reset a stall clock for nothing.
+		if (reasoning) return reasoning[1] ? { kind: "reasoning", text: reasoning[1] } : null;
 		return { kind: "message", text: line };
 	},
 };
