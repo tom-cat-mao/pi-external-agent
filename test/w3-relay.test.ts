@@ -31,7 +31,7 @@ const moduleHooks = registerHooks({
 	},
 });
 
-const hub = (await import("../index.ts")) as { default: (pi: unknown) => void };
+const hub = (await import("../src/index.ts")) as { default: (pi: unknown) => void };
 moduleHooks.deregister();
 
 const tools = new Map<string, any>();

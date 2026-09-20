@@ -10,7 +10,7 @@
  * (`total_cost_usd`); for every other CLI `costUsd` is simply absent.
  *
  * Pure module: no pi imports, no I/O, no timers. Wiring into the hub (dispatch
- * time, settle time, the stats command) belongs to index.ts.
+ * time, settle time, the stats command) belongs to the hub (hub/registry.ts; the stats command in index.ts).
  */
 
 /**

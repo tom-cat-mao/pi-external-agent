@@ -10,7 +10,7 @@ import { mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises"
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { ensureStored, extractSummary, lineCount, placeholderFor, readChunk, type ReadLimits } from "../artifacts.ts";
+import { ensureStored, extractSummary, lineCount, placeholderFor, readChunk, type ReadLimits } from "../src/artifacts.ts";
 
 const roots: string[] = [];
 
