@@ -22,6 +22,8 @@ Working rules for agents editing this repository.
 - `node --test "test/**/*.test.ts"` — full suite.
 - `npx tsc --noEmit` — typecheck.
 
+Release flow: push a `v*` tag → [.github/workflows/release.yml](.github/workflows/release.yml) runs both gates, then creates the GitHub Release with generated notes. An existing Release is left untouched, so a re-run is a no-op; to publish a tag pushed earlier, run that workflow manually (`workflow_dispatch`) with the tag name.
+
 Run only the test file relevant to your change locally; run the full suite before committing.
 
 ## Invariants
