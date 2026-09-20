@@ -15,6 +15,8 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
 
 Requires pi ≥ 0.85 and whichever agent CLIs you want to drive (they don't all need to be installed). Qoder needs `qodercli` on `PATH`, signed in; steering additionally needs an announced stable qodercli ≥ 1.1.49 — see [docs/qoder.md](docs/qoder.md).
 
+Releases are published by tag: pushing `vX.Y.Z` runs the suite and typecheck, then creates the GitHub Release.
+
 ## Tools
 
 | Tool | Purpose |

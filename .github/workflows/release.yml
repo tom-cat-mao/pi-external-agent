@@ -1,0 +1,90 @@
+name: Release
+
+# A pushed v* tag is the release trigger: the gates below run against the tagged
+# commit and, only when they pass, the GitHub Release is published with notes
+# generated from the commits and PRs since the previous tag.
+#
+# workflow_dispatch exists for tags pushed before this workflow did, or for a
+# tag whose run was lost. Publishing is idempotent, so re-running either
+# trigger is safe: an existing Release is left untouched.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to publish, e.g. v0.6.1
+        required: true
+        type: string
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # Creating the Release is the only write this workflow performs; every
+    # scope left unlisted here is none.
+    permissions:
+      contents: write
+    # The probe-then-create pair is not atomic, so serialise both triggers on
+    # the tag under release instead of racing them.
+    concurrency:
+      group: release-${{ inputs.tag || github.ref_name }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history: --generate-notes diffs against the previous tag and
+          # lists the merged PRs in between.
+          fetch-depth: 0
+          # Release exactly the tagged commit, never a branch tip.
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v7
+        with:
+          # The declared engines floor, and what .github/workflows/ci.yml runs;
+          # node --test strips types natively here, so the .ts suite runs as-is.
+          node-version: 22
+          cache: npm
+
+      - name: Resolve the target tag
+        id: target
+        env:
+          # Passed through the environment, never interpolated into the script.
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${INPUT_TAG:-$GITHUB_REF_NAME}"
+          case "$tag" in
+            v[0-9]*) ;;
+            *) echo "::error::'$tag' is not a v* version tag"; exit 1 ;;
+          esac
+          if ! git rev-parse --verify --quiet "refs/tags/$tag^{commit}" >/dev/null; then
+            echo "::error::tag '$tag' does not exist in this repository"; exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - run: npm ci
+
+      - name: Test
+        run: node --test "test/**/*.test.ts"
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; nothing to publish."
+            exit 0
+          fi
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            gh release create "$TAG" --generate-notes --verify-tag --latest
+          else
+            # Backfilling an older tag must not move the "Latest" pointer; gh's
+            # default (date and version) decides whether it deserves it.
+            gh release create "$TAG" --generate-notes --verify-tag
+          fi
