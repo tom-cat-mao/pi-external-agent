@@ -13,7 +13,7 @@ pi install git:github.com/tom-cat-mao/pi-external-agent@v0.6.1
 pi install git:github.com/tom-cat-mao/pi-external-agent
 ```
 
-要求 pi ≥ 0.85，以及按需安装的各 agent CLI（不需要全部装齐）。Qoder 需要 `qodercli` 在 `PATH` 上并已登录；steer 还要求 CLI 声明的稳定版本 ≥ 1.1.49（见 [docs/qoder.md](docs/qoder.md)）。
+要求 pi ≥ 0.85，以及按需安装的各 agent CLI（不需要全部装齐）。Qoder 需要 `qodercli` 在 `PATH` 上并已登录；steer 还要求 CLI 声明的稳定版本 ≥ 1.1.49（见 [docs/qoder.md](docs/qoder.md)）。dsh 需要先运行一次 `dsh web`：它专用的 harness home 会从 `~/.dsh` 软链你的凭据。
 
 发布由 tag 自动完成：推送 `vX.Y.Z` 后先跑测试与类型检查，通过即创建 GitHub Release。
 
@@ -54,12 +54,12 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
 | `qoder` | 阿里 | yolo | follow-up ✅；steer ✅，需 CLI 声明的版本满足 1.1.49 基线 |
 | `kimi` | Moonshot | 仅 yolo（headless 拒收权限旗标） | ❌ |
 | `claude` | Anthropic | yolo（readonly–yolo 三档；effort low–max，无 off） | ✅ stream-json |
+| `dsh` | DeepSeek harness | yolo（readonly–yolo 三档；dsh 自带沙箱强制执行该档位） | ✅ ACP |
 
 ## 文档
 
 - [AGENTS.md](AGENTS.md) — 目录结构、命令、不变式、文档规则
-- [docs/architecture.md](docs/architecture.md) — 派发流程、回执、传输层 · [docs/adapters.md](docs/adapters.md) — 各 CLI 能力矩阵
-- [docs/capabilities.md](docs/capabilities.md) — 归档、验收、模板、relay、隔离、证据板、计量 · [docs/qoder.md](docs/qoder.md) — Qoder stream-json 契约 · [.agents/notes/](.agents/notes/) — 决策记录
+- [docs/architecture.md](docs/architecture.md) — 派发流程、回执、传输层 · [docs/adapters.md](docs/adapters.md) — 各 CLI 能力矩阵 · [docs/capabilities.md](docs/capabilities.md) — 归档、验收、模板、relay、隔离、证据板、计量 · [docs/qoder.md](docs/qoder.md) — Qoder stream-json 契约 · [.agents/notes/](.agents/notes/) — 决策记录
 
 ## 社区
 
