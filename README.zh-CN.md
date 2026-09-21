@@ -13,7 +13,7 @@ pi install git:github.com/tom-cat-mao/pi-external-agent@v0.6.1
 pi install git:github.com/tom-cat-mao/pi-external-agent
 ```
 
-要求 pi ≥ 0.85，以及按需安装的各 agent CLI（不需要全部装齐）。Qoder 需要 `qodercli` 在 `PATH` 上并已登录；steer 还要求 CLI 声明的稳定版本 ≥ 1.1.49（见 [docs/qoder.md](docs/qoder.md)）。dsh 仅在 provider 密钥存放在 `~/.dsh/.credentials.yaml` 时才需要 `dsh web`：专用 harness home 在该文件存在时软链它，否则在默认 provider 路由或 `.env` 下无凭据运行。
+要求 pi ≥ 0.85，以及按需安装的各 agent CLI（不需要全部装齐）。Qoder 需要 `qodercli` 在 `PATH` 上并已登录；steer 还要求 CLI 声明的稳定版本 ≥ 1.1.49（见 [docs/qoder.md](docs/qoder.md)）。dsh 直接使用你自己的 dsh 环境（`~/.dsh`）；每次派发通过一份独立作用域的 settings 文档锁定权限档位，由 dsh 自带沙箱强制执行——不随你 `settings.yaml` 里的 preset 变化。Models 页里的 provider 配置不适用于这些运行；web profile 里装的插件需用 `dsh plugin --profile acp add <pkg>` 才能进入扩展所用的 profile。旧布局遗留的 `~/.dsh-external-agent` 目录无人引用，可安全删除。
 
 发布由 tag 自动完成：推送 `vX.Y.Z` 后先跑测试与类型检查，通过即创建 GitHub Release。
 
