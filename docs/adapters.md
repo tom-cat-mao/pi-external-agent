@@ -13,7 +13,7 @@ All eight agents share one dispatch path; an omitted `mode` takes its default, o
 | `claude` | Anthropic (`claude`) | yolo | readonly–yolo | yes: `dontAsk` + driver-denied `can_use_tool` | low–max | yes | yes | fixture-tested only |
 | `reasonix` | DeepSeek-native (`reasonix`) | yolo | readonly–yolo | no pinned tier: driver-rejected prompts confine ≤1.38.7; fail-open from ≥1.38.8 | off–max | yes | yes | — |
 | `qoder` | Alibaba (`qodercli`) | yolo | readonly–yolo | yes: `dont_ask` + built-in tool allowlist | off, low–max (no minimal) | yes, version-gated | yes | — |
-| `dsh` | DeepSeek harness (`dsh`) | yolo | readonly–yolo | yes: dsh sandbox via `DSH_HOME`/`DSH_PERMISSION_MODE`; ACP escalation driver-denied | off–max, session-only (one-shot refused) | yes | yes | — |
+| `dsh` | DeepSeek harness (`dsh`) | yolo | readonly–yolo | yes: dsh sandbox via `DSH_PERMISSION_MODE` over a scoped settings document; ACP escalation driver-denied | off–max, session-only (one-shot refused) | yes | yes | — |
 
 `enforcesReadOnly` is `false` only for kimi; `degraded` marks a known-degraded upstream. Without a sandbox, `write`/`yolo` are permission-rule tiers, not an OS boundary; a readonly hook is heuristic.
 
@@ -29,13 +29,9 @@ All eight agents share one dispatch path; an omitted `mode` takes its default, o
 
 Qoder is driven over its documented stream-json channel; a steer requires an announced stable `qodercli_version` ≥ 1.1.49, the documented SDK baseline. Missing, malformed, prerelease or older versions make `external_agent_steer` refuse, reporting the version, while start, status, follow-up and stop keep working. Details: [qoder.md](qoder.md).
 
-## dsh: dedicated harness home
+## dsh: shared home, scoped settings
 
-Every dsh spawn carries `DSH_HOME=~/.dsh-external-agent`, provisioned lazily by `ensureDshHome()` (0o700). The home is load-bearing: `permission.defaultPreset` in `~/.dsh/settings.yaml` outranks `DSH_PERMISSION_MODE` and `--patch`, so a shared home leaves the tier unenforced. Credentials: `~/.dsh/.credentials.yaml` is symlinked when present, warned about when absent; a copy left by dsh's atomic write is kept (delete-to-re-link warning). An empty home still completes a headless run on the default provider route because `.env` fallbacks carry auth; the file matters only for a provider key kept in it (`dsh web` manages it).
-
-Effort travels only over ACP (`set_config_option`, `reasoning_effort`); the one-shot profile has no knob and refuses it.
-
-Verified on 0.1.5-rc.2; upgrades re-run the smoke checklist (headless text/exit code, ACP handshake, `set_config_option`, readonly denial). One-shot answers are plain stdout, NDJSON once `--json`/`--session-id` land.
+dsh runs against the user's own `~/.dsh`, where `settings.yaml`'s `permission.defaultPreset` outranks `DSH_PERMISSION_MODE` and a higher-precedence patch replaces a row's whole config, so every spawn carries `--patch` re-pointing the settings plugin's document at `~/.dsh/settings.pi-external-agent.yaml`: empty when missing and preset-free, the composed default governs, `DSH_PERMISSION_MODE` picking the tier and dsh's sandbox enforcing it. A shell-exported `DSH_HOME` is stripped from the child env. Details: [dsh.md](dsh.md).
 
 ## Permission mappings
 
@@ -45,4 +41,4 @@ Verified on 0.1.5-rc.2; upgrades re-run the smoke checklist (headless text/exit 
 - claude: `dontAsk`/`acceptEdits`/`bypassPermissions` over stream-json; readonly also denies `can_use_tool` in the driver.
 - reasonix (`acp` pins no tier): `manual`/`acceptEdits`/`bypassPermissions`; deny rules and the OS sandbox still apply.
 - qoder: `dont_ask` + built-in allowlist/`accept_edits`/`bypass_permissions`.
-- dsh: `DSH_PERMISSION_MODE=read-only`/`workspace-write`/`danger-full-access` (codex vocabulary) in the harness home.
+- dsh: `DSH_PERMISSION_MODE=read-only`/`workspace-write`/`danger-full-access` (codex vocabulary); readonly fail-closed over ACP.

@@ -7,7 +7,7 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import type { AgentEvent, Effort, Mode } from "../adapters.ts";
+import { mergeSpawnEnv, type AgentEvent, type Effort, type Mode } from "../adapters.ts";
 
 const MAX_STDERR_CHARS = 8_000;
 export const HANDSHAKE_TIMEOUT_MS = 30_000;
@@ -93,16 +93,24 @@ export abstract class StdioProcess {
 
 	/**
 	 * `extraEnv` is merged OVER process.env, never a replacement: a dialect
-	 * contributes what its CLI needs (dsh: DSH_HOME and DSH_PERMISSION_MODE)
-	 * without taking away the environment the process has to run in at all.
+	 * contributes what its CLI needs (dsh: DSH_PERMISSION_MODE) without taking
+	 * away the environment the process has to run in at all. An `undefined`
+	 * value DELETES that key from the child's environment (dsh: an inherited
+	 * DSH_HOME must not reach the process, or it would resolve a different home
+	 * than the provisioned one).
 	 */
-	protected spawnProcess(executable: string, argv: string[], cwd: string, extraEnv?: Record<string, string>): void {
+	protected spawnProcess(
+		executable: string,
+		argv: string[],
+		cwd: string,
+		extraEnv?: Record<string, string | undefined>,
+	): void {
 		this.spawnArgv = argv;
 		const proc = spawn(executable, argv, {
 			cwd,
 			// stdin is a live protocol channel here, not the "ignore" of the one-shot path.
 			stdio: ["pipe", "pipe", "pipe"],
-			env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
+			env: extraEnv ? mergeSpawnEnv(process.env, extraEnv) : process.env,
 		});
 		this.proc = proc;
 

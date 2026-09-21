@@ -46,8 +46,9 @@
  *               method, so steering is the codebuddy fallback. session/new
  *               returns configOptions (model, reasoning_effort), and effort is
  *               forwarded with session/set_config_option — the CLI has no
- *               effort flag. DSH_HOME must be the dedicated harness home, and
- *               DSH_PERMISSION_MODE carries the tier.
+ *               effort flag. DSH_PERMISSION_MODE carries the tier, and a
+ *               `--patch` overlay keeps dsh's settings row pointed at pi's own
+ *               empty settings document in the SHARED ~/.dsh.
  *
  * Steering is never an immediate interrupt. All five deliver at a step boundary
  * (between tool calls), so a steer cannot cancel a bash command that is already
@@ -55,12 +56,18 @@
  */
 
 import { ADAPTERS, buildReadonlySettings, dshEffortToken, dshPermissionMode, type AgentId } from "../adapters.ts";
-import { ensureDshHome } from "../dsh-home.ts";
+import { dshOverlayPath, prepareDshLaunch, type DshProfile } from "../dsh-launch.ts";
 import type { SessionDriver } from "./base.ts";
 import { PiRpcDriver } from "./pi-rpc.ts";
 import { CodexAppServerDriver } from "./codex-app-server.ts";
 import { AcpDriver } from "./acp.ts";
 import { ClaudeStreamJsonDriver, QoderStreamJsonDriver } from "./stream-json.ts";
+
+/**
+ * The dsh profile a persistent session boots. One constant, because the spawn's
+ * argv and the anchor probe have to name the same composition.
+ */
+const DSH_ACP_PROFILE: DshProfile = "acp";
 
 /**
  * Agents that run over a persistent session. Everything else keeps the
@@ -104,28 +111,33 @@ export const SESSION_DRIVERS: Partial<Record<AgentId, () => SessionDriver>> = {
 			id: "dsh",
 			// dsh spells the ACP entry as a profile rather than a flag (verified
 			// 0.1.5-rc.2: standard ACP v1, no advertised steer method, so steering
-			// is a second session/prompt on the active session).
-			acpArgv: ["--profile", "acp"],
+			// is a second session/prompt on the active session), and --patch is a
+			// LAUNCHER flag, so it belongs in the entry argv with its overlay —
+			// it is what makes the requested tier bind (src/dsh-launch.ts).
+			acpArgv: ["--profile", DSH_ACP_PROFILE, "--patch", dshOverlayPath()],
 			// The model comes from the profile; no session-start model flag is
 			// verified for this CLI, so nothing is appended. The receipt reports a
 			// model request as not forwarded rather than claiming it traveled.
 			baseArgv: () => [],
-			// DSH_HOME must be the dedicated harness home (src/dsh-home.ts): the
-			// user's shared ~/.dsh settings outrank DSH_PERMISSION_MODE, so a run
-			// under the shared home would not be bounded by the requested tier at
-			// all. Provisioning runs before the spawn and is lazy/idempotent; it
-			// fails the session start only when the home itself cannot exist (an
-			// unusable path — a symlinked home is followed, as dsh follows it).
-			// Missing credentials never do: dsh runs credential-less on its default
-			// provider route, so the home is started unlinked and the warning
-			// carries the remedy — as does a home that already holds a local
-			// credentials copy.
+			// Provisioning runs before the spawn and is lazy/idempotent: the empty
+			// settings document plus the overlay that points dsh's settings row at
+			// it. It fails the session start only when one of those files cannot
+			// exist at all — without them dsh reads the user's own settings
+			// document, whose permission.defaultPreset outranks the variable, and
+			// the requested tier stops binding silently. Anything the composition
+			// anchor finds is a warning instead: the session still starts.
 			prepare: (input) => {
-				const home = ensureDshHome();
-				if (!home.ok) throw new Error(home.reason);
+				// The profile is passed, not assumed: dsh composes per profile, so
+				// this session's composition is anchored under `acp` — a user's
+				// `~/.dsh/profiles/acp/cordis.patch.yml` cannot hide behind a clean
+				// `headless` probe.
+				const launch = prepareDshLaunch(DSH_ACP_PROFILE);
+				if (!launch.ok) throw new Error(launch.reason);
 				return {
-					env: { DSH_HOME: home.home, DSH_PERMISSION_MODE: dshPermissionMode(input.mode) },
-					warning: home.warning,
+					// DSH_HOME is deleted, not set: an ambient value would point the
+					// child at a home that was neither provisioned nor anchored.
+					env: { DSH_PERMISSION_MODE: dshPermissionMode(input.mode), DSH_HOME: undefined },
+					...(launch.warning ? { warning: launch.warning } : {}),
 				};
 			},
 			// No effort flag exists on this CLI: the session sets the config option

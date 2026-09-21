@@ -10,7 +10,7 @@ Working rules for agents editing this repository.
 - `src/hub/reporting.ts` — caller-facing text: status report, dispatch receipts, compare report, relay receipt.
 - `src/hub/shared.ts` — task/receipt types, hub constants, pure formatting helpers and input predicates.
 - `src/adapters.ts` — per-CLI one-shot adapters: argv spelling and stdout parsing (incl. usage/cost), plus the `ADAPTERS` registry.
-- `src/dsh-home.ts` — the dedicated `DSH_HOME` every dsh spawn gets: lazy, idempotent provisioning, a best-effort `.credentials.yaml` symlink to the user's own file, and a warning (never a failure) when there is nothing to link.
+- `src/dsh-launch.ts` — the dsh launch path against the shared `~/.dsh`: lazy, idempotent provisioning of the scoped settings document and its `--patch` overlay, plus a best-effort anchor guard that warns when the overlay loses effect.
 - `src/drivers/` — persistent session drivers for steer / follow-up: `base.ts` (stdio + JSON-RPC plumbing), one file per wire protocol (`pi-rpc`, `codex-app-server`, `acp`, `stream-json`), and `index.ts` (`SESSION_DRIVERS`).
 - `src/artifacts.ts` — answer archive: settle-time content-addressed store, inline placeholder, paged recall.
 - `src/templates.ts` + `templates/` — task-template loading (project > user > builtin) and the five builtins.
@@ -39,4 +39,4 @@ Run only the test file relevant to your change locally; run the full suite befor
 - [docs/](docs/) holds present-tense facts about the current system — no change-of-state or revision history, in English or Chinese. History belongs to git and notes.
 - [.agents/notes/](.agents/notes/) holds decision records. Template: Problem / Decision / Alternatives considered / Consequences. Every alternative states its strongest reason and why it was rejected. No `INDEX.md` — the folder is the status.
 - Budgets are enforced by test: `AGENTS.md` ≤ 550 words, each `docs/*.md` ≤ 650 words, each `docs/postmortem/*.md` ≤ 800 words, each note ≤ 120 lines, each README ≤ 70 lines.
-- Index: [docs/architecture.md](docs/architecture.md) (dispatch flow, receipts, transports) · [docs/adapters.md](docs/adapters.md) (capability matrix) · [docs/capabilities.md](docs/capabilities.md) (archive, verify, templates, isolate) · [docs/qoder.md](docs/qoder.md) (Qoder stream-json contract) · [docs/postmortem/](docs/postmortem/) (incident write-ups).
+- Index: [docs/architecture.md](docs/architecture.md) (dispatch flow, receipts, transports) · [docs/adapters.md](docs/adapters.md) (capability matrix) · [docs/capabilities.md](docs/capabilities.md) (archive, verify, templates, isolate) · [docs/qoder.md](docs/qoder.md) (Qoder stream-json contract) · [docs/dsh.md](docs/dsh.md) (shared home, scoped settings) · [docs/postmortem/](docs/postmortem/) (incident write-ups).
