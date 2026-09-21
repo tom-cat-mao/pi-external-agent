@@ -37,7 +37,7 @@
  */
 
 import { fileURLToPath } from "node:url";
-import { dshOverlayPath, prepareDshLaunch } from "./dsh-launch.ts";
+import { dshOverlayPath, prepareDshLaunch, type DshProfile } from "./dsh-launch.ts";
 
 export type AgentId = "codex" | "pi" | "kimi" | "codebuddy" | "claude" | "reasonix" | "qoder" | "dsh";
 
@@ -222,6 +222,13 @@ export function mergeSpawnEnv(
 ): NodeJS.ProcessEnv {
 	const merged: NodeJS.ProcessEnv = { ...base };
 	for (const [key, value] of Object.entries(extra)) {
+		// Windows environment variables are case-insensitive, and process.env
+		// keeps whatever casing the OS reports: an override or a deletion has to
+		// find the variant already there, or the child ends up with both.
+		const upper = key.toUpperCase();
+		for (const existing of Object.keys(merged)) {
+			if (existing !== key && existing.toUpperCase() === upper) delete merged[existing];
+		}
 		if (value === undefined) delete merged[key];
 		else merged[key] = value;
 	}
@@ -936,6 +943,12 @@ const qoderAdapter: Adapter = {
 // it must precede the task positional.
 // ---------------------------------------------------------------------------
 
+/**
+ * The dsh profile a one-shot run boots. One constant, because the spawn's argv
+ * and the anchor probe have to name the same composition.
+ */
+const DSH_ONESHOT_PROFILE: DshProfile = "headless";
+
 const dshAdapter: Adapter = {
 	id: "dsh",
 	bin: "dsh",
@@ -967,7 +980,7 @@ const dshAdapter: Adapter = {
 		// command the caller would otherwise run. --patch precedes the task: the
 		// launcher parses it, not dsh's task argument.
 		const overlay = dshOverlayPath();
-		const argv = ["--profile", "headless", "--patch", overlay, task];
+		const argv = ["--profile", DSH_ONESHOT_PROFILE, "--patch", overlay, task];
 		const dispatch: AdapterDispatch = {
 			argv,
 			promptArgIndex: argv.length - 1,
@@ -990,7 +1003,9 @@ const dshAdapter: Adapter = {
 		// hub/registry.ts fails the dispatch with the reason they carry, and a
 		// refusal never hands out an env — there is nothing to merge.
 		if (effort) return { ...dispatch, refusal: DSH_ONESHOT_EFFORT_REFUSAL };
-		const launch = prepareDshLaunch();
+		// The probe runs under the same profile this dispatch boots: the
+		// composition is per profile, so the anchor has to read the right one.
+		const launch = prepareDshLaunch(DSH_ONESHOT_PROFILE);
 		if (!launch.ok) return { ...dispatch, refusal: launch.reason };
 		return {
 			...dispatch,

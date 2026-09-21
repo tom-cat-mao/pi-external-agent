@@ -28,7 +28,7 @@
 import { afterEach, beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -52,6 +52,7 @@ import {
 	dshSharedHome,
 	ensureDshLaunch,
 	resetDshCompositionGuard,
+	type DshProfile,
 } from "../src/dsh-launch.ts";
 import { SESSION_DRIVERS } from "../src/drivers/index.ts";
 import { answerOf, warningsOf, type Task } from "../src/hub/shared.ts";
@@ -212,13 +213,21 @@ const approvalRow = () => ({
 	lines: ["  config:", "    policy: !!js (process.env.DSH_PERMISSION_MODE ?? 'workspace-write') === 'danger-full-access' ? 'never' : 'ask'"],
 });
 
-/** Probe one fixture home with a given dump; the memo is reset first, as a fresh process would. */
-function anchor(fixture: { overlay: string; settingsDoc: string }, dumpText: string | undefined): string[] {
+/** The two profiles the extension boots, and the two the anchor has to answer for. */
+const ANCHOR_PROFILES: readonly DshProfile[] = ["headless", "acp"];
+
+/** Probe one fixture home under one profile with a given dump; the memo is reset first, as a fresh process would. */
+function anchor(
+	fixture: { overlay: string; settingsDoc: string },
+	dumpText: string,
+	profile: DshProfile = "headless",
+): string[] {
 	resetDshCompositionGuard();
 	return dshCompositionWarnings({
 		overlay: fixture.overlay,
 		settingsDoc: fixture.settingsDoc,
-		run: () => dumpText,
+		profile,
+		run: () => ({ ok: true, dump: dumpText }),
 	});
 }
 
@@ -227,20 +236,27 @@ function anchor(fixture: { overlay: string; settingsDoc: string }, dumpText: str
  * the seam the production path fills with a real `dsh --dump-config` spawn, and
  * the clean shape here is the one provisioning is supposed to produce.
  */
+const CLEAN_OVERLAY = "/fixtures/overlay.yml";
+const CLEAN_SETTINGS_DOC = "/fixtures/settings.pi-external-agent.yaml";
+
 function cleanAnchor(): void {
 	resetDshCompositionGuard();
-	dshCompositionWarnings({
-		overlay: "/fixtures/overlay.yml",
-		settingsDoc: "/fixtures/settings.pi-external-agent.yaml",
-		run: () => dump([settingsRow("/fixtures/settings.pi-external-agent.yaml", "/fixtures/overlay.yml"), sandboxRow(), approvalRow()]),
-	});
+	// EVERY profile: the memo is per profile, so arming one would leave a later
+	// test's spawn to probe this machine through whichever fixture `dsh` is
+	// first on PATH.
+	for (const profile of ANCHOR_PROFILES) {
+		dshCompositionWarnings({
+			overlay: CLEAN_OVERLAY,
+			settingsDoc: CLEAN_SETTINGS_DOC,
+			profile,
+			run: () => ({ ok: true, dump: dump([settingsRow(CLEAN_SETTINGS_DOC, CLEAN_OVERLAY), sandboxRow(), approvalRow()]) }),
+		});
+	}
 }
 
 /**
- * Every test starts with the anchor already satisfied. The probe is memoized for
- * the whole process — that is the point of it — so an un-armed test would let
- * whichever fixture `dsh` happens to be first on PATH decide the answer for
- * every test after it. The guard's own tests below reset the memo themselves.
+ * Every test starts with the anchor already satisfied, for every profile. The
+ * guard's own tests below reset the memo themselves.
  */
 beforeEach(cleanAnchor);
 
@@ -438,6 +454,39 @@ test("ensureDshLaunch rewrites a stale overlay and leaves a current one alone", 
 	assert.equal(readFileSync(overlay, "utf8"), dshOverlayContent(settingsDocIn(home)));
 });
 
+test("ensureDshLaunch replaces a symlinked settings document instead of carrying its target into the run", () => {
+	const fixture = launchFixture();
+	const { settingsDoc } = fixture;
+	// The reserved name pointed at a document we did not write — the one thing
+	// the whole module exists to keep dsh from reading.
+	const target = path.join(fixture.home, "user-settings.yaml");
+	writeFileSync(target, "permission:\n  defaultPreset: danger-full-access\n");
+	unlinkSync(settingsDoc);
+	symlinkSync(target, settingsDoc);
+
+	const result = ensureDshLaunch({ homeDir: sharedHome(fixture.home) });
+	assert.equal(result.ok, true);
+	assert.equal(lstatSync(settingsDoc).isSymbolicLink(), false, "the symlink must be replaced by a regular file");
+	assert.equal(readFileSync(settingsDoc, "utf8"), "");
+	// The link's TARGET is the user's own file: replaced, never touched.
+	assert.equal(readFileSync(target, "utf8"), "permission:\n  defaultPreset: danger-full-access\n");
+});
+
+test("ensureDshLaunch replaces a symlinked overlay with the real thing", () => {
+	const fixture = launchFixture();
+	const overlay = overlayIn(fixture.home);
+	const elsewhere = path.join(fixture.home, "elsewhere.yml");
+	writeFileSync(elsewhere, "hand-written\n");
+	unlinkSync(overlay);
+	symlinkSync(elsewhere, overlay);
+
+	const result = ensureDshLaunch({ homeDir: sharedHome(fixture.home) });
+	assert.equal(result.ok, true);
+	assert.equal(lstatSync(overlay).isSymbolicLink(), false, "the symlink must be replaced by a regular file");
+	assert.equal(readFileSync(overlay, "utf8"), dshOverlayContent(settingsDocIn(fixture.home)));
+	assert.equal(readFileSync(elsewhere, "utf8"), "hand-written\n", "the link's target is untouched");
+});
+
 test("ensureDshLaunch: an unusable home path is a refusal that names it", () => {
 	const root = mkdtempSync(path.join(tmpdir(), "dsh-provision-"));
 	const homeDir = path.join(root, "not-a-directory");
@@ -513,21 +562,25 @@ test("ensureDshLaunch: the default paths hang off HOME, and name the shared home
 // The composition anchor
 // ---------------------------------------------------------------------------
 
-test("the composition anchor probes once with the offline dump argv, and a clean composition stays silent", () => {
+test("the composition anchor probes each profile as itself, and a clean composition stays silent", () => {
 	const fixture = launchFixture();
-	resetDshCompositionGuard();
 	const probes: string[][] = [];
-	const warnings = dshCompositionWarnings({
-		overlay: fixture.overlay,
-		settingsDoc: fixture.settingsDoc,
-		run: (argv) => {
-			probes.push(argv);
-			return dump([settingsRow(fixture.settingsDoc, fixture.overlay), sandboxRow(), approvalRow()]);
-		},
-	});
-	assert.deepEqual(warnings, [], `a clean composition must stay silent, got ${JSON.stringify(warnings)}`);
-	// Offline and unambiguous: the headless profile, our overlay, the dump.
-	assert.deepEqual(probes, [["--profile", "headless", "--patch", fixture.overlay, "--dump-config"]]);
+	const run = (argv: string[]) => {
+		probes.push(argv);
+		return { ok: true, dump: dump([settingsRow(fixture.settingsDoc, fixture.overlay), sandboxRow(), approvalRow()]) };
+	};
+	for (const profile of ANCHOR_PROFILES) {
+		resetDshCompositionGuard();
+		const warnings = dshCompositionWarnings({ overlay: fixture.overlay, settingsDoc: fixture.settingsDoc, profile, run });
+		assert.deepEqual(warnings, [], `a clean composition must stay silent, got ${JSON.stringify(warnings)}`);
+	}
+	// Offline and unambiguous: each probe composes THE PROFILE THE SPAWN BOOTS —
+	// dsh composes base → profile → home → `--patch`, so a probe under the wrong
+	// profile reports on a composition nobody runs.
+	assert.deepEqual(probes, [
+		["--profile", "headless", "--patch", fixture.overlay, "--dump-config"],
+		["--profile", "acp", "--patch", fixture.overlay, "--dump-config"],
+	]);
 });
 
 test("anchor (a): a settings row left reading another file warns with the offending patch", () => {
@@ -577,6 +630,98 @@ test("anchor (b): a missing approval row warns that nothing reads the variable",
 	assert.match(warnings[0], /nothing reads DSH_PERMISSION_MODE/);
 });
 
+test("anchor (b): a decoy comment cannot stand in for a row that no longer reads the variable", () => {
+	const fixture = launchFixture();
+	// The live shape of the spoof: the config pins one literal mode and a
+	// comment mentions the variable, which a substring scan reads as a hook.
+	const warnings = anchor(
+		fixture,
+		dump([
+			settingsRow(fixture.settingsDoc, fixture.overlay),
+			{
+				id: "sandbox-policy",
+				patchedBy: "/etc/company/dsh.patch.yml",
+				lines: ["  config:", "    mode: read-only", "    # pinned: DSH_PERMISSION_MODE is not read here any more"],
+			},
+			approvalRow(),
+		]),
+	);
+	assert.equal(warnings.length, 1, `expected one warning, got ${JSON.stringify(warnings)}`);
+	assert.ok(warnings[0].includes("/etc/company/dsh.patch.yml"), "the warning names the offending patch");
+	assert.match(warnings[0], /sandbox-policy row with config that no longer reads DSH_PERMISSION_MODE/);
+
+	// A `#` inside a quoted scalar is not a comment, so a row whose live config
+	// carries the variable alongside a trailing comment still passes.
+	assert.deepEqual(
+		anchor(
+			fixture,
+			dump([
+				settingsRow(fixture.settingsDoc, fixture.overlay),
+				sandboxRow(),
+				{ id: "approval", lines: ["  config:", "    policy: !!js process.env.DSH_PERMISSION_MODE === 'danger-full-access' ? 'never' : 'ask' # tuned"] },
+			]),
+		),
+		[],
+	);
+});
+
+test("anchor: a settings document that is not a regular file warns and skips the probe", () => {
+	const fixture = launchFixture();
+	resetDshCompositionGuard();
+	unlinkSync(fixture.settingsDoc);
+	mkdirSync(fixture.settingsDoc);
+	let probes = 0;
+	const warnings = dshCompositionWarnings({
+		overlay: fixture.overlay,
+		settingsDoc: fixture.settingsDoc,
+		profile: "headless",
+		run: () => {
+			probes += 1;
+			return { ok: true, dump: "" };
+		},
+	});
+	assert.equal(warnings.length, 1, `expected one warning, got ${JSON.stringify(warnings)}`);
+	assert.ok(warnings[0].includes(fixture.settingsDoc), "the warning names the path");
+	assert.match(warnings[0], /not a regular file/);
+	assert.match(warnings[0], /composition anchor is skipped/);
+	assert.equal(probes, 0, "the probe must not run when the document cannot be read as settings");
+});
+
+test("anchor (a): the path is read from the row's config block, and the last patch that wrote it is named", () => {
+	const fixture = launchFixture();
+	// A sibling `path:` outside `config:` is not what dsh composes: the patch
+	// entry replaces the block wholesale, so only the block counts.
+	assert.deepEqual(
+		anchor(
+			fixture,
+			dump([
+				{
+					id: "settings",
+					patchedBy: fixture.overlay,
+					lines: ["  options:", "    path: /somewhere/else.yaml", "  config:", `    path: ${fixture.settingsDoc}`],
+				},
+				sandboxRow(),
+				approvalRow(),
+			]),
+		),
+		[],
+	);
+
+	// Several patches wrote the row; dsh lists them in composition order, so the
+	// one that won — the file a warning has to name — is the last.
+	const warnings = anchor(
+		fixture,
+		dump([
+			settingsRow("/etc/company/dsh-settings.yaml", "/etc/first.patch.yml, patched by /etc/last.patch.yml"),
+			sandboxRow(),
+			approvalRow(),
+		]),
+	);
+	assert.equal(warnings.length, 1, `expected one warning, got ${JSON.stringify(warnings)}`);
+	assert.ok(warnings[0].includes("/etc/last.patch.yml"), `the winning patch is named: ${warnings[0]}`);
+	assert.equal(warnings[0].includes("/etc/first.patch.yml"), false, "the patch that lost is not named");
+});
+
 test("anchor (c): a permission section written into our document warns and names it", () => {
 	const fixture = launchFixture();
 	writeFileSync(fixture.settingsDoc, "permission:\n  defaultPreset: danger-full-access\n");
@@ -592,32 +737,59 @@ test("anchor (c): a permission section written into our document warns and names
 	assert.deepEqual(anchor(fixture, dump([settingsRow(fixture.settingsDoc, fixture.overlay), sandboxRow(), approvalRow()])), []);
 });
 
-test("the anchor is memoized: one probe per process, whatever the caller asks next", () => {
+test("the anchor is memoized per profile: one probe each, and neither profile answers for the other", () => {
 	const fixture = launchFixture();
 	resetDshCompositionGuard();
-	let probes = 0;
-	const run = () => {
-		probes += 1;
-		return dump([settingsRow(fixture.settingsDoc, fixture.overlay), sandboxRow(), approvalRow()]);
+	const probes: string[] = [];
+	// The two profiles compose DIFFERENTLY: `acp` carries a company patch that
+	// re-points its settings row, `headless` is clean. One shared memo would
+	// report whichever probed first for both of them.
+	const run = (argv: string[]) => {
+		const profile = argv[argv.indexOf("--profile") + 1];
+		probes.push(profile);
+		return profile === "acp"
+			? {
+					ok: true,
+					dump: dump([settingsRow("/etc/company/dsh-settings.yaml", "/etc/company/dsh.patch.yml"), sandboxRow(), approvalRow()]),
+				}
+			: { ok: true, dump: dump([settingsRow(fixture.settingsDoc, fixture.overlay), sandboxRow(), approvalRow()]) };
 	};
-	assert.deepEqual(dshCompositionWarnings({ overlay: fixture.overlay, settingsDoc: fixture.settingsDoc, run }), []);
+	const call = (profile: DshProfile) =>
+		dshCompositionWarnings({ overlay: fixture.overlay, settingsDoc: fixture.settingsDoc, profile, run });
+
+	assert.deepEqual(call("headless"), []);
+	const acp = call("acp");
+	assert.equal(acp.length, 1, `expected one warning, got ${JSON.stringify(acp)}`);
+	assert.ok(acp[0].includes("/etc/company/dsh.patch.yml"), "the acp composition is reported as itself");
 	// A second dispatch — another mode, another task — must not spawn the probe
-	// again: the answer is about this machine, not about one dispatch.
-	assert.deepEqual(dshCompositionWarnings({ overlay: fixture.overlay, settingsDoc: fixture.settingsDoc, run }), []);
-	assert.equal(probes, 1, "the composition probe ran more than once");
+	// again: the answer is about this machine and this profile, not one dispatch.
+	assert.deepEqual(call("headless"), []);
+	assert.deepEqual(call("acp"), acp);
+	assert.deepEqual(probes, ["headless", "acp"], "the probe ran more than once per profile");
 });
 
-test("an anchor probe that cannot run is skipped in silence, and stays memoized", () => {
+test("an anchor probe that cannot run warns, and is retried on the next dispatch", () => {
 	const fixture = launchFixture();
 	resetDshCompositionGuard();
 	let probes = 0;
 	const run = () => {
 		probes += 1;
-		return undefined;
+		return { ok: false, reason: "spawnSync dsh ENOENT" };
 	};
-	assert.deepEqual(dshCompositionWarnings({ overlay: fixture.overlay, settingsDoc: fixture.settingsDoc, run }), []);
-	assert.deepEqual(dshCompositionWarnings({ overlay: fixture.overlay, settingsDoc: fixture.settingsDoc, run }), []);
-	assert.equal(probes, 1);
+	const call = (profile: DshProfile) =>
+		dshCompositionWarnings({ overlay: fixture.overlay, settingsDoc: fixture.settingsDoc, profile, run });
+
+	const warnings = call("headless");
+	assert.equal(warnings.length, 1, `expected one warning, got ${JSON.stringify(warnings)}`);
+	assert.match(warnings[0], /^dsh composition anchor unavailable: /);
+	assert.ok(warnings[0].includes("spawnSync dsh ENOENT"), "the warning carries the probe's own reason");
+	assert.match(warnings[0], /may not be the one in force/);
+	// Not memoized as silence: an unavailable anchor says nothing about the
+	// composition dsh will use, so the next dispatch probes again — and an
+	// unavailable `headless` probe says nothing about `acp` either.
+	assert.equal(call("headless").length, 1);
+	assert.equal(call("acp").length, 1);
+	assert.equal(probes, 3, "a failed probe must not be memoized");
 });
 
 test("dsh one-shot: an anchor warning rides AdapterDispatch.warning, and never refuses the dispatch", () => {
@@ -718,6 +890,32 @@ test("ACP dialects with an effort flag are unchanged; dsh never gets one", () =>
 	}
 });
 
+test("dsh ACP session: the anchor probes the acp profile, so a clean acp composition stays silent", async () => {
+	// The fixture's composition is clean ONLY under `--profile acp`: a probe that
+	// composed the one-shot profile would read a settings row someone else wrote
+	// and warn here, which is what makes this a test of the wiring rather than of
+	// the mock.
+	const dir = makeFixtureDir({ dsh: DSH_ACP_MOCK });
+	const home = makeHome();
+	const restorePath = usePath(dir);
+	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: path.join(dir, "dsh-log.jsonl") });
+	resetDshCompositionGuard();
+	try {
+		const driver = SESSION_DRIVERS.dsh!();
+		const warnings: string[] = [];
+		driver.onEvent((event) => {
+			if (event.kind === "warning") warnings.push(event.text);
+		});
+		await driver.start({ task: "t", cwd: dir, mode: "yolo" });
+		driver.kill();
+		assert.deepEqual(warnings, [], "the session's composition was probed under the wrong profile");
+	} finally {
+		restorePath();
+		restoreEnv();
+		cleanAnchor();
+	}
+});
+
 const DSH_ACP_MOCK = `#!/usr/bin/env node
 const fs = require("node:fs");
 const argv = process.argv.slice(2);
@@ -729,9 +927,13 @@ if (argv.includes("--dump-config")) {
   // copied out of the overlay we were handed, plus the two rows that read the
   // tier from the environment. The probe is not a task run, so nothing is
   // recorded for it.
+  // dsh composes PER PROFILE, so this composition is only clean when it is
+  // read under the profile this fixture stands for: a probe under any other
+  // profile reports a settings row somebody else wrote.
   const mode = process.env.DSH_MOCK_DUMP || "clean";
+  const profile = argv[argv.indexOf("--profile") + 1];
   const docPath = /^\\s*path:\\s*(.+)$/m.exec(fs.readFileSync(argv[argv.indexOf("--patch") + 1], "utf8"))[1];
-  const rows = mode === "foreign"
+  const rows = mode === "foreign" || profile !== "acp"
     ? "# == base, patched by /etc/company/dsh.patch.yml\\n- id: settings\\n  name: '@deepseek-ai/dsh-settings-file'\\n  config:\\n    path: /etc/company/dsh-settings.yaml\\n"
     : "- id: settings\\n  name: '@deepseek-ai/dsh-settings-file'\\n  config:\\n    path: " + docPath + "\\n";
   process.stdout.write(
@@ -962,6 +1164,16 @@ test("mergeSpawnEnv: values are merged over the base, and undefined deletes", ()
 	const merged = mergeSpawnEnv({ KEEP: "base", DROP: "base", OVERRIDE: "base" }, { DROP: undefined, OVERRIDE: "adapter", ADDED: "adapter" });
 	assert.deepEqual(merged, { KEEP: "base", OVERRIDE: "adapter", ADDED: "adapter" });
 	assert.equal("DROP" in merged, false);
+});
+
+test("mergeSpawnEnv: an override and a deletion find the key whatever case the environment reports", () => {
+	// Windows hands process.env whatever casing the OS stores, so a delete that
+	// only matched `DSH_HOME` exactly would leave `Dsh_Home` behind — pointing
+	// the child at a home nothing provisioned.
+	const merged = mergeSpawnEnv({ Dsh_Home: "/somewhere/else/.dsh", Path: "base" }, { DSH_HOME: undefined, PATH: "/usr/bin" });
+	assert.deepEqual(merged, { PATH: "/usr/bin" });
+	assert.equal("Dsh_Home" in merged, false);
+	assert.equal("Path" in merged, false);
 });
 
 test("hub one-shot: an adapter refusal fails the dispatch with its reason and spawns nothing", async () => {
@@ -1262,10 +1474,13 @@ const argv = process.argv.slice(2);
 const log = process.env.DSH_MOCK_LOG;
 if (argv.includes("--dump-config")) {
   // The composition the anchor reads, in the shape the real launcher prints.
+  // Clean only under the profile this fixture stands for: dsh composes per
+  // profile, so a probe under the wrong one must not look healthy.
   const mode = process.env.DSH_MOCK_DUMP || "clean";
+  const profile = argv[argv.indexOf("--profile") + 1];
   const docPath = /^\\s*path:\\s*(.+)$/m.exec(fs.readFileSync(argv[argv.indexOf("--patch") + 1], "utf8"))[1];
   process.stdout.write(
-    (mode === "foreign"
+    (mode === "foreign" || profile !== "headless"
       ? "# == base, patched by /etc/company/dsh.patch.yml\\n- id: settings\\n  name: '@deepseek-ai/dsh-settings-file'\\n  config:\\n    path: /etc/company/dsh-settings.yaml\\n"
       : "- id: settings\\n  name: '@deepseek-ai/dsh-settings-file'\\n  config:\\n    path: " + docPath + "\\n") +
     "- id: sandbox-policy\\n  name: '@deepseek-ai/dsh-sandbox-policy'\\n  config:\\n    mode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'\\n" +

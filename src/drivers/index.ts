@@ -56,12 +56,18 @@
  */
 
 import { ADAPTERS, buildReadonlySettings, dshEffortToken, dshPermissionMode, type AgentId } from "../adapters.ts";
-import { dshOverlayPath, prepareDshLaunch } from "../dsh-launch.ts";
+import { dshOverlayPath, prepareDshLaunch, type DshProfile } from "../dsh-launch.ts";
 import type { SessionDriver } from "./base.ts";
 import { PiRpcDriver } from "./pi-rpc.ts";
 import { CodexAppServerDriver } from "./codex-app-server.ts";
 import { AcpDriver } from "./acp.ts";
 import { ClaudeStreamJsonDriver, QoderStreamJsonDriver } from "./stream-json.ts";
+
+/**
+ * The dsh profile a persistent session boots. One constant, because the spawn's
+ * argv and the anchor probe have to name the same composition.
+ */
+const DSH_ACP_PROFILE: DshProfile = "acp";
 
 /**
  * Agents that run over a persistent session. Everything else keeps the
@@ -108,7 +114,7 @@ export const SESSION_DRIVERS: Partial<Record<AgentId, () => SessionDriver>> = {
 			// is a second session/prompt on the active session), and --patch is a
 			// LAUNCHER flag, so it belongs in the entry argv with its overlay —
 			// it is what makes the requested tier bind (src/dsh-launch.ts).
-			acpArgv: ["--profile", "acp", "--patch", dshOverlayPath()],
+			acpArgv: ["--profile", DSH_ACP_PROFILE, "--patch", dshOverlayPath()],
 			// The model comes from the profile; no session-start model flag is
 			// verified for this CLI, so nothing is appended. The receipt reports a
 			// model request as not forwarded rather than claiming it traveled.
@@ -121,7 +127,11 @@ export const SESSION_DRIVERS: Partial<Record<AgentId, () => SessionDriver>> = {
 			// the requested tier stops binding silently. Anything the composition
 			// anchor finds is a warning instead: the session still starts.
 			prepare: (input) => {
-				const launch = prepareDshLaunch();
+				// The profile is passed, not assumed: dsh composes per profile, so
+				// this session's composition is anchored under `acp` — a user's
+				// `~/.dsh/profiles/acp/cordis.patch.yml` cannot hide behind a clean
+				// `headless` probe.
+				const launch = prepareDshLaunch(DSH_ACP_PROFILE);
 				if (!launch.ok) throw new Error(launch.reason);
 				return {
 					// DSH_HOME is deleted, not set: an ambient value would point the

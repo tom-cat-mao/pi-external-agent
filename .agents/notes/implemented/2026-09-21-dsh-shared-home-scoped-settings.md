@@ -16,6 +16,7 @@ that the tier would not bind under a shared home; verified live on 0.1.5-rc.2, i
 ## Decision
 
 - dsh runs against the shared `~/.dsh` — the user's own profiles, plugins, credentials and session store.
+- `~/.dsh` itself is created when it is absent: the overlay has nowhere to live otherwise, and an existing home is left exactly as it is. dsh then records its own composition per profile inside it (`<profile>/cordis.yml`, materialized on a profile's first dispatch) — dsh's file in dsh's home, not extension state.
 - Every spawn carries `--patch ~/.dsh/cordis.patch.pi-external-agent.yml`, a static overlay whose only entry re-points the settings plugin's document:
 
 ```yaml
@@ -25,9 +26,10 @@ that the tier would not bind under a shared home; verified live on 0.1.5-rc.2, i
 ```
 
 - That document is provisioned empty when missing and NEVER overwritten.
+- Both names are reserved for our two files, so a symlink at either is REPLACED, never followed: the settings document by an empty regular file, the overlay by a temp-file write plus rename (atomic, and it replaces the link). Following one would let a link we did not write decide what dsh reads — for the settings document, a file that may carry `permission.defaultPreset`.
 - Session creation finds no `permission.defaultPreset` in our document, so the composed default governs and `DSH_PERMISSION_MODE` decides the tier per dispatch (readonly → `read-only`, write → `workspace-write`, yolo → `danger-full-access`), enforced mechanically by dsh's sandbox; over ACP, readonly is additionally fail-closed by the driver answering `session/request_permission`.
 - Verified live against the user's real `~/.dsh`, preset `danger-full-access`: a read-only dispatch was denied by the sandbox, and the user's `settings.yaml` was untouched.
-- A best-effort anchor guard warns on status, wait and settle when the overlay lost effect, when a user profile or home patch replaced the sandbox/approval rows' env hook, or when our settings document gains a permission section.
+- A best-effort anchor guard warns on status, wait and settle when the overlay lost effect, when a user profile or home patch replaced the sandbox/approval rows' env hook, or when our settings document gains a permission section. It probes once per profile, under the profile the spawn boots (`headless` for a one-shot run, `acp` for a session): dsh composes base → profile → home → `--patch`, so one profile's composition says nothing about the other's. A probe that cannot run warns (`dsh composition anchor unavailable: …`) rather than passing for a clean composition, and is retried on the next dispatch.
 - An ambient `DSH_HOME` exported in the user's shell is explicitly stripped from the child env.
 - Provisioning refuses only when its two files — the overlay and the settings document — cannot be created.
 - One-shot effort requests are still refused, never dropped: the `headless` profile has no effort knob.
@@ -56,7 +58,7 @@ Cost and consequences:
 - (a) The user's `settings.yaml` is never read by extension runs: Models-page provider profiles and other settings-document preferences do not apply. Credentials-file providers and the default DeepSeek route do.
 - (b) Plugins install per-profile: a plugin added to the web profile is not visible to the `acp`/`headless` profiles the extension boots. Share one with `dsh plugin --profile acp add <pkg>`.
 - (c) Extension sessions land in the shared session store, visible to the user's dsh surfaces.
-- (d) The anchor guard is best-effort, not a boundary: a user profile or home patch that replaces the sandbox/approval rows' env hook, or a `permission` section someone adds to our settings document, is reported on status, wait and settle rather than prevented.
+- (d) The anchor guard is best-effort, not a boundary: a user profile or home patch that replaces the sandbox/approval rows' env hook, or a `permission` section someone adds to our settings document, is reported on status, wait and settle rather than prevented — and a machine where the probe cannot run reports that instead of reporting nothing.
 - (e) A `DSH_HOME` exported in the user's shell cannot silently re-route a spawn: it is stripped from the child env.
 - (f) A provisioning failure is a refusal — a run never falls back to the user's preset with a receipt that claims otherwise.
 - (g) `~/.dsh-external-agent`, left by the previous design, is inert user data the extension does not reference; users may delete it.

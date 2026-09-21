@@ -27,10 +27,10 @@
  *
  * No live dsh run happens here: the protocol client talks to the fixture, and
  * provisioning is exercised against a temporary HOME. The composition anchor's
- * probe is memoized per process and would otherwise let whichever fixture `dsh`
- * happens to be first on PATH answer for every test after it, so the suite arms
- * it with a clean composition (see armedAnchor) and leaves the anchor's own
- * behaviour to test/dsh.test.ts.
+ * probe is memoized per profile for the process and would otherwise let
+ * whichever fixture `dsh` happens to be first on PATH answer for every test
+ * after it, so the suite arms both profiles with a clean composition (see
+ * armedAnchor) and leaves the anchor's own behaviour to test/dsh.test.ts.
  *
  * Run with `node --test test/dsh-driver.test.ts`.
  */
@@ -233,29 +233,38 @@ function overlayIn(home: string): string {
  * it for these fixture files. The anchor itself is test/dsh.test.ts's subject;
  * this suite needs it silent so that the fixture `dsh` — which answers the ACP
  * handshake, not `--dump-config` — is never asked to compose anything.
+ *
+ * Both profiles are armed: the anchor memoizes PER PROFILE, and a session start
+ * probes `acp`, so arming only the one-shot profile would leave every session
+ * test probing through the fixture.
  */
 function armedAnchor(home: string): void {
 	const settingsDoc = settingsDocIn(home);
 	resetDshCompositionGuard();
-	dshCompositionWarnings({
-		overlay: overlayIn(home),
-		settingsDoc,
-		run: () =>
-			[
-				`# == @deepseek-ai/dsh-base, patched by ${overlayIn(home)}`,
-				"- id: settings",
-				"  name: '@deepseek-ai/dsh-settings-file'",
-				"  config:",
-				`    path: ${settingsDoc}`,
-				"- id: sandbox-policy",
-				"  config:",
-				"    mode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'",
-				"- id: approval",
-				"  config:",
-				"    policy: !!js process.env.DSH_PERMISSION_MODE === 'danger-full-access' ? 'never' : 'ask'",
-				"",
-			].join("\n"),
-	});
+	for (const profile of ["headless", "acp"] as const) {
+		dshCompositionWarnings({
+			overlay: overlayIn(home),
+			settingsDoc,
+			profile,
+			run: () => ({
+				ok: true,
+				dump: [
+					`# == @deepseek-ai/dsh-base, patched by ${overlayIn(home)}`,
+					"- id: settings",
+					"  name: '@deepseek-ai/dsh-settings-file'",
+					"  config:",
+					`    path: ${settingsDoc}`,
+					"- id: sandbox-policy",
+					"  config:",
+					"    mode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'",
+					"- id: approval",
+					"  config:",
+					"    policy: !!js process.env.DSH_PERMISSION_MODE === 'danger-full-access' ? 'never' : 'ask'",
+					"",
+				].join("\n"),
+			}),
+		});
+	}
 }
 
 /** Tolerates a torn trailing line while the fixture is still appending. */

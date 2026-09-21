@@ -34,14 +34,23 @@
  * Provisioning alone is not proof the composition is what we asked for — a
  * later patch can outrank our overlay, and a profile or home patch can replace
  * the rows that read DSH_PERMISSION_MODE — so the composition is ANCHORED once
- * per process by an offline `dsh --dump-config` probe
- * (dshCompositionWarnings). Its findings are warnings, never refusals: a run
+ * per profile per process by an offline `dsh --dump-config` probe run under the
+ * profile the dispatch will boot (dshCompositionWarnings): dsh composes
+ * base → profile → home → `--patch`, so a probe under `headless` says nothing
+ * about `acp` and vice versa. Its findings are warnings, never refusals: a run
  * whose composition drifted is still a run, but the caller has to know the tier
- * it asked for may not be the one in force.
+ * it asked for may not be the one in force. A probe that cannot run at all —
+ * no dsh, a non-zero exit, a timeout — warns and is retried on the next
+ * dispatch instead of standing in for a composition nobody read.
+ *
+ * Both files are ours by NAME, so a symlink found at either is replaced rather
+ * than followed: a link we did not write could aim dsh's settings row at a
+ * document carrying a `permission.defaultPreset`, which is exactly the
+ * precedence this module exists to keep out of a hub-dispatched run.
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -56,6 +65,15 @@ export const DSH_OVERLAY_NAME = "cordis.patch.pi-external-agent.yml";
 
 /** How long the offline `--dump-config` anchor probe may take before it is skipped. */
 const DSH_DUMP_TIMEOUT_MS = 10_000;
+
+/**
+ * The two dsh run profiles the extension boots: `headless` on the one-shot
+ * transport, `acp` for the session driver. The anchor probes PER PROFILE,
+ * because dsh composes base → profile → home → `--patch`: a user's
+ * `~/.dsh/profiles/acp/cordis.patch.yml` can replace a row for the ACP
+ * composition alone, and a probe under the other profile would never see it.
+ */
+export type DshProfile = "headless" | "acp";
 
 /** The settings variable dsh's sandbox-policy and approval rows read. */
 const DSH_PERMISSION_ENV = "DSH_PERMISSION_MODE";
@@ -129,6 +147,11 @@ export type DshLaunchResult =
  * differs — a stale one from an earlier build (or a home that moved) must not
  * pin the settings row at a path nothing maintains.
  *
+ * Both names are reserved for these two files, so a symlink at either is
+ * removed and replaced by the regular file itself: writing through the link
+ * would put a document we cannot see — one that may carry
+ * `permission.defaultPreset` — where dsh reads its settings.
+ *
  * A failure here is a refusal rather than a warning because both files are
  * load-bearing: without the overlay dsh reads the user's settings document, and
  * the requested tier stops binding silently.
@@ -146,6 +169,17 @@ export function ensureDshLaunch(options: DshLaunchOptions = {}): DshLaunchResult
 		mkdirSync(home, { recursive: true });
 	} catch (err) {
 		return { ok: false, reason: `could not create dsh's shared home ${home}: ${describe(err)}` };
+	}
+
+	if (isSymlink(settingsDoc)) {
+		try {
+			unlinkSync(settingsDoc);
+		} catch (err) {
+			return {
+				ok: false,
+				reason: `could not replace the symlinked dsh settings document ${settingsDoc}: ${describe(err)}`,
+			};
+		}
 	}
 
 	if (!existsSync(settingsDoc)) {
@@ -171,10 +205,20 @@ export function ensureDshLaunch(options: DshLaunchOptions = {}): DshLaunchResult
 	} catch {
 		/* absent or unreadable: the write below is the same either way */
 	}
-	if (existing !== content) {
+	if (isSymlink(overlay) || existing !== content) {
+		// Through a temp file and a rename: the overlay is never half-written
+		// where a concurrent spawn could read it, and the rename replaces a
+		// symlink at the destination instead of writing through it.
+		const temp = `${overlay}.${process.pid}.tmp`;
 		try {
-			writeFileSync(overlay, content);
+			writeFileSync(temp, content);
+			renameSync(temp, overlay);
 		} catch (err) {
+			try {
+				unlinkSync(temp);
+			} catch {
+				/* nothing was created, or the write failed before it existed */
+			}
 			return { ok: false, reason: `could not write the dsh overlay ${overlay}: ${describe(err)}` };
 		}
 	}
@@ -182,37 +226,52 @@ export function ensureDshLaunch(options: DshLaunchOptions = {}): DshLaunchResult
 	return { ok: true, overlay, settingsDoc };
 }
 
+/** Whether a path exists as a symbolic link — lstat, so the link itself is examined. */
+function isSymlink(path: string): boolean {
+	try {
+		return lstatSync(path).isSymbolicLink();
+	} catch {
+		/* absent, or its parent is not a directory: nothing to replace */
+		return false;
+	}
+}
+
 export interface DshGuardOptions {
 	/** Our overlay path, as handed to dsh. */
 	overlay: string;
 	/** Our settings document, whose emptiness is the point. */
 	settingsDoc: string;
+	/** The profile the spawn will boot; dsh composes per profile, so the probe must too. */
+	profile: DshProfile;
 	/** The dsh executable to probe; defaults to `dsh` from PATH. */
 	bin?: string;
 	/**
 	 * Probe runner, for tests and for a caller with its own dsh: given the probe
-	 * argv, it returns the composed config, or undefined when the probe cannot
-	 * run. Defaults to spawning `dsh <argv>`.
+	 * argv, it returns the composed config, or why it could not be read.
+	 * Defaults to spawning `dsh <argv>`.
 	 */
-	run?: (argv: string[]) => string | undefined;
+	run?: (argv: string[]) => DshProbeOutcome;
 }
 
-/** The memoized anchor result: undefined until this process has probed once. */
-let compositionWarnings: string[] | undefined;
+/** What one offline probe produced: the composed config, or why there is none. */
+export type DshProbeOutcome = { ok: true; dump: string } | { ok: false; reason: string };
+
+/** The memoized anchor results, one per profile; absent until that profile has probed. */
+const compositionWarnings = new Map<DshProfile, string[]>();
 
 /**
- * Forget the memoized anchor result, so the next call probes again. Production
- * probes once per process on purpose — the answer is about this machine's
- * configuration, not about one dispatch — so this exists for tests that need a
- * fresh probe.
+ * Forget the memoized anchor results, so the next call probes again. Production
+ * probes once per profile per process on purpose — the answer is about this
+ * machine's configuration, not about one dispatch — so this exists for tests
+ * that need a fresh probe.
  */
 export function resetDshCompositionGuard(): void {
-	compositionWarnings = undefined;
+	compositionWarnings.clear();
 }
 
 /**
  * The composition anchor: at most one offline `dsh --dump-config` spawn per
- * process, reported as warnings.
+ * profile per process, reported as warnings.
  *
  * Provisioning proves the two files are on disk; this proves the process dsh
  * will actually compose reads them. Three things are worth knowing, and each
@@ -223,36 +282,75 @@ export function resetDshCompositionGuard(): void {
  *       composition no longer reads DSH_PERMISSION_MODE at all;
  *   (c) something wrote a `permission:` section into OUR document.
  *
- * A probe that cannot run (dsh absent, a non-zero exit, a timeout) skips the
- * guard in silence: it is a best-effort warning and must never block a dispatch.
+ * The probe runs under the profile the spawn will boot, so a profile patch that
+ * rewrites a row for `acp` is reported for an `acp` session rather than hidden
+ * behind a clean `headless` composition.
+ *
+ * A probe that cannot run (dsh absent, a non-zero exit, a timeout) is reported
+ * as an unavailable anchor and NOT memoized: it is a fact about this attempt,
+ * not about the machine, so the next dispatch probes again. Either way the
+ * finding is a warning and never blocks a dispatch.
  */
 export function dshCompositionWarnings(options: DshGuardOptions): string[] {
-	if (compositionWarnings !== undefined) return compositionWarnings;
+	const memo = compositionWarnings.get(options.profile);
+	if (memo !== undefined) return memo;
+
+	// A document that is not a regular file (a directory, a symlink somebody
+	// re-created) cannot be read as an empty settings document, and the probe
+	// could not tell us what dsh reads instead: warn, and skip the guard.
+	const doc = lstatOrUndefined(options.settingsDoc);
+	if (doc && !doc.isFile()) {
+		return [
+			`${options.settingsDoc} is not a regular file, so the composition anchor is skipped` +
+				`: the requested permission tier may not be the one in force.`,
+		];
+	}
+
 	const probe = options.run ?? ((argv: string[]) => runDshDumpConfig(options.bin ?? "dsh", argv));
-	const dump = probe(dshDumpArgv(options.overlay));
-	compositionWarnings = dump === undefined ? [] : compositionViolations(dump, options);
-	return compositionWarnings;
+	const outcome = probe(dshDumpArgv(options.profile, options.overlay));
+	if (!outcome.ok) {
+		return [
+			`dsh composition anchor unavailable: the ${options.profile} profile's composition could not be read offline` +
+				` (${outcome.reason}): the requested permission tier may not be the one in force.`,
+		];
+	}
+
+	const warnings = compositionViolations(outcome.dump, options);
+	compositionWarnings.set(options.profile, warnings);
+	return warnings;
 }
 
 /** The offline probe: the launcher composes and prints its config, no model call, no session. */
-function dshDumpArgv(overlay: string): string[] {
-	return ["--profile", "headless", "--patch", overlay, "--dump-config"];
+function dshDumpArgv(profile: DshProfile, overlay: string): string[] {
+	return ["--profile", profile, "--patch", overlay, "--dump-config"];
 }
 
-function runDshDumpConfig(bin: string, argv: string[]): string | undefined {
+function runDshDumpConfig(bin: string, argv: string[]): DshProbeOutcome {
 	try {
-		return execFileSync(bin, argv, {
-			encoding: "utf8",
-			timeout: DSH_DUMP_TIMEOUT_MS,
-			// The probe must see the composition the spawn will see, and the spawn
-			// strips an inherited DSH_HOME (it would point the shared home
-			// elsewhere) — so the probe strips it too.
-			env: probeEnv(),
-			stdio: ["ignore", "pipe", "ignore"],
-		});
+		return {
+			ok: true,
+			dump: execFileSync(bin, argv, {
+				encoding: "utf8",
+				timeout: DSH_DUMP_TIMEOUT_MS,
+				// The probe must see the composition the spawn will see, and the
+				// spawn strips an inherited DSH_HOME (it would point the shared
+				// home elsewhere) — so the probe strips it too.
+				env: probeEnv(),
+				stdio: ["ignore", "pipe", "ignore"],
+			}),
+		};
+	} catch (err) {
+		// Best effort by construction: an unavailable or unhappy dsh is reported
+		// as an unavailable anchor instead of failing a dispatch that would run.
+		return { ok: false, reason: describe(err) };
+	}
+}
+
+/** `lstatSync`, or undefined when the path does not exist. */
+function lstatOrUndefined(path: string): ReturnType<typeof lstatSync> | undefined {
+	try {
+		return lstatSync(path);
 	} catch {
-		// Best effort by construction: an unavailable or unhappy dsh skips the
-		// anchor instead of failing a dispatch that would have run.
 		return undefined;
 	}
 }
@@ -271,21 +369,22 @@ interface ConfigRow {
 }
 
 const ROW_START = /^- id:\s*(\S+)\s*$/;
-const PATCHED_BY = /patched by (\S+)/;
+const PATCHED_BY = /patched by ([^,\s]+)/g;
 
 /**
  * Index a `--dump-config` dump by row id. dsh marks a patched row with a
  * `# ... patched by <file>` comment on the line above it, which is the only
- * provenance in the dump — and the file name a warning should name.
+ * provenance in the dump — and the file name a warning should name. A row
+ * several patches wrote carries one marker per patch, in composition order, so
+ * the LAST marker is the patch that won.
  */
 function configRows(dump: string): Map<string, ConfigRow> {
 	const rows = new Map<string, ConfigRow>();
 	let pendingPatch: string | undefined;
 	let current: ConfigRow | undefined;
 	for (const line of dump.split("\n")) {
-		const patch = line.trimStart().startsWith("#") ? PATCHED_BY.exec(line) : null;
-		if (patch) {
-			pendingPatch = patch[1];
+		if (line.trimStart().startsWith("#")) {
+			for (const marker of line.matchAll(PATCHED_BY)) pendingPatch = marker[1];
 			continue;
 		}
 		const start = ROW_START.exec(line);
@@ -300,14 +399,46 @@ function configRows(dump: string): Map<string, ConfigRow> {
 	return rows;
 }
 
-/** The value of a `key:` line inside a row's own lines, if the row has one. */
+/**
+ * The value of a `key:` line inside the row's own `config:` block, if there is
+ * one. Scoped to that block: the patch entry replaces a row's `config` wholesale,
+ * so a same-named key anywhere else in the row is not what dsh composes.
+ */
 function rowValue(row: ConfigRow, key: string): string | undefined {
 	const pattern = new RegExp(`^\\s+${key}:\\s*(.+?)\\s*$`);
-	for (const line of row.lines) {
-		const match = pattern.exec(line);
-		if (match) return match[1];
+	for (let index = 0; index < row.lines.length; index += 1) {
+		const header = /^(\s+)config:\s*$/.exec(row.lines[index]);
+		if (!header) continue;
+		const indent = header[1].length;
+		for (const line of row.lines.slice(index + 1)) {
+			const lineIndent = /^\s*/.exec(line)![0].length;
+			if (line.trim() && lineIndent <= indent) break; // dedented: the block ended
+			const match = pattern.exec(line);
+			if (match) return match[1];
+		}
 	}
 	return undefined;
+}
+
+/**
+ * A dump line with its YAML comment removed. The heuristic is naive on purpose:
+ * a `#` opens a comment unless it sits inside a quoted scalar, which is where
+ * the dump's `!!js` rows carry their quotes. It is what keeps a decoy comment
+ * from standing in for a row that no longer reads the variable.
+ */
+function stripYamlComment(line: string): string {
+	let quote: string | undefined;
+	for (let index = 0; index < line.length; index += 1) {
+		const char = line[index];
+		if (quote !== undefined) {
+			if (char === quote) quote = undefined;
+		} else if (char === "'" || char === '"') {
+			quote = char;
+		} else if (char === "#") {
+			return line.slice(0, index);
+		}
+	}
+	return line;
 }
 
 /**
@@ -334,9 +465,11 @@ function compositionViolations(dump: string, options: DshGuardOptions): string[]
 
 	// (b) The tier travels in the environment, and exactly two rows read it.
 	// Replacing either with a literal pinning one mode breaks every other tier.
+	// Comments are stripped first: a row whose literal is decorated with a
+	// mention of the variable reads no variable at all.
 	for (const id of ENV_HOOKED_ROW_IDS) {
 		const row = rows.get(id);
-		if (row && row.lines.some((line) => line.includes(DSH_PERMISSION_ENV))) continue;
+		if (row && row.lines.some((line) => stripYamlComment(line).includes(DSH_PERMISSION_ENV))) continue;
 		warnings.push(
 			row
 				? `${row.patch ?? "the composed config"} replaced dsh's ${id} row with config that no longer reads ${DSH_PERMISSION_ENV}` +
@@ -371,14 +504,15 @@ export type DshPrepareResult =
 
 /**
  * Provisioning plus the anchor probe — what both dsh transports call before
- * they spawn. The refusal is about provisioning only (a file that cannot
- * exist); everything the anchor finds is a warning, because a run whose
- * composition drifted is still a run the caller may want to make.
+ * they spawn, each with the profile it is about to boot. The refusal is about
+ * provisioning only (a file that cannot exist); everything the anchor finds is
+ * a warning, because a run whose composition drifted is still a run the caller
+ * may want to make.
  */
-export function prepareDshLaunch(options: DshLaunchOptions = {}): DshPrepareResult {
+export function prepareDshLaunch(profile: DshProfile, options: DshLaunchOptions = {}): DshPrepareResult {
 	const launch = ensureDshLaunch(options);
 	if (!launch.ok) return launch;
-	const warnings = dshCompositionWarnings({ overlay: launch.overlay, settingsDoc: launch.settingsDoc });
+	const warnings = dshCompositionWarnings({ overlay: launch.overlay, settingsDoc: launch.settingsDoc, profile });
 	return warnings.length > 0 ? { ...launch, warning: warnings.join(" ") } : launch;
 }
 
