@@ -400,7 +400,7 @@ test("w4: compare appends one board row per settled slot and reports the digest"
 			task: "SHARED",
 			agents: [
 				{ agent: "claude", cwd: dir, mode: "readonly", task: "ALPHA_TASK" },
-				{ agent: "kimi", cwd: dir, mode: "readonly" },
+				{ agent: "claude", cwd: dir, mode: "readonly", effort: "off" },
 				{ agent: "claude", cwd: dir, mode: "readonly", task: "BETA_TASK" },
 			],
 			timeout: 30,
@@ -408,7 +408,7 @@ test("w4: compare appends one board row per settled slot and reports the digest"
 		const text = resultText(result);
 		const boardPath = path.join(sessionDir, "external-agent", "board.jsonl");
 		assert.match(text, /board: .*board\.jsonl \(\+2 entries\)/);
-		assert.equal(result.details.results[1].refused, true, "the kimi slot was refused");
+		assert.equal(result.details.results[1].refused, true, "the slot asking for an unsupported effort was refused");
 
 		const rows = readFileSync(boardPath, "utf8")
 			.trim()

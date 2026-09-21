@@ -16,10 +16,10 @@
  *    session driver answering protocol permission requests (dsh's ACP escalation deny) —
  *    never by a prompt request, and defaults are per-adapter:
  *    codex/pi/kimi/codebuddy/reasonix/qoder/claude/dsh
- *    yolo; kimi is yolo-only (headless print mode rejects permission flags and forces
- *    Never Ask), so readonly/write are refused;
+ *    yolo, with every tier open (kimi's readonly is plan mode plus the driver
+ *    rejecting permission prompts, and its print spelling stays yolo-only);
  *    concurrent write/yolo tasks in the same directory are refused outright.
- *    Why: .agents/notes/implemented/2026-09-21-receipt-label-truth-pass.md
+ *    Why: .agents/notes/implemented/2026-09-21-kimi-acp-driver.md
  *
  * 3. One tool surface: `agent` is an enum rather than one tool per CLI, because
  *    tool descriptions cost context in every request.

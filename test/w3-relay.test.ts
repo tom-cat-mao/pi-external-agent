@@ -5,6 +5,7 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
+import { SESSION_DRIVERS } from "../src/drivers/index.ts";
 
 const STUBS: Record<string, string> = {
 	"@earendil-works/pi-coding-agent": `export function keyHint(key, description) { return key + " " + description; }`,
@@ -178,7 +179,11 @@ process.stdin.on("data", (chunk) => {
 });
 `;
 
-/** kimi is the one-shot arm: `-p <task>` on argv, one chat record, then exit. */
+/**
+ * The one-shot spelling of `kimi -p <task>`: one chat record on stdout, then
+ * exit. The test reaches it by removing kimi's session driver for the kimi
+ * dispatches it wants on that transport.
+ */
 const KIMI_ONESHOT_MOCK = `#!/usr/bin/env node
 const fs = require("node:fs");
 const answer = process.env.KIMI_MOCK_ANSWER_FILE ? fs.readFileSync(process.env.KIMI_MOCK_ANSWER_FILE, "utf8") : "KIMI_OK";
@@ -206,6 +211,21 @@ function withEnv(values: Record<string, string>): () => void {
 			if (value === undefined) delete process.env[key];
 			else process.env[key] = value;
 		}
+	};
+}
+
+/**
+ * kimi runs over its ACP session in the hub, so the one-shot adapter is
+ * reachable only when kimi has no session driver: the registry picks the
+ * persistent transport for exactly the agents in SESSION_DRIVERS. Removing the
+ * entry is the only way to drive that path through the registry; the returned
+ * function puts it back, so no other test sees a different transport table.
+ */
+function withoutKimiDriver(): () => void {
+	const saved = SESSION_DRIVERS.kimi;
+	delete SESSION_DRIVERS.kimi;
+	return () => {
+		SESSION_DRIVERS.kimi = saved;
 	};
 }
 
@@ -427,6 +447,7 @@ test("w3: relay refuses a one-shot target and a dead session rather than degradi
 	const answerFile = path.join(dir, "answer.txt");
 	writeFileSync(answerFile, "RELAY_THIS_BODY");
 	const restore = withEnv({ PATH: `${dir}${path.delimiter}${process.env.PATH ?? ""}`, KIMI_MOCK_ANSWER_FILE: answerFile });
+	const restoreDriver = withoutKimiDriver();
 	try {
 		const source = await call("external_agent_start", { agent: "kimi", task: "dig in", mode: "yolo", cwd: dir, notify: "off" });
 		const sourceId = source.details.task.taskId;
@@ -436,6 +457,10 @@ test("w3: relay refuses a one-shot target and a dead session rather than degradi
 			await call("external_agent_start", { agent: "kimi", task: "target", mode: "yolo", cwd: dir, notify: "off" })
 		).details.task.taskId;
 		await settleTask(oneShotId);
+		// Both kimi tasks were dispatched as one-shot processes; the table is
+		// whole again before the relay, so the refusal below is about the target
+		// task's transport, not about what kimi supports right now.
+		restoreDriver();
 		const refusedOneshot = await call("external_agent_follow_up", { taskId: oneShotId, message: "", fromTaskId: sourceId });
 		assert.equal(refusedOneshot.details.relayed, false);
 		assert.match(resultText(refusedOneshot), /runs as a one-shot process/);
@@ -454,6 +479,7 @@ test("w3: relay refuses a one-shot target and a dead session rather than degradi
 		const listed = await call("external_agent_status", {});
 		assert.equal(listed.details.tasks.length, 3, "no replacement task was dispatched");
 	} finally {
+		restoreDriver();
 		restore();
 	}
 });

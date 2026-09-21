@@ -15,6 +15,7 @@ import { registerHooks } from "node:module";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { SESSION_DRIVERS } from "../src/drivers/index.ts";
 
 const STUBS: Record<string, string> = {
 	"@earendil-works/pi-coding-agent": `export function keyHint(key, description) { return key + " " + description; }`,
@@ -55,12 +56,13 @@ afterEach(() => lifecycle.get("session_shutdown")!({ reason: "quit" }));
 
 /**
  * Three mock agents, each shaped like the transport its adapter is driven on:
- *   kimi   -> one-shot stream-json: OpenAI-style chat records (the only adapter
- *             left without a session driver)
+ *   kimi   -> one binary, two spellings: its ACP session (`kimi acp`, the path a
+ *             dispatch takes) and the one-shot print spelling, which is reachable
+ *             only when kimi has no session driver
  *   claude -> persistent stream-json session: initialize handshake, then one
  *             result record per user message (Claude-Code-shaped)
  *   codex  -> persistent `app-server` JSON-RPC: thread/start then turn/start
- * COMPARE_MOCK_HOLD makes kimi accept its turn and never settle, which is what
+ * COMPARE_MOCK_HOLD makes the named turn accept and never settle, which is what
  * the timeout path needs; COMPARE_MOCK_ANSWER overrides the answer text so the
  * truncation bound can be exercised.
  */
@@ -68,12 +70,52 @@ const COMPARE_MOCKS: Record<string, string> = {
 	kimi: `#!/usr/bin/env node
 const fs = require("node:fs");
 const argvFile = process.env.COMPARE_MOCK_ARGV_FILE;
-if (argvFile) fs.appendFileSync(argvFile, JSON.stringify({ bin: "kimi", argv: process.argv.slice(2) }) + "\\n");
-if (process.env.COMPARE_MOCK_HOLD === "1") {
-	setInterval(function () {}, 1000);
+const argv = process.argv.slice(2);
+if (argvFile) fs.appendFileSync(argvFile, JSON.stringify({ bin: "kimi", argv }) + "\\n");
+const answer = process.env.COMPARE_MOCK_ANSWER || "KIMI-ANSWER";
+const hold = process.env.COMPARE_MOCK_HOLD === "1";
+
+if (argv[0] !== "acp") {
+	// The one-shot print spelling: one chat record, then exit.
+	if (hold) {
+		setInterval(function () {}, 1000);
+	} else {
+		process.stdout.write(JSON.stringify({ role: "assistant", content: answer }) + "\\n", function () { process.exit(0); });
+	}
 } else {
-	const answer = process.env.COMPARE_MOCK_ANSWER || "KIMI-ANSWER";
-	process.stdout.write(JSON.stringify({ role: "assistant", content: answer }) + "\\n", function () { process.exit(0); });
+	const send = function (value) { process.stdout.write(JSON.stringify(value) + "\\n"); };
+	let buffer = "";
+	process.stdin.setEncoding("utf8");
+	process.stdin.on("data", function (chunk) {
+		buffer += chunk;
+		const lines = buffer.split("\\n");
+		buffer = lines.pop();
+		for (const line of lines) {
+			if (!line.trim()) continue;
+			let msg;
+			try { msg = JSON.parse(line); } catch { continue; }
+			if (msg.method === "initialize") {
+				send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } });
+			} else if (msg.method === "session/new") {
+				send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s1", configOptions: [
+					{ id: "model", currentValue: "kimi-k2" },
+					{ id: "thinking", currentValue: "low", values: ["off", "low", "medium", "high", "max"] },
+				] } });
+			} else if (msg.method === "session/set_mode") {
+				send({ jsonrpc: "2.0", id: msg.id, result: {} });
+			} else if (msg.method === "session/set_config_option") {
+				send({ jsonrpc: "2.0", id: msg.id, result: { configOptions: [
+					{ id: "thinking", currentValue: msg.params.value, values: ["off", "low", "medium", "high", "max"] },
+				] } });
+			} else if (msg.method === "session/prompt") {
+				if (hold) continue;
+				send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "s1", update: {
+					sessionUpdate: "agent_message_chunk", content: { type: "text", text: answer },
+				} } });
+				send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
+			}
+		}
+	});
 }
 `,
 	claude: `#!/usr/bin/env node
@@ -187,6 +229,21 @@ function mockLog(file: string): any[] {
 	return text ? text.split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
 }
 
+/**
+ * Every adapter now has a session driver, so the hub's one-shot transport is
+ * reachable only when an agent has none — the registry picks the persistent
+ * transport for exactly the agents in SESSION_DRIVERS. Removing kimi's entry is
+ * how the mixed-transport batch below reaches that path; the returned function
+ * puts it back, so no other test sees a different transport table.
+ */
+function withoutKimiDriver(): () => void {
+	const saved = SESSION_DRIVERS.kimi;
+	delete SESSION_DRIVERS.kimi;
+	return () => {
+		SESSION_DRIVERS.kimi = saved;
+	};
+}
+
 test("compare: dispatches several agents and returns one aggregated side-by-side receipt", async () => {
 	const dir = makeFixtureDir(COMPARE_MOCKS);
 	const restorePath = usePath(dir);
@@ -236,9 +293,13 @@ test("compare: dispatches several agents and returns one aggregated side-by-side
 		assert.equal(kimi.state, "done");
 		assert.equal(kimi.answer, "KIMI-ANSWER");
 		assert.equal(kimi.mode, "yolo");
-		// kimi is the one-shot arm: the task really is an argv word there.
-		assert.equal(kimi.dispatch.transport, "oneshot");
-		assert.equal(kimi.dispatch.argv[kimi.dispatch.promptArgIndex], "say which module owns the task registry");
+		// kimi rides its ACP session too, so the receipt describes that channel
+		// and the task is nowhere in the startup argv.
+		assert.equal(kimi.dispatch.transport, "persistent");
+		assert.equal(kimi.dispatch.stdin, "jsonrpc");
+		assert.deepEqual(kimi.dispatch.argv, ["acp"]);
+		assert.equal(kimi.dispatch.promptArgIndex, -1);
+		assert.equal(kimi.dispatch.argv.includes("say which module owns the task registry"), false);
 		assert.equal(kimi.dispatch.effort.requested, undefined);
 		assert.equal(kimi.dispatch.argv.includes("--effort"), false);
 
@@ -268,7 +329,10 @@ test("compare: a refused spec is recorded while the other specs still run", asyn
 			{
 				task: "summarize the entry points",
 				agents: [
-					{ agent: "kimi", mode: "readonly" },
+					// Two specs the hub refuses before anything spawns — codex tops
+					// out below "max", claude does not offer "minimal" — so the one
+					// spec that can run still does.
+					{ agent: "codex", mode: "readonly", effort: "max" },
 					{ agent: "claude", mode: "readonly", effort: "minimal" },
 					{ agent: "claude", mode: "readonly" },
 				],
@@ -279,7 +343,7 @@ test("compare: a refused spec is recorded while the other specs still run", asyn
 		const results = compared.details.results;
 		assert.equal(results.length, 3);
 		assert.equal(results[0].refused, true);
-		assert.match(results[0].reason, /kimi is yolo-only \(requested "readonly"\)/);
+		assert.match(results[0].reason, /codex supports effort levels off, minimal, low, medium, high, xhigh \(requested "max"\)/);
 		assert.equal(results[0].taskId, undefined);
 		assert.equal(results[0].state, undefined);
 		assert.equal(results[1].refused, true);
@@ -289,8 +353,8 @@ test("compare: a refused spec is recorded while the other specs still run", asyn
 		assert.equal(results[2].answer, "CLAUDE-ANSWER");
 
 		const text = compared.content[0].text;
-		assert.match(text, /\[1\] kimi · refused/);
-		assert.match(text, /Refused: kimi is yolo-only/);
+		assert.match(text, /\[1\] codex · refused/);
+		assert.match(text, /Refused: codex supports effort levels/);
 		assert.match(text, /summary: 3 specs · 2 refused · 1 dispatched · 1 done/);
 	} finally {
 		await call("external_agent_stop", { all: true });
@@ -427,7 +491,10 @@ test("compare: omitted effort adds no flag to any spawn argv while explicit effo
 				task: "t",
 				agents: [
 					{ agent: "claude", mode: "readonly", effort: "high" },
-					{ agent: "kimi", mode: "yolo" },
+					// kimi's effort travels over its session rather than in argv, so
+					// the flag check below can never cover it: the receipt says where
+					// the level went.
+					{ agent: "kimi", mode: "yolo", effort: "high" },
 				],
 			},
 			dir,
@@ -441,6 +508,10 @@ test("compare: omitted effort adds no flag to any spawn argv while explicit effo
 		assert.equal(forwarded.filter((entry) => entry.bin === "kimi").every((entry) => !entry.argv.includes("--effort")), true);
 		assert.equal(explicit.details.results[0].dispatch.effort.requested, "high");
 		assert.equal(explicit.details.results[0].dispatch.effort.forwarded, true);
+		const kimiEffort = explicit.details.results[1].dispatch.effort;
+		assert.equal(kimiEffort.requested, "high");
+		assert.equal(kimiEffort.forwarded, true);
+		assert.match(kimiEffort.note, /session\/set_config_option thinking=high/);
 	} finally {
 		await call("external_agent_stop", { all: true });
 		restoreEnv();
@@ -453,14 +524,14 @@ test("compare: a persistent-session agent rides its session driver in the same b
 	const turnFile = path.join(dir, "turn-start.jsonl");
 	const restorePath = usePath(dir);
 	const restoreEnv = withEnv({ COMPARE_MOCK_TURN_FILE: turnFile });
+	// kimi is a session agent too, so the one-shot arm below is reached the only
+	// way the hub can still reach it: by removing kimi's driver for this batch.
+	const restoreDriver = withoutKimiDriver();
 	try {
 		const compared = await compare(
 			{
 				task: "name the transport this agent uses",
 				agents: [
-					// kimi is yolo-only and the batch shares one directory, so the
-					// session slot carries readonly and the one-shot slot yolo —
-					// two mutating tasks in one cwd would be refused.
 					{ agent: "codex", mode: "readonly", effort: "high" },
 					{ agent: "kimi", mode: "yolo" },
 				],
@@ -483,16 +554,19 @@ test("compare: a persistent-session agent rides its session driver in the same b
 		assert.equal(turnStart.length, 1);
 		assert.equal(turnStart[0].effort, "high");
 
-		// kimi is the only adapter left without a session driver, so it is the
-		// one-shot arm here; it answers and exits instead of holding a session open.
+		// With no driver registered, kimi falls to the one-shot spelling: the
+		// task is an argv word and the process answers and exits instead of
+		// holding a session open.
 		assert.equal(oneshot.agent, "kimi");
 		assert.equal(oneshot.state, "done");
 		assert.equal(oneshot.dispatch.transport, "oneshot");
+		assert.equal(oneshot.dispatch.argv[oneshot.dispatch.promptArgIndex], "name the transport this agent uses");
 		assert.equal(oneshot.dispatch.effort.requested, undefined);
 
 		const text = compared.content[0].text;
 		assert.match(text, /summary: 2 specs · 2 dispatched · 2 done/);
 	} finally {
+		restoreDriver();
 		await call("external_agent_stop", { all: true });
 		restoreEnv();
 		restorePath();
@@ -526,12 +600,15 @@ test("compare: a codex turn whose completion shares the turn/start response chun
 			dir,
 		);
 
-		const [session, oneshot] = compared.details.results;
+		const [session, kimi] = compared.details.results;
 		assert.equal(session.refused, false);
 		assert.equal(session.state, "done");
 		assert.equal(session.answer, "CODEX-ANSWER");
 		assert.equal(session.dispatch.transport, "persistent");
-		assert.equal(oneshot.state, "done");
+		// The other slot is on its own session channel and must settle too: a
+		// batch cannot be held up by whichever agent shares a chunk.
+		assert.equal(kimi.state, "done");
+		assert.equal(kimi.dispatch.transport, "persistent");
 		assert.equal(mockLog(turnFile).length, 1);
 		assert.equal(compared.details.timedOut, false);
 		assert.match(compared.content[0].text, /summary: 2 specs · 2 dispatched · 2 done/);

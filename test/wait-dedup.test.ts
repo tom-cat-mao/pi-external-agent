@@ -11,6 +11,7 @@ import { chmodSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { ADAPTERS } from "../src/adapters.ts";
+import { SESSION_DRIVERS } from "../src/drivers/index.ts";
 
 const STUBS: Record<string, string> = {
 	"@earendil-works/pi-coding-agent": `export function keyHint(key, description) { return key + " " + description; }`,
@@ -103,6 +104,21 @@ function withEnv(values: Record<string, string>): () => void {
 
 function usePath(dir: string): () => void {
 	return withEnv({ PATH: `${dir}${path.delimiter}${process.env.PATH ?? ""}` });
+}
+
+/**
+ * kimi runs over its ACP session in the hub, so the one-shot adapter is
+ * reachable only when kimi has no session driver: the registry picks the
+ * persistent transport for exactly the agents in SESSION_DRIVERS. Removing the
+ * entry is the only way to drive that path through the registry; the returned
+ * function puts it back, so no other test sees a different transport table.
+ */
+function withoutKimiDriver(): () => void {
+	const saved = SESSION_DRIVERS.kimi;
+	delete SESSION_DRIVERS.kimi;
+	return () => {
+		SESSION_DRIVERS.kimi = saved;
+	};
 }
 
 function sleep(ms: number): Promise<void> {
@@ -370,10 +386,12 @@ test("wait-dedup: a task held by an unfinished wait is re-delivered once by sess
 
 test("wait-dedup: a dispatch that fails before it starts owes no notice, and a reload does not replay it", async () => {
 	const original = ADAPTERS.kimi.buildDispatch;
+	const restoreDriver = withoutKimiDriver();
 	armNotifications();
 	try {
-		// kimi is one-shot only, so an adapter refusal is the path a rejected
-		// dispatch takes: the task is failed before anything spawns.
+		// kimi runs over its session driver, so this test removes that driver for
+		// its duration: an adapter refusal is the path a rejected one-shot
+		// dispatch takes, and the task is failed before anything spawns.
 		ADAPTERS.kimi.buildDispatch = (input) => ({ ...original(input), refusal: "kimi cannot run this request" });
 		const started = await call("external_agent_start", { agent: "kimi", task: "t", mode: "yolo", notify: "nextTurn" });
 		// The tool result carries the whole report, notice mode notwithstanding.
@@ -389,6 +407,7 @@ test("wait-dedup: a dispatch that fails before it starts owes no notice, and a r
 		assert.equal(pushes.length, 0, `the refused dispatch was replayed after a reload: ${pushes.join(" | ")}`);
 	} finally {
 		ADAPTERS.kimi.buildDispatch = original;
+		restoreDriver();
 	}
 });
 

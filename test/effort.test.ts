@@ -128,10 +128,13 @@ test("one-shot: off is an explicit override, not the same as omitting effort", (
 	assert.equal(effortPayload(reasonix.argv), "disabled");
 });
 
-test("one-shot kimi: effort is never forwarded (refusal is enforced upstream)", () => {
+test("one-shot kimi: effort is never forwarded — the print spelling refuses it instead", () => {
+	// The level travels over the session (the `thinking` config option); print
+	// mode has no knob at all, so the request is refused rather than dropped.
 	const dispatch = ADAPTERS.kimi.buildDispatch({ task: "t", cwd: "/tmp", mode: "yolo", effort: "high" });
 	assert.equal(effortPayload(dispatch.argv), undefined);
 	assert.equal(dispatch.effort.forwarded, false);
+	assert.match(dispatch.refusal ?? "", /only inside its ACP session/);
 });
 
 test("persistent pi rpc: omitted effort adds no --thinking; explicit level is forwarded", () => {

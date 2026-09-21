@@ -411,6 +411,8 @@ export function enforcementDisplay(receipt: DispatchReceipt): string {
 			return "cli-mode (dontAsk denies everything not pre-approved)";
 		case "driver-rejected-prompts":
 			return "driver-rejected prompts (confines only ≤1.38.7; fail-open from 1.38.8)";
+		case "plan-mode-guard":
+			return "plan-mode guard (Write/Edit vetoed) + driver-rejected prompts (fail-closed backstop)";
 		case "not-enforced":
 			return "NOT enforced by target harness";
 		default:

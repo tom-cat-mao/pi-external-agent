@@ -1041,7 +1041,7 @@ export function registerHubTools(pi: ExtensionAPI): void {
 		description: [
 			"Send a mid-run guidance message to a running external agent task: correct the approach, narrow the scope,",
 			"add a constraint, or tell it to wrap up early (to cancel instead, use external_agent_stop). Supported:",
-			`${STEER_AGENTS}; the others are one-shot. Qoder steering requires qodercli stable >= 1.1.49 and is refused`,
+			`${STEER_AGENTS}; kimi is persistent but has no steer. Qoder steering requires qodercli stable >= 1.1.49 and is refused`,
 			"with the reported version otherwise. For a settled task, use external_agent_follow_up.",
 		].join(" "),
 		promptSnippet: "Redirect a running external agent task mid-run",

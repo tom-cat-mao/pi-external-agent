@@ -8,9 +8,11 @@
  *
  * Capabilities as currently wired:
  *   codex     -> OpenAI; yolo workhorse with its own sandbox tiers (read-only / workspace-write / danger-full-access)
- *   kimi      -> Moonshot; yolo-only because a headless run cannot select a lower tier:
- *                -p rejects every permission flag and forces Never Ask, so readonly/write are refused.
- *                Why: .agents/notes/implemented/2026-09-21-receipt-label-truth-pass.md
+ *   kimi      -> Moonshot; yolo default, all three tiers over its ACP session: readonly is plan
+ *                mode (its guard vetoes Write/Edit) plus the driver rejecting permission
+ *                prompts, write is auto, yolo is yolo. Its one-shot print spelling rejects
+ *                every permission flag and forces Never Ask, so that spelling is yolo-only.
+ *                Why: .agents/notes/implemented/2026-09-21-kimi-acp-driver.md
  *   codebuddy -> Tencent; Claude-Code-compatible surface, yolo default (all tiers open);
  *                readonly runs default mode with a runtime-built --settings hook.
  *                Why: .agents/notes/implemented/2026-09-07-codebuddy-readonly-hook.md
@@ -29,7 +31,9 @@
  *   codebuddy -> --effort <minimal|low|medium|high|xhigh|max>
  *   claude    -> --effort <low|medium|high|xhigh|max>
  *   codex     -> -c model_reasoning_effort="<off|minimal|low|medium|high|xhigh>" (no dedicated flag; "off" -> "none")
- *   kimi      -> none; requests are refused
+ *   kimi      -> none on the one-shot path (refused, see KIMI_ONESHOT_EFFORT_REFUSAL);
+ *                inside an ACP session: session/set_config_option thinking <level>, sent
+ *                verbatim and validated against the vocabulary session/new advertises
  *   reasonix  -> --effort <LEVEL> mapped onto the relay's vocabulary disabled|low|high|max
  *   qoder     -> --reasoning-effort <off|low|medium|high|xhigh|max> (no "minimal")
  *   dsh       -> none on the one-shot path (refused, see DSH_ONESHOT_EFFORT_REFUSAL);
@@ -172,6 +176,7 @@ export const READ_ONLY_ENFORCEMENTS = [
 	"harness-enforced",
 	"cli-mode",
 	"driver-rejected-prompts",
+	"plan-mode-guard",
 	"not-enforced",
 	"not-applicable",
 ] as const;
@@ -635,8 +640,65 @@ function claudeFamily(
 }
 
 // ---------------------------------------------------------------------------
-// Kimi — stream-json execution workhorse; no read-only sandbox exists headless
+// Kimi — ACP sessions carry real tiers; the print spelling is yolo-only
 // ---------------------------------------------------------------------------
+
+/**
+ * Why a mode below yolo is refused on kimi's one-shot spelling. `-p` rejects
+ * every permission flag (options.ts:79-87 throws OptionConflictError for
+ * --yolo/--auto/--plan) and the print path forces Never Ask (auto) —
+ * run-v2-print.ts:481 setMode('auto') — so that spelling selects no tier at
+ * all: not below yolo, and not above it either, since Never Ask is more
+ * permissive than yolo (Ask When Needed). Static [[permission.rules]] denies
+ * still bind. The ACP session is where the tiers are real, and it is the path
+ * every dispatch takes.
+ */
+const KIMI_ONESHOT_TIER_REFUSAL =
+	"kimi's one-shot print spelling is yolo-only: -p rejects every permission flag and forces Never Ask (auto), so it can select no tier at all. " +
+	"Over its ACP session the tiers are real (readonly is plan mode plus the driver rejecting permission prompts), and that is the path a dispatch takes.";
+
+/**
+ * Why an effort request is refused on the one-shot spelling: print mode has no
+ * effort knob at all (the level travels as the session's `thinking` config
+ * option over ACP), so forwarding it here would drop it silently.
+ */
+const KIMI_ONESHOT_EFFORT_REFUSAL =
+	"kimi forwards reasoning effort only inside its ACP session (session/set_config_option thinking); " +
+	"its one-shot print spelling has no effort knob, so the request is refused rather than dropped. " +
+	"Drop the effort parameter, or run kimi over its persistent session.";
+
+/**
+ * What a kimi session's tier really bounds. readonly is plan mode — the guard
+ * vetoes Write/Edit before approval, which is what makes the label true: in
+ * every other mode `git-cwd-write-approve` silently approves in-workspace
+ * writes and edits, and the driver rejecting every permission request is the
+ * fail-closed backstop behind the guard.
+ *
+ * The two upper tiers are not the same mechanism, and the receipt must not
+ * claim they are: in `auto` the dangerous-command guard short-circuits and
+ * `auto-mode-approve` then approves every tool call, so a dangerous Bash
+ * command runs with no ask at all — while `yolo` is the mode where that ask
+ * survives and the driver allows it. AskUserQuestion runs the other way:
+ * denied in auto, approved in yolo.
+ */
+function kimiSessionPolicy(mode: Mode): string {
+	if (mode === "readonly") {
+		return (
+			"kimi plan mode: the guard vetoes Write/Edit before approval (every other mode quietly approves in-workspace writes " +
+			"and edits), and the driver rejects every session/request_permission as a fail-closed backstop"
+		);
+	}
+	if (mode === "write") {
+		return (
+			"kimi auto mode: the dangerous-command ask does not fire (the guard short-circuits in auto, and auto-mode-approve then approves " +
+			"every tool call), so dangerous Bash runs unasked; the driver allows any ask a user-configured rule still raises, and AskUserQuestion is denied"
+		);
+	}
+	return (
+		"kimi yolo mode: dangerous-command asks survive and the driver allows them (write/auto raises none); " +
+		"AskUserQuestion is approved"
+	);
+}
 
 const kimiAdapter: Adapter = {
 	id: "kimi",
@@ -644,26 +706,27 @@ const kimiAdapter: Adapter = {
 	provider: "Moonshot",
 	useFor:
 		"Execution workhorse like codex and pi: code writing and task execution. " +
-		"yolo only — -p rejects every permission flag and forces Never Ask, so no lower tier can be requested.",
+		"All three tiers are real over its ACP session; write and yolo differ in how kimi's own asks are handled (auto raises none).",
 	defaultMode: "yolo",
 	maxMode: "yolo",
-	// yolo-only by design (user decision 2026-09-07; rationale corrected
-	// 2026-09-21 against kimi-code 2.0.2 source). Print mode has exactly one
-	// real behavior: `-p` rejects --yolo/--auto/--plan outright
-	// (options.ts:79-87 throws OptionConflictError for each), and
-	// run-v2-print.ts:481 forces setMode("auto") — Never Ask — so config.toml's
-	// default_permission_mode is never consulted and no tier, not even yolo,
-	// is pinned. Never Ask is more permissive than yolo (Ask When Needed), so
-	// yolo is not a ceiling either; only static [[permission.rules]] denies
-	// still bind. A lower tier would put an unenforceable label on the
-	// receipt, so readonly/write are refused at dispatch.
-	minMode: "yolo",
-	minModeNote: "-p rejects every permission flag and forces Never Ask, so a headless run cannot select a lower tier.",
-	enforcesReadOnly: false,
-	buildDispatch({ task, model, effort }) {
+	// The one-shot spelling's floor does not apply to the session path, which
+	// serves every tier (see KIMI_ONESHOT_TIER_REFUSAL for the print-mode floor).
+	supportedEfforts: EFFORT_LEVELS,
+	session: {
+		steer: false,
+		followUp: true,
+		steerNote:
+			"none: a concurrent session/prompt during an active turn is rejected (-32600) and kimi advertises no steer method, so guidance waits for the turn to end",
+	},
+	sessionPolicy: kimiSessionPolicy,
+	// Not a sandbox: the plan-mode guard plus the driver's rejections are the
+	// two layers a readonly run stands on, and the receipt names both.
+	readonlyEnforcement: "plan-mode-guard",
+	enforcesReadOnly: true,
+	buildDispatch({ task, mode, model, effort }) {
 		const argv = ["-p", task, "--output-format", "stream-json"];
 		if (model) argv.push("--model", model);
-		return {
+		const dispatch: AdapterDispatch = {
 			argv,
 			promptArgIndex: 1,
 			cwdForwardedToCli: false,
@@ -680,8 +743,17 @@ const kimiAdapter: Adapter = {
 					note: "Passed to kimi as --model (a model alias from config.toml; the flag exists since kimi-code 0.36.x).",
 				}
 				: { forwarded: false, note: "No model override requested; kimi's default_model in config.toml applies." },
-			effort: effortReceipt(effort, false, "kimi has no reasoning-effort flag; refused upstream, nothing forwarded."),
+			effort: effortReceipt(
+				effort,
+				false,
+				`NOT forwarded on this path: ${KIMI_ONESHOT_EFFORT_REFUSAL}`,
+			),
 		};
+		// Both refusals are this spelling's own: the session path serves every
+		// tier and forwards effort, so neither is a kimi-wide limit.
+		if (mode !== "yolo") return { ...dispatch, refusal: KIMI_ONESHOT_TIER_REFUSAL };
+		if (effort) return { ...dispatch, refusal: KIMI_ONESHOT_EFFORT_REFUSAL };
+		return dispatch;
 	},
 	// stream-json in kimi-code 0.36.x emits OpenAI-style chat records, one per
 	// line — this is NOT the Claude-Code-shaped format an earlier revision

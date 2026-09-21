@@ -1,5 +1,5 @@
 /**
- * ACP over stdio (reasonix, codebuddy, dsh).
+ * ACP over stdio (reasonix, codebuddy, dsh, kimi).
  *
  * reasonix initialize advertises _meta["reasonix.io"].sessionSteer.method; read
  * the advertised name, never hardcode it. `--acp` accepts --model but rejects
@@ -9,8 +9,16 @@
  * session/prompt on the active session. dsh spells the same entry point as a
  * profile (`--profile acp`, verified 0.1.5-rc.2) followed by `--patch` and its
  * overlay, and has no effort flag either, but its session exposes a
- * reasoning_effort config option, so effort is forwarded with
- * session/set_config_option.
+ * reasoning_effort config option. kimi spells it as a subcommand (`kimi acp`,
+ * verified against kimi-code 2.0.2): four modes (default/plan/auto/yolo), a
+ * non-idempotent session/set_mode, a thinking config option whose vocabulary
+ * session/new advertises, and no steer at all.
+ *
+ * The start path is spawn → initialize → session/new → configureSession phase
+ * → first prompt. The configure phase is the one place that settles the
+ * session's mode, effort and model; a dialect opts in by declaring
+ * AcpDialect.configureSession, and a dialect that declares nothing sends
+ * nothing between session/new and the prompt.
  */
 
 import { ADAPTERS, type AgentEvent, type AgentId, type Effort, type Mode } from "../adapters.ts";
@@ -25,15 +33,50 @@ import {
 } from "./base.ts";
 
 // ---------------------------------------------------------------------------
-// ACP (reasonix, codebuddy, dsh)
+// ACP (reasonix, codebuddy, dsh, kimi)
 // ---------------------------------------------------------------------------
+
+/** One config option session/new advertised for the new session. */
+export interface AcpConfigOption {
+	id?: unknown;
+	currentValue?: unknown;
+	values?: unknown;
+	options?: unknown;
+	[k: string]: unknown;
+}
+
+/**
+ * What the configure phase hands a dialect: the session it may configure, the
+ * request it was dispatched with, the vocabulary session/new advertised, and
+ * the two ways to speak to the harness.
+ */
+export interface AcpSessionConfig {
+	sessionId: string;
+	/** The tier the caller asked for, already checked against the adapter's modes. */
+	mode: Mode;
+	model?: string;
+	effort?: Effort;
+	/** Config options session/new advertised; a session that advertises none gets `[]`. */
+	configOptions: AcpConfigOption[];
+	/**
+	 * session/set_mode spelling, carrying the configure phase's own tolerance: a
+	 * rejection the dialect classifies (benignModeRejection) as "the session is
+	 * already in the mode being set" is a no-op, and every other rejection
+	 * throws — which fails the session start, so no prompt can run under a tier
+	 * the caller did not ask for.
+	 */
+	setMode(modeId: string): Promise<void>;
+	/** Any further wire call the dialect needs (session/set_config_option today). */
+	call(method: string, params: unknown): Promise<any>;
+}
 
 export interface AcpDialect {
 	id: AgentId;
 	/**
 	 * The whole ACP entry argv. Every dialect but dsh speaks ACP behind a bare
-	 * `--acp` (the default); dsh spells it as `--profile acp`, and a dialect
-	 * replaces the entry instead of appending to a hardcoded flag.
+	 * `--acp` (the default); dsh spells it as `--profile acp`, kimi as the `acp`
+	 * subcommand, and a dialect replaces the entry instead of appending to a
+	 * hardcoded flag.
 	 */
 	acpArgv?: string[];
 	/** Extra argv appended after the ACP entry. */
@@ -54,21 +97,61 @@ export interface AcpDialect {
 	prepare?: (input: SessionStartInput) => { env?: Record<string, string | undefined>; warning?: string } | undefined;
 	failClosedPermissionModes?: Mode[];
 	/**
-	 * Effort forwarding over the protocol, for dialects whose CLI has no effort
-	 * flag (dsh: set reasoning_effort to the mapped level after session/new).
-	 * Dialects with a real flag (codebuddy) carry it in baseArgv and leave this
-	 * unset. A rejected set_config_option fails the session start — the turn
-	 * must never run at a default the caller did not ask for.
+	 * OPT-IN: everything the dialect must settle on the session between
+	 * session/new and the first prompt — the mode (kimi: session/set_mode),
+	 * effort and model (both: session/set_config_option). Unset means the driver
+	 * sends nothing in that window, which is what reasonix and codebuddy do: the
+	 * timing is the driver's, the wire calls are the dialect's.
+	 *
+	 * A rejection fails the session start with the CLI's own error, so a turn
+	 * never runs at a mode, effort or model the caller did not ask for. The one
+	 * tolerance is a mode set the dialect classifies as already-in-that-state:
+	 * the session IS in the requested mode, which is the requested outcome.
 	 */
-	effort?: { configId: string; token: (effort: Effort) => string };
+	configureSession?: (ctx: AcpSessionConfig) => Promise<void>;
+	/**
+	 * Classifies a session/set_mode rejection as "the session is already in the
+	 * mode that was requested", so there is nothing left to set. It receives the
+	 * REQUESTED mode id along with the failure text, so a conflict that names a
+	 * different mode can never pass — that would mean the session is somewhere
+	 * else, which is exactly what the fail-closed policy must not swallow. The
+	 * failure text is what the plumbing surfaces: message first, plus whatever
+	 * the error carried in data.details (kimi hides the real words there).
+	 *
+	 * Only mode sets are classified: kimi's set_mode is not idempotent (setting
+	 * plan while in plan throws), while an effort or model rejection always
+	 * fails the start — those decide how the turn runs and what it costs.
+	 */
+	benignModeRejection?: (message: string, modeId: string) => boolean;
+	/**
+	 * Rewrite a session/new failure into the dialect's own actionable text
+	 * (kimi: a logged-out CLI answers -32000, whose human message is an auth
+	 * complaint the caller can act on by running `kimi login`). The JSON-RPC
+	 * plumbing carries only the message, not the code, so the dialect maps what
+	 * it gets. Returning undefined keeps the original failure.
+	 */
+	sessionNewHint?: (err: Error) => string | undefined;
+	/**
+	 * Whether mid-run guidance can be delivered as a second session/prompt on
+	 * the active session (codebuddy, dsh). Default true. kimi rejects a
+	 * concurrent prompt with -32600 and advertises no steer method, so claiming
+	 * acceptance there would report guidance that was never delivered.
+	 */
+	steerViaConcurrentPrompt?: boolean;
 }
 
 /** The ACP entry flag every dialect but dsh uses. */
 const DEFAULT_ACP_ARGV = ["--acp"];
 
-const ACP_METHODS = {
+/**
+ * The ACP methods this driver speaks, exported because a dialect's
+ * configureSession performs wire calls of its own and must spell them the same
+ * way the handshake does.
+ */
+export const ACP_METHODS = {
 	initialize: "initialize",
 	sessionNew: "session/new",
+	sessionSetMode: "session/set_mode",
 	sessionPrompt: "session/prompt",
 	sessionCancel: "session/cancel",
 	sessionSetConfigOption: "session/set_config_option",
@@ -164,24 +247,77 @@ export class AcpDriver extends BaseSessionDriver implements SessionDriver {
 			}
 		}
 
-		const created = await this.request(ACP_METHODS.sessionNew, { cwd: input.cwd, mcpServers: [] }, HANDSHAKE_TIMEOUT_MS);
+		const created = await this.openSession(input);
 		this.sessionId = created?.sessionId;
 		if (!this.sessionId) throw new Error(`${this.dialect.id} ACP returned no sessionId`);
-
-		// Effort, for dialects whose CLI has no flag for it: set the session
-		// config option before the first turn. The rejection is deliberately not
-		// caught — the session start fails with the CLI's own error, so a run
-		// never proceeds at a default the caller did not ask for.
-		const effort = this.dialect.effort;
-		if (input.effort && effort) {
-			await this.request(
-				ACP_METHODS.sessionSetConfigOption,
-				{ sessionId: this.sessionId, configId: effort.configId, value: effort.token(input.effort) },
-				HANDSHAKE_TIMEOUT_MS,
-			);
-		}
+		// Dispatched once per session, from here: steer and follow-up never
+		// re-configure. A re-run on the same session would be a no-op by design —
+		// the mode set lands as "already in … mode", which the tolerance covers,
+		// and an effort/model re-set only restates what is in force — but this
+		// dispatch is not atomic with those paths: nothing serializes a configure
+		// against a prompt. No concurrent prompt exists in the hub today (a steer
+		// needs an active turn, which begins only after this phase resolves), so
+		// the window cannot be reached.
+		const configure = this.dialect.configureSession;
+		if (configure) await this.configureSession(configure, input, created);
 
 		this.startPrompt(input.task);
+	}
+
+	/**
+	 * session/new, with the dialect's chance to turn a failure into actionable
+	 * text: a logged-out kimi answers -32000, and the plumbing that rejects the
+	 * request carries the message but not the code.
+	 */
+	private async openSession(input: SessionStartInput): Promise<any> {
+		try {
+			return await this.request(ACP_METHODS.sessionNew, { cwd: input.cwd, mcpServers: [] }, HANDSHAKE_TIMEOUT_MS);
+		} catch (err) {
+			const failure = err instanceof Error ? err : new Error(String(err));
+			const hint = this.dialect.sessionNewHint?.(failure);
+			if (hint) throw new Error(hint);
+			throw failure;
+		}
+	}
+
+	/**
+	 * The configure phase: the one place that settles the session's mode, effort
+	 * and model — after session/new, before the first prompt, once per session.
+	 * The dialect performs the wire calls, the driver owns the timing and the
+	 * fail-closed policy: anything the dialect cannot settle fails the session
+	 * start, so no prompt is ever sent under a configuration the caller did not
+	 * ask for.
+	 */
+	private async configureSession(
+		configure: (ctx: AcpSessionConfig) => Promise<void>,
+		input: SessionStartInput,
+		created: any,
+	): Promise<void> {
+		const sessionId = this.sessionId;
+		if (!sessionId) throw new Error(`${this.dialect.id} ACP returned no sessionId`);
+		const call = (method: string, params: unknown) => this.request(method, params, HANDSHAKE_TIMEOUT_MS);
+		const setMode = async (modeId: string): Promise<void> => {
+			try {
+				await call(ACP_METHODS.sessionSetMode, { sessionId, modeId });
+			} catch (err) {
+				const message = err instanceof Error ? err.message : String(err);
+				// Tolerated only when the dialect recognises this as "already in
+				// the mode that was requested": the session is in the requested
+				// state, so there is nothing left to set. A conflict about any
+				// other mode — or any other rejection — stays fatal.
+				if (this.dialect.benignModeRejection?.(message, modeId)) return;
+				throw err;
+			}
+		};
+		await configure({
+			sessionId,
+			mode: input.mode,
+			model: input.model,
+			effort: input.effort,
+			configOptions: Array.isArray(created?.configOptions) ? (created.configOptions as AcpConfigOption[]) : [],
+			setMode,
+			call,
+		});
 	}
 
 	async followUp(message: string): Promise<void> {
@@ -218,9 +354,19 @@ export class AcpDriver extends BaseSessionDriver implements SessionDriver {
 			}
 		}
 
-		// No advertised steer method (codebuddy): a second prompt on the active
-		// session is the steer. Its response only lands when the turn ends, so it
-		// is deliberately not tracked as this turn's own prompt.
+		// No advertised steer method: for codebuddy and dsh a second prompt on
+		// the active session is the steer. Its response only lands when the turn
+		// ends, so it is deliberately not tracked as this turn's own prompt — and
+		// a rejection is swallowed, because a steer that arrived too late to be
+		// accepted must not fail the task. A dialect whose harness REJECTS a
+		// concurrent prompt outright (kimi: -32600) must not come through here:
+		// swallowing that rejection would report guidance that never landed.
+		if (this.dialect.steerViaConcurrentPrompt === false) {
+			return {
+				accepted: false,
+				reason: `${this.dialect.id} has no mid-run steering: a concurrent session/prompt is rejected, and no steer method is advertised`,
+			};
+		}
 		void this
 			.request(ACP_METHODS.sessionPrompt, { sessionId: this.sessionId, prompt: [{ type: "text", text: message }] }, 0)
 			.catch(() => undefined);
@@ -359,6 +505,10 @@ export class AcpDriver extends BaseSessionDriver implements SessionDriver {
 				return;
 			}
 			case "usage_update": {
+				// kimi never advertises this one: its initialize lists only
+				// loadSession, prompt/session/mcp capabilities and auth, and the
+				// figure still arrives (same status as dsh's set_config_option in
+				// its capabilities list) — so it is parsed, not required.
 				if (typeof update.used === "number") {
 					const size = typeof update.size === "number" ? `/${update.size}` : "";
 					this.emit({ kind: "usage", text: `ctx=${update.used}${size}` });
