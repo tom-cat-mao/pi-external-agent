@@ -995,7 +995,11 @@ export function effortSessionNote(agent: AgentId, effort: Effort): string {
 		return `Set inside the ACP session as session/set_config_option reasoning_effort=${dshEffortToken(effort)}; dsh accepts effort only there, never on its one-shot path.`;
 	}
 	if (agent === "kimi") {
-		return `Set inside the ACP session as session/set_config_option thinking=${kimiThinkingToken(effort)}; kimi advertises that vocabulary per session, and a level it does not offer fails the start rather than being sent.`;
+		return (
+			`Set inside the ACP session as session/set_config_option thinking=${kimiThinkingToken(effort)}; kimi advertises that vocabulary per session, ` +
+			"and a level it does not offer fails the start rather than being sent — so this `forwarded` claim is asserted before the handshake, and the " +
+			"session either delivers the level or fails loudly; it is never silently dropped."
+		);
 	}
 	return `Passed to the persistent session for "${effort}".`;
 }

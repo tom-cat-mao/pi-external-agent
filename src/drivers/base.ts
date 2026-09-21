@@ -223,6 +223,29 @@ interface PendingRequest {
 	method: string;
 }
 
+/**
+ * The real failure text a JSON-RPC error hides in `error.data.details`. A
+ * harness that wraps every engine failure in one fixed message puts the human
+ * words there (kimi answers a plan→plan mode set with message "Internal error"
+ * and data.details "Already in plan mode"), so a driver matching on the
+ * rejection's text — or reporting it to the caller — never sees the reason
+ * otherwise. A string is used as it is; a structured value is JSON-encoded, so
+ * nothing is dropped. Returns "" when there is no such field, which keeps an
+ * error that carries only a message surfaced exactly as it was.
+ */
+function errorDataDetails(data: unknown): string {
+	if (!data || typeof data !== "object") return "";
+	const details = (data as { details?: unknown }).details;
+	if (typeof details === "string") return details.trim().slice(0, 500);
+	if (details === undefined || details === null) return "";
+	try {
+		const encoded = JSON.stringify(details);
+		return encoded && encoded !== "{}" ? encoded.slice(0, 500) : "";
+	} catch {
+		return "";
+	}
+}
+
 abstract class JsonRpcConnection extends StdioProcess {
 	private nextId = 1;
 	private readonly pending = new Map<number, PendingRequest>();
@@ -308,7 +331,7 @@ abstract class JsonRpcConnection extends StdioProcess {
 			// A message carrying both method and id is a request we must answer;
 			// without an id it is a fire-and-forget notification. Only NUMERIC
 			// ids are routed as requests: JSON-RPC 2.0 also allows string ids,
-			// and the ACP dialects (reasonix, codebuddy, dsh) number their
+			// and the ACP dialects (reasonix, codebuddy, dsh, kimi) number their
 			// requests with integers, which is the type respond() replies in. A
 			// string-id request would fall through to the notification callback
 			// and never be answered — the ACP contract, not a case to guess at.
@@ -326,7 +349,10 @@ abstract class JsonRpcConnection extends StdioProcess {
 			if (entry.timer) clearTimeout(entry.timer);
 			if (msg.error) {
 				const detail = typeof msg.error.message === "string" ? msg.error.message : JSON.stringify(msg.error);
-				entry.reject(new Error(`${entry.method}: ${detail}`));
+				// Message first, then whatever the error quarantined in
+				// data.details: the message alone is often a fixed wrapper.
+				const hidden = errorDataDetails(msg.error.data);
+				entry.reject(new Error(`${entry.method}: ${detail}${hidden ? ` — ${hidden}` : ""}`));
 			} else {
 				entry.resolve(msg.result);
 			}

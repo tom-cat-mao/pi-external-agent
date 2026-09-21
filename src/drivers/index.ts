@@ -13,7 +13,7 @@
  *
  *   PiRpcDriver           pi --mode rpc        — line JSON commands + events
  *   CodexAppServerDriver  codex app-server     — JSON-RPC 2.0, experimental
- *   AcpDriver             reasonix/codebuddy/dsh — JSON-RPC 2.0 ACP over stdio
+ *   AcpDriver             reasonix/codebuddy/dsh/kimi — JSON-RPC 2.0 ACP over stdio
  *   ClaudeStreamJsonDriver claude              — LF stream-json (anthropic contract)
  *   QoderStreamJsonDriver  qoder               — LF stream-json with version gate
  *
@@ -92,6 +92,23 @@ const KIMI_MODE_IDS: Record<Mode, string> = { readonly: "plan", write: "auto", y
 
 function kimiModeId(mode: Mode): string {
 	return KIMI_MODE_IDS[mode];
+}
+
+/**
+ * The one session/set_mode rejection kimi's configure phase tolerates: the
+ * session is ALREADY in the mode that was requested, so there is nothing left
+ * to set (set_mode is not idempotent, and a session can boot in a mode of its
+ * own). kimi does not put that text in the JSON-RPC error message — a plan→plan
+ * conflict arrives as message "Internal error" with "Already in plan mode" in
+ * data.details, which the plumbing surfaces alongside the message.
+ *
+ * The requested mode id has to be named by the rejection. "already in" some
+ * OTHER mode means the session is somewhere else than what was asked for, which
+ * is precisely the case the fail-closed policy must not swallow.
+ */
+function kimiBenignModeRejection(message: string, modeId: string): boolean {
+	const requested = modeId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+	return new RegExp(`\\balready\\b[\\s\\S]*\\bin\\b[\\s\\S]*\\b${requested}\\b`, "i").test(message);
 }
 
 /**
@@ -254,10 +271,11 @@ export const SESSION_DRIVERS: Partial<Record<AgentId, () => SessionDriver>> = {
 			// request; write/yolo let the harness's own asks through, because
 			// those tiers permit them.
 			failClosedPermissionModes: ["readonly"],
-			// kimi's set_mode is not idempotent (plan while in plan throws), and a
-			// resumed session boots in its last mode. Only that rejection is
-			// benign; any other mode, effort or model rejection fails the start.
-			benignModeRejection: /\balready\b[\s\S]*\bmode\b/i,
+			// kimi's set_mode is not idempotent (plan while in plan throws) and a
+			// session can boot in a mode of its own. Only a rejection that names
+			// the requested mode as already in force is benign; any other mode,
+			// effort or model rejection fails the start.
+			benignModeRejection: kimiBenignModeRejection,
 			sessionNewHint: kimiLoginHint,
 			// A concurrent session/prompt during an active turn is rejected with
 			// -32600 and no steer method is advertised, so kimi has no steer.

@@ -11,8 +11,10 @@
  *   - the configure phase sets the tier with session/set_mode before the first
  *     prompt (readonly->plan, write->auto, yolo->yolo), and a rejection fails
  *     the start so no prompt runs under another tier. The one tolerated
- *     rejection is `already in plan mode` — the session IS in the requested
- *     state, which is what a resumed session looks like;
+ *     rejection is `already in <the requested mode>` — the session IS in the
+ *     requested state — and it arrives the way the real harness sends it: a
+ *     fixed "Internal error" message with the engine's own words in
+ *     error.data.details;
  *   - effort goes as session/set_config_option thinking=<level>, sent verbatim
  *     and only when the session advertises that level: kimi's vocabulary is
  *     read off session/new, and an unadvertised level fails the start instead
@@ -106,7 +108,8 @@ record({ kind: "spawn", argv: process.argv.slice(2), env: {
 const hold = process.env.KIMI_MOCK_HOLD === "1";
 const sessionNewError = process.env.KIMI_MOCK_SESSION_NEW_ERROR || null;
 const setModeError = process.env.KIMI_MOCK_SET_MODE_ERROR || null;
-const alreadyInMode = process.env.KIMI_MOCK_ALREADY_IN_MODE === "1";
+const modeConflict = process.env.KIMI_MOCK_MODE_CONFLICT || null;
+const modeConflictJson = process.env.KIMI_MOCK_MODE_CONFLICT_JSON || null;
 const failConfig = process.env.KIMI_MOCK_FAIL_CONFIG === "1";
 const lateUsage = process.env.KIMI_MOCK_LATE_USAGE === "1";
 const historyBurst = process.env.KIMI_MOCK_HISTORY === "1";
@@ -198,8 +201,16 @@ function handle(msg) {
       send({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: setModeError } });
       return;
     }
-    if (alreadyInMode && msg.params.modeId === "plan") {
-      send({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "Already in plan mode" } });
+    if (modeConflict) {
+      // The real shape of a plan->plan conflict: the engine's own words are
+      // quarantined in data.details behind a fixed message (the ACP server maps
+      // a thrown engine error with errorToResult -> internalError({details})).
+      send({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: "Internal error", data: { details: "Already in " + modeConflict + " mode" } } });
+      return;
+    }
+    if (modeConflictJson) {
+      // A structured data.details: the plumbing must not drop it either.
+      send({ jsonrpc: "2.0", id: msg.id, error: { code: -32603, message: "Internal error", data: { details: JSON.parse(modeConflictJson) } } });
       return;
     }
     send({ jsonrpc: "2.0", id: msg.id, result: { modeId: msg.params.modeId } });
@@ -469,14 +480,50 @@ test("kimi ACP session sets the tier with session/set_mode before the first prom
 });
 
 test("kimi ACP session: `already in plan mode` is tolerated — the session IS in the requested state", async () => {
-	// What a resumed session looks like: it boots in the mode it was left in, and
-	// set_mode is not idempotent there.
-	const harness = makeHarness("kimi", { KIMI_MOCK_ALREADY_IN_MODE: "1" });
+	// A session that boots in the mode it was left in, set against a non-idempotent
+	// set_mode. The engine's words reach the driver only because the plumbing
+	// surfaces error.data.details behind the fixed "Internal error" message.
+	const harness = makeHarness("kimi", { KIMI_MOCK_MODE_CONFLICT: "plan" });
 	try {
 		await harness.start({ mode: "readonly", task: "audit only" });
 		const prompt = await waitFor("the first session/prompt", () => ofKind(harness.records(), "prompt")[0]);
 		assert.equal(prompt.text, "audit only");
 		assert.deepEqual(await harness.turnOutcome(), { status: "done" });
+	} finally {
+		harness.stop();
+	}
+});
+
+test("kimi ACP session: a mode conflict that names ANOTHER mode fails the start", async () => {
+	// "Already in auto mode" while plan was requested: the session is NOT in the
+	// requested state, so the tolerance must not swallow it — the prompt would
+	// otherwise run under a tier the caller did not ask for.
+	const harness = makeHarness("kimi", { KIMI_MOCK_MODE_CONFLICT: "auto" });
+	try {
+		await assert.rejects(
+			() => harness.start({ mode: "readonly" }),
+			(err: Error) => {
+				assert.match(err.message, /session\/set_mode: Internal error — Already in auto mode/);
+				return true;
+			},
+		);
+		assert.deepEqual(ofKind(harness.records(), "prompt"), [], "the turn ran under a tier the caller did not ask for");
+	} finally {
+		harness.stop();
+	}
+});
+
+test("kimi ACP session: a structured error.data.details is surfaced too", async () => {
+	const harness = makeHarness("kimi", { KIMI_MOCK_MODE_CONFLICT_JSON: JSON.stringify({ reason: "mode_conflict", modeId: "plan" }) });
+	try {
+		await assert.rejects(
+			() => harness.start({ mode: "readonly" }),
+			(err: Error) => {
+				assert.match(err.message, /session\/set_mode: Internal error — \{"reason":"mode_conflict","modeId":"plan"\}/);
+				return true;
+			},
+		);
+		assert.deepEqual(ofKind(harness.records(), "prompt"), []);
 	} finally {
 		harness.stop();
 	}

@@ -33,7 +33,7 @@ import {
 } from "./base.ts";
 
 // ---------------------------------------------------------------------------
-// ACP (reasonix, codebuddy, dsh)
+// ACP (reasonix, codebuddy, dsh, kimi)
 // ---------------------------------------------------------------------------
 
 /** One config option session/new advertised for the new session. */
@@ -61,9 +61,9 @@ export interface AcpSessionConfig {
 	/**
 	 * session/set_mode spelling, carrying the configure phase's own tolerance: a
 	 * rejection the dialect classifies (benignModeRejection) as "the session is
-	 * already in that mode" is a no-op, and every other rejection throws — which
-	 * fails the session start, so no prompt can run under a tier the caller did
-	 * not ask for.
+	 * already in the mode being set" is a no-op, and every other rejection
+	 * throws — which fails the session start, so no prompt can run under a tier
+	 * the caller did not ask for.
 	 */
 	setMode(modeId: string): Promise<void>;
 	/** Any further wire call the dialect needs (session/set_config_option today). */
@@ -110,13 +110,19 @@ export interface AcpDialect {
 	 */
 	configureSession?: (ctx: AcpSessionConfig) => Promise<void>;
 	/**
-	 * Matches a session/set_mode rejection that means "the session is already in
-	 * that mode". Only mode sets are classified: kimi's set_mode is not
-	 * idempotent (setting plan while in plan throws), and a resumed session boots
-	 * in its last mode — while an effort or model rejection always fails the
-	 * start, because those decide how the turn runs and what it costs.
+	 * Classifies a session/set_mode rejection as "the session is already in the
+	 * mode that was requested", so there is nothing left to set. It receives the
+	 * REQUESTED mode id along with the failure text, so a conflict that names a
+	 * different mode can never pass — that would mean the session is somewhere
+	 * else, which is exactly what the fail-closed policy must not swallow. The
+	 * failure text is what the plumbing surfaces: message first, plus whatever
+	 * the error carried in data.details (kimi hides the real words there).
+	 *
+	 * Only mode sets are classified: kimi's set_mode is not idempotent (setting
+	 * plan while in plan throws), while an effort or model rejection always
+	 * fails the start — those decide how the turn runs and what it costs.
 	 */
-	benignModeRejection?: RegExp;
+	benignModeRejection?: (message: string, modeId: string) => boolean;
 	/**
 	 * Rewrite a session/new failure into the dialect's own actionable text
 	 * (kimi: a logged-out CLI answers -32000, whose human message is an auth
@@ -244,6 +250,14 @@ export class AcpDriver extends BaseSessionDriver implements SessionDriver {
 		const created = await this.openSession(input);
 		this.sessionId = created?.sessionId;
 		if (!this.sessionId) throw new Error(`${this.dialect.id} ACP returned no sessionId`);
+		// Dispatched once per session, from here: steer and follow-up never
+		// re-configure. A re-run on the same session would be a no-op by design —
+		// the mode set lands as "already in … mode", which the tolerance covers,
+		// and an effort/model re-set only restates what is in force — but this
+		// dispatch is not atomic with those paths: nothing serializes a configure
+		// against a prompt. No concurrent prompt exists in the hub today (a steer
+		// needs an active turn, which begins only after this phase resolves), so
+		// the window cannot be reached.
 		const configure = this.dialect.configureSession;
 		if (configure) await this.configureSession(configure, input, created);
 
@@ -288,9 +302,10 @@ export class AcpDriver extends BaseSessionDriver implements SessionDriver {
 			} catch (err) {
 				const message = err instanceof Error ? err.message : String(err);
 				// Tolerated only when the dialect recognises this as "already in
-				// that mode": the session is in the requested state, so there is
-				// nothing left to set. Every other rejection stays fatal.
-				if (this.dialect.benignModeRejection?.test(message)) return;
+				// the mode that was requested": the session is in the requested
+				// state, so there is nothing left to set. A conflict about any
+				// other mode — or any other rejection — stays fatal.
+				if (this.dialect.benignModeRejection?.(message, modeId)) return;
 				throw err;
 			}
 		};
@@ -490,6 +505,10 @@ export class AcpDriver extends BaseSessionDriver implements SessionDriver {
 				return;
 			}
 			case "usage_update": {
+				// kimi never advertises this one: its initialize lists only
+				// loadSession, prompt/session/mcp capabilities and auth, and the
+				// figure still arrives (same status as dsh's set_config_option in
+				// its capabilities list) — so it is parsed, not required.
 				if (typeof update.used === "number") {
 					const size = typeof update.size === "number" ? `/${update.size}` : "";
 					this.emit({ kind: "usage", text: `ctx=${update.used}${size}` });

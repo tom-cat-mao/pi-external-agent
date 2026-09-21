@@ -672,9 +672,14 @@ const KIMI_ONESHOT_EFFORT_REFUSAL =
  * vetoes Write/Edit before approval, which is what makes the label true: in
  * every other mode `git-cwd-write-approve` silently approves in-workspace
  * writes and edits, and the driver rejecting every permission request is the
- * fail-closed backstop behind the guard. write and yolo are the same tier but
- * for one thing (`dangerous-command-ask` survives both), so neither is claimed
- * to be the more bounded one.
+ * fail-closed backstop behind the guard.
+ *
+ * The two upper tiers are not the same mechanism, and the receipt must not
+ * claim they are: in `auto` the dangerous-command guard short-circuits and
+ * `auto-mode-approve` then approves every tool call, so a dangerous Bash
+ * command runs with no ask at all — while `yolo` is the mode where that ask
+ * survives and the driver allows it. AskUserQuestion runs the other way:
+ * denied in auto, approved in yolo.
  */
 function kimiSessionPolicy(mode: Mode): string {
 	if (mode === "readonly") {
@@ -683,11 +688,16 @@ function kimiSessionPolicy(mode: Mode): string {
 			"and edits), and the driver rejects every session/request_permission as a fail-closed backstop"
 		);
 	}
-	const questions =
-		mode === "write"
-			? "AskUserQuestion is denied there and approved in yolo — the only difference between the two tiers"
-			: "AskUserQuestion is approved there and denied in write — the only difference between the two tiers";
-	return `kimi ${mode === "write" ? "auto" : "yolo"} mode: dangerous-command asks survive, and the driver allows the asks the harness raises; ${questions}`;
+	if (mode === "write") {
+		return (
+			"kimi auto mode: the dangerous-command ask does not fire (the guard short-circuits in auto, and auto-mode-approve then approves " +
+			"every tool call), so dangerous Bash runs unasked; the driver allows any ask a user-configured rule still raises, and AskUserQuestion is denied"
+		);
+	}
+	return (
+		"kimi yolo mode: dangerous-command asks survive and the driver allows them (write/auto raises none); " +
+		"AskUserQuestion is approved"
+	);
 }
 
 const kimiAdapter: Adapter = {
@@ -696,7 +706,7 @@ const kimiAdapter: Adapter = {
 	provider: "Moonshot",
 	useFor:
 		"Execution workhorse like codex and pi: code writing and task execution. " +
-		"All three tiers are real over its ACP session; write and yolo are the same tier but for how kimi's own questions to the user are answered.",
+		"All three tiers are real over its ACP session; write and yolo differ in how kimi's own asks are handled (auto raises none).",
 	defaultMode: "yolo",
 	maxMode: "yolo",
 	// The one-shot spelling's floor does not apply to the session path, which
