@@ -52,14 +52,14 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
 | `reasonix` | DeepSeek 原生 | yolo（deny 规则和 OS 沙箱仍生效） | ✅ ACP vendor 扩展 |
 | `codebuddy` | 腾讯 | yolo | ✅ ACP step 边界注入 |
 | `qoder` | 阿里 | yolo | follow-up ✅；steer ✅，需 CLI 声明的版本满足 1.1.49 基线 |
-| `kimi` | Moonshot | yolo（ACP 会话内三档为 readonly–yolo；print 拼写仅 yolo） | ❌ |
+| `kimi` | Moonshot | yolo（ACP 会话内三档为 readonly–yolo；print 拼写仅 yolo） | follow-up ✅；steer ❌ |
 | `claude` | Anthropic | yolo（readonly–yolo 三档；effort low–max，无 off） | ✅ stream-json |
 | `dsh` | DeepSeek harness | yolo（readonly–yolo 三档；dsh 自带沙箱强制执行该档位） | ✅ ACP |
 
 ## 文档
 
 - [AGENTS.md](AGENTS.md) — 目录结构、命令、不变式、文档规则
-- [docs/architecture.md](docs/architecture.md) — 派发流程、回执、传输层 · [docs/adapters.md](docs/adapters.md) — 各 CLI 能力矩阵 · [docs/capabilities.md](docs/capabilities.md) — 归档、验收、模板、relay、隔离、证据板、计量 · [docs/qoder.md](docs/qoder.md) — Qoder stream-json 契约 · [.agents/notes/](.agents/notes/) — 决策记录
+- [docs/architecture.md](docs/architecture.md) — 派发流程、回执、传输层 · [docs/adapters.md](docs/adapters.md) — 各 CLI 能力矩阵 · [docs/capabilities.md](docs/capabilities.md) — 归档、验收、模板、relay、隔离、证据板、计量 · [docs/qoder.md](docs/qoder.md) — Qoder stream-json 契约 · [docs/dsh.md](docs/dsh.md) — dsh 共享 home 与作用域 settings · [docs/kimi.md](docs/kimi.md) — kimi 的 ACP 会话、档位与 effort · [.agents/notes/](.agents/notes/) — 决策记录
 
 ## 社区
 

@@ -11,11 +11,11 @@ All eight agents share one dispatch path; an omitted `mode` takes its default, o
 | `kimi` | Moonshot (`kimi`) | yolo | readonly–yolo | yes: plan-mode guard vetoes Write/Edit + driver-rejected prompts | off–max, session-only (one-shot refused) | no | yes | — |
 | `codebuddy` | Tencent (`codebuddy`) | yolo | readonly–yolo | best-effort: `default` + `--settings` + PreToolUse Bash hook | minimal–max (no off) | yes | yes | — |
 | `claude` | Anthropic (`claude`) | yolo | readonly–yolo | yes: `dontAsk` mode denies what was not pre-approved | low–max | yes | yes | fixture-tested only |
-| `reasonix` | DeepSeek-native (`reasonix`) | yolo | readonly–yolo | no pinned tier: driver-rejected prompts confine ≤1.38.7; fail-open from ≥1.38.8 | off–max | yes | yes | — |
+| `reasonix` | DeepSeek-native (`reasonix`) | yolo | readonly–yolo | no pinned tier: driver-rejected prompts confine ≤1.38.7; fail-open from ≥1.38.8 | off–max; ACP forwards none | yes | yes | — |
 | `qoder` | Alibaba (`qodercli`) | yolo | readonly–yolo | yes: `dont_ask` + built-in tool allowlist | off, low–max (no minimal) | yes, version-gated | yes | — |
 | `dsh` | DeepSeek harness (`dsh`) | yolo | readonly–yolo | yes: dsh sandbox via `DSH_PERMISSION_MODE` over a scoped settings document; ACP escalation driver-denied | off–max, session-only (one-shot refused) | yes | yes | — |
 
-Every adapter enforces read-only, and the Read-only column names the layer that does it; `degraded` marks a known-degraded upstream. Without a sandbox, `write`/`yolo` are permission-rule tiers, not an OS boundary; a readonly hook is heuristic.
+Every adapter enforces read-only, and the Read-only column names that layer; `degraded` marks a known-degraded upstream. Without a sandbox, `write`/`yolo` are permission-rule tiers, not an OS boundary; a readonly hook is heuristic.
 
 ## kimi: tiers over ACP, print mode still yolo-only
 

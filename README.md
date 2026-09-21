@@ -52,14 +52,14 @@ All off by default; enable per call — `template` (output contract), `verify` (
 | `reasonix` | DeepSeek-native | yolo (deny rules + OS sandbox still apply) | ✅ via ACP vendor extension |
 | `codebuddy` | Tencent | yolo | ✅ via ACP step-boundary injection |
 | `qoder` | Alibaba | yolo | follow-up ✅; steer ✅ when the announced CLI meets the 1.1.49 baseline |
-| `kimi` | Moonshot | yolo (readonly–yolo over its ACP session; the print spelling is yolo-only) | ❌ |
+| `kimi` | Moonshot | yolo (readonly–yolo over its ACP session; the print spelling is yolo-only) | follow-up ✅; steer ❌ |
 | `claude` | Anthropic | yolo (readonly–yolo; effort low–max, no off) | ✅ via stream-json |
 | `dsh` | DeepSeek harness | yolo (readonly–yolo; dsh's own sandbox enforces the tier) | ✅ via ACP |
 
 ## Documentation
 
 - [AGENTS.md](AGENTS.md) — repository layout, commands, invariants, documentation rules
-- [docs/architecture.md](docs/architecture.md) — dispatch flow, receipts, transports · [docs/adapters.md](docs/adapters.md) — per-CLI capability matrix · [docs/capabilities.md](docs/capabilities.md) — archive, verify, templates, relay, isolate, board, meter · [docs/qoder.md](docs/qoder.md) — Qoder stream-json contract · [.agents/notes/](.agents/notes/) — decision records
+- [docs/architecture.md](docs/architecture.md) — dispatch flow, receipts, transports · [docs/adapters.md](docs/adapters.md) — per-CLI capability matrix · [docs/capabilities.md](docs/capabilities.md) — archive, verify, templates, relay, isolate, board, meter · [docs/qoder.md](docs/qoder.md) — Qoder stream-json contract · [docs/dsh.md](docs/dsh.md) — dsh shared home, scoped settings · [docs/kimi.md](docs/kimi.md) — kimi's ACP session, tiers, effort · [.agents/notes/](.agents/notes/) — decision records
 
 ## Community
 

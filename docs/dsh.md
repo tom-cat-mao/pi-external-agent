@@ -12,4 +12,4 @@ dsh runs against the user's own `~/.dsh` (profiles, plugins, credentials, sessio
 
 ## Effort and verification
 
-Effort travels only over ACP (`session/set_config_option`, configId `reasoning_effort`); one-shot it is refused, never dropped. Verified on 0.1.5-rc.2: a readonly dispatch under a `danger-full-access` user preset was sandbox-denied, `settings.yaml` untouched; upgrades re-run the smoke checklist (headless text/exit code, ACP handshake, `set_config_option`, readonly denial). One-shot answers are plain stdout until `--json`/`--session-id` land, then NDJSON.
+Effort travels only over ACP (`session/set_config_option`, configId `reasoning_effort`); one-shot it is refused, never dropped. A model request is reported not forwarded on either transport: the run profile selects the model, and no model flag is verified on either path. Verified on 0.1.5-rc.2: a readonly dispatch under a `danger-full-access` user preset was sandbox-denied, `settings.yaml` untouched; upgrades re-run the smoke checklist (headless text/exit code, ACP handshake, `set_config_option`, readonly denial). One-shot answers are plain stdout until `--json`/`--session-id` land, then NDJSON.
