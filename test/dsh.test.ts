@@ -1109,6 +1109,21 @@ test("dsh ACP session: a rejected set_config_option fails the session start", as
 // The hub's env plumbing and refusal path (one-shot transport)
 // ---------------------------------------------------------------------------
 
+/**
+ * kimi runs over its ACP session in the hub, so the one-shot adapter is
+ * reachable only when kimi has no session driver: the registry picks the
+ * persistent transport for exactly the agents in SESSION_DRIVERS. Removing the
+ * entry is the only way to drive that path through the registry; the returned
+ * function puts it back, so no other test sees a different transport table.
+ */
+function withoutKimiDriver(): () => void {
+	const saved = SESSION_DRIVERS.kimi;
+	delete SESSION_DRIVERS.kimi;
+	return () => {
+		SESSION_DRIVERS.kimi = saved;
+	};
+}
+
 const KIMI_ENV_MOCK = `#!/usr/bin/env node
 const marker = process.env.DSH_TEST_MARKER || "absent";
 const pathInherited = process.env.PATH ? "yes" : "no";
@@ -1120,6 +1135,7 @@ test("hub one-shot: an adapter's env is merged over process.env, never replacing
 	const dir = makeFixtureDir({ kimi: KIMI_ENV_MOCK });
 	const restorePath = usePath(dir);
 	const original = ADAPTERS.kimi.buildDispatch;
+	const restoreDriver = withoutKimiDriver();
 	try {
 		const plain = await call("external_agent_start", { agent: "kimi", task: "t", mode: "yolo", cwd: dir, notify: "off" });
 		const plainWait = await call("external_agent_wait", { taskIds: [plain.details.task.taskId], timeout: 5 });
@@ -1132,6 +1148,7 @@ test("hub one-shot: an adapter's env is merged over process.env, never replacing
 	} finally {
 		ADAPTERS.kimi.buildDispatch = original;
 		await call("external_agent_stop", { all: true });
+		restoreDriver();
 		restorePath();
 	}
 });
@@ -1144,6 +1161,7 @@ test("hub one-shot: an adapter's undefined env value deletes an inherited variab
 	const restorePath = usePath(dir);
 	const restoreEnv = withEnv({ DSH_TEST_MARKER: "from-the-shell" });
 	const original = ADAPTERS.kimi.buildDispatch;
+	const restoreDriver = withoutKimiDriver();
 	try {
 		const kept = await call("external_agent_start", { agent: "kimi", task: "t", mode: "yolo", cwd: dir, notify: "off" });
 		const keptWait = await call("external_agent_wait", { taskIds: [kept.details.task.taskId], timeout: 5 });
@@ -1156,6 +1174,7 @@ test("hub one-shot: an adapter's undefined env value deletes an inherited variab
 	} finally {
 		ADAPTERS.kimi.buildDispatch = original;
 		await call("external_agent_stop", { all: true });
+		restoreDriver();
 		restoreEnv();
 		restorePath();
 	}
@@ -1181,6 +1200,7 @@ test("hub one-shot: an adapter refusal fails the dispatch with its reason and sp
 	const dir = makeFixtureDir({ kimi: KIMI_ENV_MOCK });
 	const restorePath = usePath(dir);
 	const original = ADAPTERS.kimi.buildDispatch;
+	const restoreDriver = withoutKimiDriver();
 	try {
 		ADAPTERS.kimi.buildDispatch = (input) => ({ ...original(input), refusal: "kimi cannot run this request" });
 		const started = await call("external_agent_start", { agent: "kimi", task: "t", mode: "yolo", cwd: dir, notify: "off" });
@@ -1190,6 +1210,7 @@ test("hub one-shot: an adapter refusal fails the dispatch with its reason and sp
 	} finally {
 		ADAPTERS.kimi.buildDispatch = original;
 		await call("external_agent_stop", { all: true });
+		restoreDriver();
 		restorePath();
 	}
 });

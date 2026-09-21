@@ -164,30 +164,61 @@ process.stdin.on("data", (chunk) => {
 
 /**
  * Kimi speaks in-flight records (claude's json output surfaces only the final
- * result), so the activity-profile test uses it: STALL_MOCK_PRE_EVENTS tool
- * calls spaced before the gate, then the answer prose.
+ * result), so the activity-profile test uses it over its ACP session:
+ * STALL_MOCK_PRE_EVENTS tool calls spaced before the gate, then the answer
+ * prose. The gate is the task text — the prompt arrives over the protocol, so
+ * the harness reads the file path from the prompt itself.
  */
 const GATED_KIMI_MOCK = `#!/usr/bin/env node
 const fs = require("node:fs");
-const at = process.argv.indexOf("-p");
-const gate = at === -1 ? "" : (process.argv[at + 1] || "");
+const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
 const pre = Number(process.env.STALL_MOCK_PRE_EVENTS || "0");
-if (pre > 0) {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
-  for (let i = 0; i < pre; i += 1) {
-    process.stdout.write(JSON.stringify({ role: "assistant", tool_calls: [{ function: { name: "bash", arguments: JSON.stringify({ command: "retry-" + i }) } }] }) + "\\n");
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
+let buffer = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", (chunk) => {
+  buffer += chunk;
+  const lines = buffer.split("\\n");
+  buffer = lines.pop();
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    let msg;
+    try { msg = JSON.parse(line); } catch { continue; }
+    if (msg.method === "initialize") {
+      send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: 1, agentCapabilities: {} } });
+      continue;
+    }
+    if (msg.method === "session/new") {
+      send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s1", configOptions: [] } });
+      continue;
+    }
+    if (msg.method === "session/set_mode") {
+      send({ jsonrpc: "2.0", id: msg.id, result: {} });
+      continue;
+    }
+    if (msg.method !== "session/prompt") continue;
+    const gate = msg.params.prompt[0].text;
+    if (pre > 0) {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 250);
+      for (let i = 0; i < pre; i += 1) {
+        send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "s1", update: {
+          sessionUpdate: "tool_call", toolCallId: "tc" + i, title: "bash", rawInput: { command: "retry-" + i },
+        } } });
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 150);
+      }
+    }
+    if (gate) {
+      const started = Date.now();
+      while (!fs.existsSync(gate)) {
+        if (Date.now() - started > 60000) process.exit(3);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+      }
+    }
+    send({ jsonrpc: "2.0", method: "session/update", params: { sessionId: "s1", update: {
+      sessionUpdate: "agent_message_chunk", content: { type: "text", text: process.env.WAIT_MOCK_ANSWER || "WAIT_OK" },
+    } } });
+    send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn" } });
   }
-}
-if (gate) {
-  const started = Date.now();
-  while (!fs.existsSync(gate)) {
-    if (Date.now() - started > 60000) process.exit(3);
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
-  }
-}
-process.stdout.write(JSON.stringify({ role: "assistant", content: process.env.WAIT_MOCK_ANSWER || "WAIT_OK" }) + "\\n");
-process.exit(0);
+});
 `;
 
 async function call(name: string, params: Record<string, unknown>, signal?: AbortSignal): Promise<any> {

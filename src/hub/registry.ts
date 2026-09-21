@@ -22,6 +22,7 @@ import {
 	SESSION_DRIVERS,
 	STEER_AGENT_IDS,
 	hasSessionDriver,
+	kimiThinkingToken,
 	type SessionDriver,
 	type SteerResult,
 } from "../drivers/index.ts";
@@ -993,6 +994,9 @@ export function effortSessionNote(agent: AgentId, effort: Effort): string {
 	if (agent === "dsh") {
 		return `Set inside the ACP session as session/set_config_option reasoning_effort=${dshEffortToken(effort)}; dsh accepts effort only there, never on its one-shot path.`;
 	}
+	if (agent === "kimi") {
+		return `Set inside the ACP session as session/set_config_option thinking=${kimiThinkingToken(effort)}; kimi advertises that vocabulary per session, and a level it does not offer fails the start rather than being sent.`;
+	}
 	return `Passed to the persistent session for "${effort}".`;
 }
 
@@ -1009,6 +1013,9 @@ export function modelForwardedOnSession(agent: AgentId): boolean {
 export function modelSessionNote(agent: AgentId, model: string): string {
 	if (agent === "dsh") {
 		return `requested "${model}"; NOT forwarded — dsh selects its model from the run profile, not from a session-start flag.`;
+	}
+	if (agent === "kimi") {
+		return `Set inside the ACP session as session/set_config_option model=${model}; kimi takes a raw model id there, not a provider/model pair.`;
 	}
 	return "Passed to the persistent session at startup.";
 }
@@ -1300,7 +1307,7 @@ type DispatchCheck = { ok: true } | { ok: false; reason: string };
  * and external_agent_compare so both refuse identically and for the same
  * reasons — a compare spec must never be a way around a start-time guard.
  *
- * All three checks are fail-closed: a mode below the adapter's floor (kimi) has
+ * All three checks are fail-closed: a mode below the adapter's floor has
  * no enforcement behind it, a mode above its ceiling has nothing to bound it,
  * and an effort override the target cannot forward would mislead the caller
  * about the run's cost. The last check is the directory conflict: two mutating
@@ -1320,10 +1327,12 @@ export function validateDispatch(
 ): DispatchCheck {
 	const adapter = ADAPTERS[agent];
 
-	// Fail closed below the adapter's floor too: an adapter with minMode
-	// (kimi) has no lower tier at all — accepting one would be a label
-	// with no enforcement behind it. The adapter states why in its own terms
-	// (minModeNote), so the refusal carries the real reason.
+	// Fail closed below the adapter's floor: an adapter that declares one has no
+	// lower tier at all, and accepting the request would put a label on a run
+	// with nothing behind it. No adapter declares one today (the floor defaults
+	// to readonly, which is the lowest tier there is), so the guard is the
+	// fail-closed default a future floor lands on; the adapter states why in its
+	// own terms (minModeNote), and the refusal carries the real reason.
 	const minMode = adapter.minMode ?? "readonly";
 	if (MODE_RANK[mode] < MODE_RANK[minMode]) {
 		return {
@@ -1336,9 +1345,9 @@ export function validateDispatch(
 	}
 
 	// Fail closed: never exceed the adapter's mode ceiling. An adapter whose
-	// harness enforces no read-only tier (kimi) caps at the tiers it can
-	// really serve, so a request above the ceiling is refused instead of run
-	// under a label nothing backs.
+	// harness enforces no read-only tier caps at the tiers it can really serve,
+	// so a request above the ceiling is refused instead of run under a label
+	// nothing backs.
 	if (MODE_RANK[mode] > MODE_RANK[adapter.maxMode]) {
 		const reason = !adapter.enforcesReadOnly
 			? `${agent} has no harness-enforced sandbox, so ${mode} mode cannot be bounded. ` +
