@@ -60,7 +60,7 @@ import { dshOverlayPath, prepareDshLaunch, type DshProfile } from "../dsh-launch
 import type { SessionDriver } from "./base.ts";
 import { PiRpcDriver } from "./pi-rpc.ts";
 import { CodexAppServerDriver } from "./codex-app-server.ts";
-import { AcpDriver } from "./acp.ts";
+import { ACP_METHODS, AcpDriver } from "./acp.ts";
 import { ClaudeStreamJsonDriver, QoderStreamJsonDriver } from "./stream-json.ts";
 
 /**
@@ -140,10 +140,19 @@ export const SESSION_DRIVERS: Partial<Record<AgentId, () => SessionDriver>> = {
 					...(launch.warning ? { warning: launch.warning } : {}),
 				};
 			},
-			// No effort flag exists on this CLI: the session sets the config option
-			// instead. A rejected set_config_option fails the session start, so the
-			// turn never runs at a default the caller did not ask for.
-			effort: { configId: "reasoning_effort", token: dshEffortToken },
+			// dsh's effort has no flag on this CLI: the session carries it as
+			// reasoning_effort, set in the configure phase — after session/new,
+			// before the first prompt. A rejected set fails the session start
+			// with dsh's own error, so the turn never runs at a default the
+			// caller did not ask for.
+			configureSession: async ({ sessionId, effort, call }) => {
+				if (!effort) return;
+				await call(ACP_METHODS.sessionSetConfigOption, {
+					sessionId,
+					configId: "reasoning_effort",
+					value: dshEffortToken(effort),
+				});
+			},
 		}),
 };
 
