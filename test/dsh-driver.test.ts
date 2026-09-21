@@ -6,9 +6,10 @@
  *     the `--patch` overlay that keeps dsh's settings row off the user's own
  *     settings document, and the task travels on the protocol rather than in the
  *     startup argv;
- *   - every spawn carries the tier as DSH_PERMISSION_MODE and DELETES an
- *     inherited DSH_HOME (the home is the shared ~/.dsh the overlay was written
- *     into), merged over process.env (never replacing it);
+ *   - every spawn carries the tier as DSH_PERMISSION_MODE and the telemetry
+ *     opt-out as DSH_TELEMETRY_DISABLED, and DELETES an inherited DSH_HOME (the
+ *     home is the shared ~/.dsh the overlay was written into), merged over
+ *     process.env (never replacing it);
  *   - effort has no flag on this CLI, so it is set on the session as
  *     reasoning_effort AFTER session/new, mapped off|low|high|max — and no
  *     frame at all is sent when the caller requested no effort;
@@ -67,6 +68,7 @@ record({
   env: {
     DSH_HOME: process.env.DSH_HOME || null,
     DSH_PERMISSION_MODE: process.env.DSH_PERMISSION_MODE || null,
+    DSH_TELEMETRY_DISABLED: process.env.DSH_TELEMETRY_DISABLED || null,
     INHERITED: process.env.DSH_MOCK_INHERITED || null,
     PATH_PRESENT: Boolean(process.env.PATH),
   },
@@ -388,7 +390,7 @@ test("dsh ACP session spawns `--profile acp --patch <overlay>` — never --acp �
 	}
 });
 
-test("dsh ACP session env: the mode's DSH_PERMISSION_MODE, no inherited DSH_HOME, merged over process.env", async () => {
+test("dsh ACP session env: the mode's DSH_PERMISSION_MODE, the telemetry opt-out, no inherited DSH_HOME, merged over process.env", async () => {
 	const home = makeHome();
 	const modes: Array<[Mode, string]> = [
 		["readonly", "read-only"],
@@ -407,6 +409,9 @@ test("dsh ACP session env: the mode's DSH_PERMISSION_MODE, no inherited DSH_HOME
 			const spawn = await waitFor(`the ${mode} spawn`, () => harness.records()[0]);
 			assert.equal(spawn.env.DSH_HOME, null, `${mode} carried an inherited DSH_HOME`);
 			assert.equal(spawn.env.DSH_PERMISSION_MODE, permission, `${mode} did not get its tier`);
+			// Every extension spawn opts out of dsh's session telemetry; the
+			// user's own interactive dsh keeps its own choice.
+			assert.equal(spawn.env.DSH_TELEMETRY_DISABLED, "1", `${mode} did not get the telemetry opt-out`);
 			// Merged over process.env, not a replacement: the CLI keeps the
 			// environment it has to run in.
 			assert.equal(spawn.env.PATH_PRESENT, true, `${mode} lost PATH`);

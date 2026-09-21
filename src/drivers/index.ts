@@ -55,7 +55,7 @@
  * running — only change what the agent does next.
  */
 
-import { ADAPTERS, buildReadonlySettings, dshEffortToken, dshPermissionMode, type AgentId } from "../adapters.ts";
+import { ADAPTERS, buildReadonlySettings, DSH_TELEMETRY_OPT_OUT, dshEffortToken, dshPermissionMode, type AgentId } from "../adapters.ts";
 import { dshOverlayPath, prepareDshLaunch, type DshProfile } from "../dsh-launch.ts";
 import type { SessionDriver } from "./base.ts";
 import { PiRpcDriver } from "./pi-rpc.ts";
@@ -135,8 +135,15 @@ export const SESSION_DRIVERS: Partial<Record<AgentId, () => SessionDriver>> = {
 				if (!launch.ok) throw new Error(launch.reason);
 				return {
 					// DSH_HOME is deleted, not set: an ambient value would point the
-					// child at a home that was neither provisioned nor anchored.
-					env: { DSH_PERMISSION_MODE: dshPermissionMode(input.mode), DSH_HOME: undefined },
+					// child at a home that was neither provisioned nor anchored. The
+					// telemetry opt-out rides with the session spawn for the same
+					// reason it rides with the one-shot one: this run is the
+					// extension's, not the user's own dsh.
+					env: {
+						DSH_PERMISSION_MODE: dshPermissionMode(input.mode),
+						DSH_HOME: undefined,
+						DSH_TELEMETRY_DISABLED: DSH_TELEMETRY_OPT_OUT,
+					},
 					...(launch.warning ? { warning: launch.warning } : {}),
 				};
 			},

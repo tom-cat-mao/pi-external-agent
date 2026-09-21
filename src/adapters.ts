@@ -111,6 +111,19 @@ export function dshPermissionMode(mode: Mode): string {
 }
 
 /**
+ * The value both extension spawn paths carry as `DSH_TELEMETRY_DISABLED`
+ * (one-shot env below, ACP prepare in drivers/index.ts). Verified against the
+ * installed 0.1.5-rc.2 launcher: `resolveTelemetryPatch` in dsh's
+ * `lib/profile-boot-*.js` reads the variable and, for ANY non-empty value —
+ * `1`, `0` and `false` alike, a privacy switch that prefers off-by-mistake —
+ * appends a last-precedence overlay disabling the `session-telemetry-otel`
+ * row; `@deepseek-ai/dsh-base/cordis.patch.yml` documents the same contract.
+ * Only the extension's own spawns opt out: an interactive dsh in the user's
+ * terminal keeps its own telemetry settings.
+ */
+export const DSH_TELEMETRY_OPT_OUT = "1";
+
+/**
  * Why an effort request is refused on dsh's one-shot path. The headless profile
  * has no effort knob at all (verified 0.1.5-rc.2), while an ACP session sets
  * reasoning_effort over the protocol; the hub's own effort check in
@@ -182,10 +195,10 @@ export interface AdapterDispatch {
 	 * spawn paths (never a replacement). A key whose value is `undefined` is
 	 * DELETED from the child's environment instead of being passed through —
 	 * see mergeSpawnEnv. dsh is the adapter that uses it: the requested
-	 * permission tier travels as DSH_PERMISSION_MODE, and an inherited
-	 * DSH_HOME is deleted, because a value exported in the user's shell would
-	 * otherwise point dsh at a different home than the one the overlay was
-	 * written into.
+	 * permission tier travels as DSH_PERMISSION_MODE, an inherited DSH_HOME is
+	 * deleted, because a value exported in the user's shell would otherwise
+	 * point dsh at a different home than the one the overlay was written into,
+	 * and DSH_TELEMETRY_DISABLED opts the spawn out of dsh's session telemetry.
 	 */
 	env?: Record<string, string | undefined>;
 	/**
@@ -1012,8 +1025,13 @@ const dshAdapter: Adapter = {
 			...(launch.warning ? { warning: launch.warning } : {}),
 			// DSH_HOME is deleted rather than set: the overlay above already names
 			// the home, and an inherited value would point the child at a home
-			// neither provisioned nor anchored.
-			env: { DSH_PERMISSION_MODE: dshPermissionMode(mode), DSH_HOME: undefined },
+			// neither provisioned nor anchored. The telemetry opt-out rides with
+			// every spawn: this run is the extension's, not the user's own dsh.
+			env: {
+				DSH_PERMISSION_MODE: dshPermissionMode(mode),
+				DSH_HOME: undefined,
+				DSH_TELEMETRY_DISABLED: DSH_TELEMETRY_OPT_OUT,
+			},
 		};
 	},
 	// Plain-text stdout: no --json exists in this release, so every non-empty
