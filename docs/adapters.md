@@ -2,7 +2,7 @@
 
 Generated from `ADAPTERS` in `src/adapters.ts`; update both.
 
-All eight agents share one dispatch path; an omitted `mode` takes its default, out-of-range is refused.
+All eight agents share one dispatch path; `mode` defaults when omitted, out-of-range is refused.
 
 | Agent | Provider (`bin`) | Default | Modes | Read-only | Effort | Steer | Follow-up | Degraded |
 |---|---|---|---|---|---|---|---|---|
@@ -31,7 +31,7 @@ Qoder is driven over its documented stream-json channel; a steer requires an ann
 
 ## dsh: shared home, scoped settings
 
-dsh runs against the user's own `~/.dsh`, where `settings.yaml`'s `permission.defaultPreset` outranks `DSH_PERMISSION_MODE` and a higher-precedence patch replaces a row's whole config, so every spawn carries `--patch` re-pointing the settings plugin's document at `~/.dsh/settings.pi-external-agent.yaml`: empty when missing and preset-free, the composed default governs, `DSH_PERMISSION_MODE` picking the tier and dsh's sandbox enforcing it. A shell-exported `DSH_HOME` is stripped from the child env. Details: [dsh.md](dsh.md).
+dsh runs against the user's own `~/.dsh`, where `settings.yaml`'s `permission.defaultPreset` outranks `DSH_PERMISSION_MODE` and a higher-precedence patch replaces a row's whole config, so every spawn carries `--patch` re-pointing the settings plugin's document at `~/.dsh/settings.pi-external-agent.yaml`: empty when missing and preset-free, the composed default governs, `DSH_PERMISSION_MODE` picking the tier and dsh's sandbox enforcing it. A shell-exported `DSH_HOME` is stripped from the child env; every extension spawn carries `DSH_TELEMETRY_DISABLED`, dsh's telemetry opt-out. Details: [dsh.md](dsh.md).
 
 ## Permission mappings
 
