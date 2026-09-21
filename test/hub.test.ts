@@ -328,8 +328,9 @@ test("hub: claude follow-up works over persistent session", async () => {
 	try {
 		const started = await call("external_agent_start", { agent: "claude", task: "x", mode: "readonly", cwd: dir, notify: "off" });
 		assert.equal(started.details.task.transport, "persistent");
-		// the driver, not the CLI harness, answers can_use_tool: the receipt says so
-		assert.equal(started.details.task.dispatch.readOnlyEnforcement, "driver-enforced");
+		// the CLI's dontAsk mode bounds the run; the receipt must name it rather
+		// than claim a driver deny the CLI never gives the driver the chance to send
+		assert.equal(started.details.task.dispatch.readOnlyEnforcement, "cli-mode");
 		assert.match(started.content[0].text, /claude is degraded/);
 	} finally {
 		await call("external_agent_stop", { all: true });

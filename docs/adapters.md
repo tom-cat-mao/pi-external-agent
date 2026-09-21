@@ -8,9 +8,9 @@ All eight agents share one dispatch path; `mode` defaults when omitted, out-of-r
 |---|---|---|---|---|---|---|---|---|
 | `codex` | OpenAI (`codex`) | yolo | readonly–yolo | yes: `--sandbox read-only` | off, minimal–xhigh | yes | yes | — |
 | `pi` | pi itself (`pi`) | yolo | readonly–yolo | yes: `--tools read,grep,find,ls` | off–max | yes | yes | — |
-| `kimi` | Moonshot (`kimi`) | yolo | yolo only (`minMode: "yolo"`) | no | none (refused) | no | no | — |
+| `kimi` | Moonshot (`kimi`) | yolo | yolo only (`minMode: "yolo"`) | no: print mode forces Never Ask | none (refused) | no | no | — |
 | `codebuddy` | Tencent (`codebuddy`) | yolo | readonly–yolo | best-effort: `default` + `--settings` + PreToolUse Bash hook | minimal–max (no off) | yes | yes | — |
-| `claude` | Anthropic (`claude`) | yolo | readonly–yolo | yes: `dontAsk` + driver-denied `can_use_tool` | low–max | yes | yes | fixture-tested only |
+| `claude` | Anthropic (`claude`) | yolo | readonly–yolo | yes: `dontAsk` mode denies what was not pre-approved | low–max | yes | yes | fixture-tested only |
 | `reasonix` | DeepSeek-native (`reasonix`) | yolo | readonly–yolo | no pinned tier: driver-rejected prompts confine ≤1.38.7; fail-open from ≥1.38.8 | off–max | yes | yes | — |
 | `qoder` | Alibaba (`qodercli`) | yolo | readonly–yolo | yes: `dont_ask` + built-in tool allowlist | off, low–max (no minimal) | yes, version-gated | yes | — |
 | `dsh` | DeepSeek harness (`dsh`) | yolo | readonly–yolo | yes: dsh sandbox via `DSH_PERMISSION_MODE` over a scoped settings document; ACP escalation driver-denied | off–max, session-only (one-shot refused) | yes | yes | — |
@@ -19,26 +19,26 @@ All eight agents share one dispatch path; `mode` defaults when omitted, out-of-r
 
 ## kimi: yolo-only enforcement
 
-`kimi-code` rejects permission flags alongside `-p`, so headless runs execute under `default_permission_mode` from `~/.kimi-code/config.toml`; `minMode: "yolo"` refuses unenforced tiers, and `effort` is refused — no control exists.
+`kimi-code` print mode cannot select a tier: `-p` rejects `--yolo`/`--auto`/`--plan`, the print path forces Never Ask (auto), and `--dangerously-skip-permissions` does not exist, so `config.toml`'s `default_permission_mode` is never consulted and the requested yolo is not what runs (Never Ask permits more than Ask When Needed). Static `[[permission.rules]]` denies still bind. `minMode: "yolo"` refuses lower tiers rather than label what it cannot bound; `effort` is refused (no control exists).
 
 ## reasonix: readonly version boundary
 
-`reasonix acp` (the only production path) rejects `--permission-mode`, so nothing pins the tier: readonly rests on the driver rejecting `session/request_permission`. Through v1.38.7 `session/new` boots in `Ask`, so writes and bash calls prompt and get rejected — effective. From v1.38.8 (commit 4daa815be) it hardcodes `workspace-write`, so in-workspace writes and writer bash run unprompted and readonly silently stops confining; outside-workspace writes and the bash Seatbelt sandbox still bound it. The `tool_approval` vocabulary changed at that boundary: tier pinning must capability-negotiate from `session/new`'s `configOptions`.
+`reasonix acp` (the only production path) rejects `--permission-mode`, so nothing pins the tier: readonly rests on the driver rejecting `session/request_permission`. Through v1.38.7 `session/new` boots in `Ask`: writes and bash calls prompt and are rejected — effective. From v1.38.8 (commit 4daa815be) it hardcodes `workspace-write`, so in-workspace writes and writer bash run unprompted and readonly silently stops confining; outside-workspace writes and the bash Seatbelt sandbox still bound it. `tool_approval` changed there: tier pinning must capability-negotiate from `session/new`'s `configOptions`.
 
 ## qoder: steering version gate
 
-Qoder is driven over its documented stream-json channel; a steer requires an announced stable `qodercli_version` ≥ 1.1.49, the documented SDK baseline. Missing, malformed, prerelease or older versions make `external_agent_steer` refuse, reporting the version, while start, status, follow-up and stop keep working. Details: [qoder.md](qoder.md).
+Qoder is driven over its documented stream-json channel; steering needs an announced stable `qodercli_version` ≥ 1.1.49 (the SDK baseline). Missing, malformed, prerelease or older versions make `external_agent_steer` refuse with the reported version; every other tool keeps working. Details: [qoder.md](qoder.md).
 
 ## dsh: shared home, scoped settings
 
-dsh runs against the user's own `~/.dsh`, where `settings.yaml`'s `permission.defaultPreset` outranks `DSH_PERMISSION_MODE` and a higher-precedence patch replaces a row's whole config, so every spawn carries `--patch` re-pointing the settings plugin's document at `~/.dsh/settings.pi-external-agent.yaml`: empty when missing and preset-free, the composed default governs, `DSH_PERMISSION_MODE` picking the tier and dsh's sandbox enforcing it. A shell-exported `DSH_HOME` is stripped from the child env; every extension spawn carries `DSH_TELEMETRY_DISABLED`, dsh's telemetry opt-out. Details: [dsh.md](dsh.md).
+dsh runs against the user's own `~/.dsh`, where `settings.yaml`'s `permission.defaultPreset` outranks `DSH_PERMISSION_MODE` and a higher-precedence patch replaces a row's whole config, so every spawn carries `--patch` pointing the settings document at `~/.dsh/settings.pi-external-agent.yaml`: empty when missing and preset-free, the composed default governs — `DSH_PERMISSION_MODE` picking the tier, dsh's sandbox enforcing it. A shell-exported `DSH_HOME` is stripped from the child env; every spawn carries `DSH_TELEMETRY_DISABLED`, dsh's telemetry opt-out. Details: [dsh.md](dsh.md).
 
 ## Permission mappings
 
 - codex: `--sandbox read-only`/`workspace-write`/`danger-full-access`.
 - pi: readonly restricts `--tools`; with no sandbox, write and yolo are equivalent.
 - codebuddy: `default` + `--settings` (readonly)/`acceptEdits`/`bypassPermissions`.
-- claude: `dontAsk`/`acceptEdits`/`bypassPermissions` over stream-json; readonly also denies `can_use_tool` in the driver.
-- reasonix (`acp` pins no tier): `manual`/`acceptEdits`/`bypassPermissions`; deny rules and the OS sandbox still apply.
+- claude: `dontAsk`/`acceptEdits`/`bypassPermissions` over stream-json; readonly is the CLI's `dontAsk` deny (`permissions.allow` rules and read-only Bash heuristics still apply), preempting the driver's `can_use_tool` backstop.
+- reasonix (one-shot spelling; `acp` pins no tier): `manual`/`acceptEdits`/`bypassPermissions`; deny rules and OS sandbox still apply.
 - qoder: `dont_ask` + built-in allowlist/`accept_edits`/`bypass_permissions`.
 - dsh: `DSH_PERMISSION_MODE=read-only`/`workspace-write`/`danger-full-access` (codex vocabulary); readonly fail-closed over ACP.

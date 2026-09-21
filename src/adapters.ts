@@ -8,9 +8,9 @@
  *
  * Capabilities as currently wired:
  *   codex     -> OpenAI; yolo workhorse with its own sandbox tiers (read-only / workspace-write / danger-full-access)
- *   kimi      -> Moonshot; yolo-only because -p rejects every permission flag, so a
- *                headless run inherits config.toml's default_permission_mode and readonly/write are refused.
- *                Why: .agents/notes/implemented/2026-09-07-kimi-yolo-only.md
+ *   kimi      -> Moonshot; yolo-only because a headless run cannot select a lower tier:
+ *                -p rejects every permission flag and forces Never Ask, so readonly/write are refused.
+ *                Why: .agents/notes/implemented/2026-09-21-receipt-label-truth-pass.md
  *   codebuddy -> Tencent; Claude-Code-compatible surface, yolo default (all tiers open);
  *                readonly runs default mode with a runtime-built --settings hook.
  *                Why: .agents/notes/implemented/2026-09-07-codebuddy-readonly-hook.md
@@ -174,12 +174,28 @@ export interface BuildArgsInput {
 	effort?: Effort;
 }
 
+/**
+ * How a readonly turn is really bounded, named by whoever does the bounding.
+ * The target harness is not always it: claude's `dontAsk` CLI mode denies
+ * every tool the user did not pre-approve before a driver permission callback
+ * could be reached, and a reasonix ACP session pins no tier at all, so its
+ * confinement is the driver rejecting `session/request_permission` prompts.
+ */
+export const READ_ONLY_ENFORCEMENTS = [
+	"harness-enforced",
+	"cli-mode",
+	"driver-rejected-prompts",
+	"not-enforced",
+	"not-applicable",
+] as const;
+export type ReadOnlyEnforcement = (typeof READ_ONLY_ENFORCEMENTS)[number];
+
 export interface AdapterDispatch {
 	argv: string[];
 	promptArgIndex: number;
 	cwdForwardedToCli: boolean;
 	effectivePolicy: string | null;
-	readOnlyEnforcement: "harness-enforced" | "driver-enforced" | "not-enforced" | "not-applicable";
+	readOnlyEnforcement: ReadOnlyEnforcement;
 	model: {
 		requested?: string;
 		forwarded: boolean;
@@ -266,12 +282,19 @@ export interface Adapter {
 	/** Whether the agent's harness can actually enforce read-only. */
 	enforcesReadOnly: boolean;
 	/**
-	 * Set when the persistent driver, not the target harness, is the readonly
-	 * enforcement point: it answers the CLI's can_use_tool permission requests
-	 * with a deny itself (claude). Receipts label such a readonly turn
-	 * "driver-enforced" instead of "harness-enforced".
+	 * The enforcement a readonly turn's receipt reports, when the target
+	 * harness is not the enforcer: claude's `dontAsk` CLI mode ("cli-mode"),
+	 * or the reasonix driver rejecting permission prompts
+	 * ("driver-rejected-prompts"). Unset means the harness's own layer — a
+	 * sandbox, a tool allowlist, settings rules — is the enforcer.
 	 */
-	driverEnforcedReadOnly?: boolean;
+	readonlyEnforcement?: ReadOnlyEnforcement;
+	/**
+	 * Why this adapter's mode floor exists, in its own terms. A dispatch below
+	 * the floor is refused with this note attached, so the caller reads the
+	 * real reason instead of guessing at one.
+	 */
+	minModeNote?: string;
 	/** Known-degraded adapters are still callable but flagged in the tool output. */
 	degraded?: string;
 	/**
@@ -561,10 +584,10 @@ function claudeFamily(
 	// For stream-json persistent sessions, use dontAsk/acceptEdits/bypassPermissions
 	// mapping; for json one-shot, use plan/acceptEdits/yoloPermissionMode.
 	streamJsonMapping = false,
-	// Set when the persistent driver answers the CLI's can_use_tool requests
-	// itself, so a readonly turn is enforced by driver code (claude) rather
-	// than by the target harness's own permission layer.
-	driverEnforcedReadOnly = false,
+	// Set when a readonly turn is bounded by something other than the target
+	// harness's own permission layer, so the receipt names what really bounds
+	// it (claude: the dontAsk CLI mode).
+	readonlyEnforcement?: ReadOnlyEnforcement,
 ): Adapter {
 	return {
 		id,
@@ -576,7 +599,7 @@ function claudeFamily(
 		supportedEfforts,
 		session,
 		enforcesReadOnly: true,
-		driverEnforcedReadOnly,
+		readonlyEnforcement,
 		degraded,
 		buildDispatch({ task, mode, model, effort }) {
 			const argv = ["-p", task, "--output-format", outputFormat];
@@ -613,7 +636,7 @@ function claudeFamily(
 					? "--permission-mode default --settings (allow/deny rules + PreToolUse Bash hook; denies are silent)"
 					: `--permission-mode ${permissionMode}`,
 				readOnlyEnforcement:
-					mode === "readonly" ? (driverEnforcedReadOnly ? "driver-enforced" : "harness-enforced") : "not-applicable",
+					mode === "readonly" ? (readonlyEnforcement ?? "harness-enforced") : "not-applicable",
 				model: model
 					? { requested: model, forwarded: true, note: "Passed to the target CLI as --model." }
 					: { forwarded: false, note: "No model override requested; target CLI/config selects the model." },
@@ -634,16 +657,21 @@ const kimiAdapter: Adapter = {
 	provider: "Moonshot",
 	useFor:
 		"Execution workhorse like codex and pi: code writing and task execution. " +
-		"yolo only — kimi-code 0.41.0 rejects every permission flag with -p, so a headless run " +
-		"always executes under kimi's config permission mode.",
+		"yolo only — -p rejects every permission flag and forces Never Ask, so no lower tier can be requested.",
 	defaultMode: "yolo",
 	maxMode: "yolo",
-	// yolo-only by design (user decision 2026-09-07): kimi's headless surface has
-	// exactly one real behavior — config default_permission_mode ("yolo" in
-	// ~/.kimi-code/config.toml) governs everything, since -p rejects
-	// --auto/--yolo/--plan outright. Any lower tier would be a label with no
-	// enforcement behind it, so readonly/write are refused at dispatch instead.
+	// yolo-only by design (user decision 2026-09-07; rationale corrected
+	// 2026-09-21 against kimi-code 2.0.2 source). Print mode has exactly one
+	// real behavior: `-p` rejects --yolo/--auto/--plan outright
+	// (options.ts:79-87 throws OptionConflictError for each), and
+	// run-v2-print.ts:481 forces setMode("auto") — Never Ask — so config.toml's
+	// default_permission_mode is never consulted and no tier, not even yolo,
+	// is pinned. Never Ask is more permissive than yolo (Ask When Needed), so
+	// yolo is not a ceiling either; only static [[permission.rules]] denies
+	// still bind. A lower tier would put an unenforceable label on the
+	// receipt, so readonly/write are refused at dispatch.
 	minMode: "yolo",
+	minModeNote: "-p rejects every permission flag and forces Never Ask, so a headless run cannot select a lower tier.",
 	enforcesReadOnly: false,
 	buildDispatch({ task, model, effort }) {
 		const argv = ["-p", task, "--output-format", "stream-json"];
@@ -652,8 +680,11 @@ const kimiAdapter: Adapter = {
 			argv,
 			promptArgIndex: 1,
 			cwdForwardedToCli: false,
+			// The requested "yolo" is not what runs: print mode overrides the
+			// permission mode to Never Ask (auto) and skips config.toml's
+			// default_permission_mode entirely. Static deny rules still bind.
 			effectivePolicy:
-				`no permission flag exists for -p in kimi-code 0.41.0; config default_permission_mode ("yolo") applies`,
+				`-p forces Never Ask (auto); config.toml's default_permission_mode is not consulted; static deny rules still apply`,
 			readOnlyEnforcement: "not-applicable",
 			model: model
 				? {
@@ -674,15 +705,16 @@ const kimiAdapter: Adapter = {
 	//   {"role":"tool","tool_call_id":...,"content":...}     -> tool result, noise
 	//   {"role":"assistant","content":"<string>"}           -> the answer prose
 	//   {"role":"meta","type":"session.resume_hint",...}      -> noise
-	// Failures go to stderr as bare `error: ...` lines with a non-zero exit, so
-	// stdout bare lines are tool-output echoes, never the answer; drop them.
+	// `-p` reports no usage or token figures on any record, so the meter has
+	// nothing to count for kimi and no usage branch belongs here.
+	// Failures go to stderr as bare `error: ...` lines with a non-zero exit, and
+	// only stdout reaches parseEvent (hub/registry.ts reads stderr separately),
+	// so a bare stdout line is a tool-output echo, never the answer or an error.
 	parseEvent(line) {
 		let obj: any;
 		try {
 			obj = JSON.parse(line);
 		} catch {
-			const trimmed = line.trim();
-			if (/^error:/i.test(trimmed)) return { kind: "error", text: trimmed };
 			return null;
 		}
 
@@ -725,10 +757,13 @@ const kimiAdapter: Adapter = {
 //   xhigh->max  max->max   (xhigh->max mirrors pi's own thinkingLevelMap for
 //   this exact relay model)
 //
-// Permission mapping (headless approval resolution is documented in CLI.md):
+// Permission mapping for the one-shot spelling below (headless approval
+// resolution is documented in CLI.md). No dispatch takes this path — reasonix
+// has a session driver, so the hub always boots `--acp` — but the mapping is
+// kept truthful for it:
 //   readonly -> manual: no prompt exists headless, so writer fallback and
-//             explicit ask decisions fail CLOSED; readers still run. That is
-//             genuine harness-enforced read-only.
+//             explicit ask decisions fail CLOSED; readers still run. The CLI
+//             is the enforcer here, unlike the ACP session.
 //   write    -> acceptEdits: file-edit tools allowed; other ask decisions
 //             (including Bash) still fail closed.
 //   yolo     -> bypassPermissions: ordinary calls run despite ask rules, but
@@ -759,6 +794,12 @@ const reasonixAdapter: Adapter = {
 		steerNote: "advertised sessionSteer method; steer_accepted injects at the next step boundary, queued_followup means it missed the turn",
 	},
 	enforcesReadOnly: true,
+	// Over ACP — the path every dispatch takes, since a session driver exists —
+	// nothing pins the tier (`acp` rejects --permission-mode), so readonly
+	// rests on this driver rejecting session/request_permission prompts. That
+	// only confines while the CLI boots sessions in Ask (≤1.38.7); from 1.38.8
+	// it hardcodes workspace-write and readonly stops confining silently.
+	readonlyEnforcement: "driver-rejected-prompts",
 	buildDispatch({ task, cwd, mode, model, effort }) {
 		const argv = ["run", "--output-format", "stream-json", "--dir", cwd];
 		const permissionMode = mode === "readonly" ? "manual" : mode === "write" ? "acceptEdits" : "bypassPermissions";
@@ -774,6 +815,9 @@ const reasonixAdapter: Adapter = {
 			effectivePolicy:
 				`--permission-mode ${permissionMode}` +
 				(mode === "yolo" ? " (deny rules and OS bash sandbox still apply)" : ""),
+			// This one-shot spelling is the only path where a tier is pinned: the
+			// CLI fails ask decisions closed headless. The ACP path pins nothing
+			// and carries readonlyEnforcement above instead — see its comment.
 			readOnlyEnforcement: mode === "readonly" ? "harness-enforced" : "not-applicable",
 			model: model
 				? {
@@ -1233,7 +1277,12 @@ export const ADAPTERS: Record<AgentId, Adapter> = {
 		},
 		undefined, // no readonlySettings for claude
 		true, // use stream-json mapping
-		true, // readonly is driver-enforced: can_use_tool comes back denied
+		// readonly is bounded by the CLI itself: under dontAsk claude denies
+		// every tool the user has not pre-approved, so the driver's
+		// can_use_tool deny is a backstop the CLI preempts, not the enforcer.
+		// User permissions.allow rules and claude's read-only Bash heuristics
+		// still apply under dontAsk (see docs/adapters.md).
+		"cli-mode",
 	),
 	reasonix: reasonixAdapter,
 	qoder: qoderAdapter,

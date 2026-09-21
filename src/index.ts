@@ -13,11 +13,13 @@
  *    (side by side, no judging). Why: .agents/notes/implemented/2026-08-17-no-wall-clock-timeout.md
  *
  * 2. Permission tiers are enforced mechanically — by the target harness, or by the
- *    session driver answering protocol permission requests (claude's can_use_tool) —
+ *    session driver answering protocol permission requests (dsh's ACP escalation deny) —
  *    never by a prompt request, and defaults are per-adapter:
  *    codex/pi/kimi/codebuddy/reasonix/qoder/claude/dsh
- *    yolo; kimi is yolo-only (headless mode rejects permission flags), so readonly/write are refused;
- *    concurrent write/yolo tasks in the same directory are refused outright. Why: .agents/notes/implemented/2026-09-07-kimi-yolo-only.md
+ *    yolo; kimi is yolo-only (headless print mode rejects permission flags and forces
+ *    Never Ask), so readonly/write are refused;
+ *    concurrent write/yolo tasks in the same directory are refused outright.
+ *    Why: .agents/notes/implemented/2026-09-21-receipt-label-truth-pass.md
  *
  * 3. One tool surface: `agent` is an enum rather than one tool per CLI, because
  *    tool descriptions cost context in every request.

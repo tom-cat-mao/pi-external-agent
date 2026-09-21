@@ -326,8 +326,11 @@ export class ClaudeStreamJsonDriver extends StdioProcess implements SessionDrive
 			return;
 		}
 		// can_use_tool answers follow the tier the same way the ACP driver does:
-		// readonly fails closed because nothing else bounds the run, while write
-		// and yolo already run under their own CLI-side permission mode.
+		// readonly fails closed as a backstop, while write and yolo already run
+		// under their own CLI-side permission mode. On a readonly turn this is
+		// normally unreachable: the dontAsk CLI mode denies unapproved tools
+		// itself and raises no such request — hence the receipt's "cli-mode"
+		// label rather than a claim that this deny is the enforcement point.
 		if (subtype === "can_use_tool") {
 			const response =
 				this.mode === "readonly"

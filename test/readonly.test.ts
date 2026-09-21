@@ -1,7 +1,9 @@
 /**
  * Regression tests for the codebuddy readonly mapping (default mode +
- * runtime-built --settings allow/deny rules + PreToolUse Bash hook) and the
- * claude stream-json readonly mapping.
+ * runtime-built --settings allow/deny rules + PreToolUse Bash hook), the
+ * claude stream-json readonly mapping, and the enforcement label every
+ * readonly receipt carries — the enforcer differs per CLI, so the label has to
+ * name the real one.
  *
  * Run with `node --test test/readonly.test.ts` on Node 22.18+ / 26 (native
  * TypeScript type stripping) or any TS loader.
@@ -13,8 +15,11 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, rmdirSync, unlinkSync
 import { tmpdir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
-import { ADAPTERS, buildReadonlySettings } from "../src/adapters.ts";
+import { ADAPTERS, AGENT_IDS, buildReadonlySettings } from "../src/adapters.ts";
 import { SESSION_DRIVERS } from "../src/drivers/index.ts";
+import { enforcementDisplay, sessionReadOnlyEnforcement } from "../src/hub/shared.ts";
+import { receiptFromStartArgs } from "../src/hub/reporting.ts";
+import { validateDispatch } from "../src/hub/registry.ts";
 
 const HOOK_PATH = fileURLToPath(new URL("../hooks/codebuddy-readonly.js", import.meta.url));
 const ADAPTERS_PATH = fileURLToPath(new URL("../src/adapters.ts", import.meta.url));
@@ -65,6 +70,59 @@ test("claude persistent session: readonly -> dontAsk with stream-json", () => {
 	// claude upgraded to yolo default with stream-json persistence like codebuddy
 	const ro = ADAPTERS.claude.buildDispatch({ task: "t", cwd: "/tmp", mode: "readonly" });
 	assert.equal(ro.argv[ro.argv.indexOf("--permission-mode") + 1], "dontAsk");
+});
+
+test("readonly enforcement labels name the real enforcer", () => {
+	// Not every CLI hands the tier to its own permission layer, so rounding
+	// everything to "harness-enforced" would claim a boundary that is not there:
+	// claude's dontAsk mode denies inside the CLI (no can_use_tool is raised),
+	// and reasonix's ACP session pins no tier at all — the driver rejecting
+	// permission prompts is all that is left.
+	assert.equal(sessionReadOnlyEnforcement("claude", "readonly"), "cli-mode");
+	assert.equal(sessionReadOnlyEnforcement("reasonix", "readonly"), "driver-rejected-prompts");
+	for (const agent of ["codex", "pi", "codebuddy", "qoder", "dsh"] as const) {
+		assert.equal(sessionReadOnlyEnforcement(agent, "readonly"), "harness-enforced", agent);
+	}
+	for (const agent of AGENT_IDS) {
+		for (const mode of ["write", "yolo"] as const) {
+			assert.equal(sessionReadOnlyEnforcement(agent, mode), "not-applicable", `${agent}/${mode}`);
+		}
+	}
+});
+
+test("enforcement labels reach the receipt and expand to what the caller reads", () => {
+	const claude = receiptFromStartArgs({ agent: "claude", task: "audit", mode: "readonly", cwd: "/tmp" }, "/tmp");
+	assert.equal(claude?.readOnlyEnforcement, "cli-mode");
+	assert.match(enforcementDisplay(claude!), /cli-mode \(dontAsk denies everything not pre-approved\)/);
+
+	const reasonix = receiptFromStartArgs({ agent: "reasonix", task: "audit", mode: "readonly", cwd: "/tmp" }, "/tmp");
+	assert.equal(reasonix?.readOnlyEnforcement, "driver-rejected-prompts");
+	assert.match(enforcementDisplay(reasonix!), /confines only ≤1\.38\.7; fail-open from 1\.38\.8/);
+});
+
+test("kimi: the yolo receipt and the readonly refusal both state what print mode does", () => {
+	// kimi-code 2.0.2: -p rejects --yolo/--auto/--plan and forces Never Ask, so
+	// config.toml's default_permission_mode never governs a headless run, and
+	// the requested yolo is not the mode that runs (Never Ask is more permissive).
+	const dispatch = ADAPTERS.kimi.buildDispatch({ task: "t", cwd: "/tmp", mode: "yolo" });
+	assert.match(dispatch.effectivePolicy ?? "", /-p forces Never Ask \(auto\)/);
+	assert.match(dispatch.effectivePolicy ?? "", /default_permission_mode is not consulted/);
+	assert.match(dispatch.effectivePolicy ?? "", /static deny rules still apply/);
+	assert.doesNotMatch(ADAPTERS.kimi.useFor, /0\.41\.0|config permission mode/);
+
+	const refused = validateDispatch("kimi", "readonly", "/tmp/kimi-label-cwd", undefined);
+	if (refused.ok) throw new Error("kimi readonly must stay refused");
+	assert.match(refused.reason, /kimi is yolo-only \(requested "readonly"\)/);
+	assert.match(refused.reason, /-p rejects every permission flag and forces Never Ask/);
+
+	const write = validateDispatch("kimi", "write", "/tmp/kimi-label-cwd", undefined);
+	if (write.ok) throw new Error("kimi write must stay refused");
+	assert.match(write.reason, /cannot select a lower tier/);
+
+	// Failures arrive on stderr, which never reaches parseEvent (hub/registry.ts
+	// reads it separately), so a bare stdout line is noise, not an error event.
+	assert.equal(ADAPTERS.kimi.parseEvent("error: something went wrong"), null);
+	assert.equal(ADAPTERS.kimi.parseEvent("plain tool echo"), null);
 });
 
 test("ACP codebuddy driver: readonly -> default + --settings; write/yolo unchanged", () => {
