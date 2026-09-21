@@ -1322,19 +1322,23 @@ export function validateDispatch(
 
 	// Fail closed below the adapter's floor too: an adapter with minMode
 	// (kimi) has no lower tier at all — accepting one would be a label
-	// with no enforcement behind it.
+	// with no enforcement behind it. The adapter states why in its own terms
+	// (minModeNote), so the refusal carries the real reason.
 	const minMode = adapter.minMode ?? "readonly";
 	if (MODE_RANK[mode] < MODE_RANK[minMode]) {
 		return {
 			ok: false,
 			reason:
-				`${agent} is ${minMode}-only (requested "${mode}"). ` +
-				`Pick an agent with a lower tier (${AGENT_IDS.filter((i) => (ADAPTERS[i].minMode ?? "readonly") === "readonly").join(", ")}).`,
+				`${agent} is ${minMode}-only (requested "${mode}")` +
+				(adapter.minModeNote ? `: ${adapter.minModeNote}` : ".") +
+				` Pick an agent with a lower tier (${AGENT_IDS.filter((i) => (ADAPTERS[i].minMode ?? "readonly") === "readonly").join(", ")}).`,
 		};
 	}
 
-	// Fail closed: never exceed the adapter's mode ceiling. kimi's ceiling is
-	// read-only precisely because its harness has no sandbox to bound writes.
+	// Fail closed: never exceed the adapter's mode ceiling. An adapter whose
+	// harness enforces no read-only tier (kimi) caps at the tiers it can
+	// really serve, so a request above the ceiling is refused instead of run
+	// under a label nothing backs.
 	if (MODE_RANK[mode] > MODE_RANK[adapter.maxMode]) {
 		const reason = !adapter.enforcesReadOnly
 			? `${agent} has no harness-enforced sandbox, so ${mode} mode cannot be bounded. ` +

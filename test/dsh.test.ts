@@ -271,7 +271,8 @@ test("dsh adapter: yolo default, every tier enforced, all seven effort levels", 
 	assert.equal(adapter.maxMode, "yolo");
 	assert.equal(adapter.minMode, undefined);
 	assert.equal(adapter.enforcesReadOnly, true);
-	assert.equal(adapter.driverEnforcedReadOnly, undefined);
+	// dsh's own sandbox is the enforcer, so no override label is declared
+	assert.equal(adapter.readonlyEnforcement, undefined);
 	assert.deepEqual(adapter.supportedEfforts, EFFORT_LEVELS);
 	assert.equal(adapter.session?.steer, true);
 	assert.equal(adapter.session?.followUp, true);

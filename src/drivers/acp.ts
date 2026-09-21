@@ -120,9 +120,12 @@ export class AcpDriver extends BaseSessionDriver implements SessionDriver {
 		// (codebuddy: --permission-mode default + --settings deny rules + Bash
 		// hook), a permission request should never reach this driver at all —
 		// rule-layer denies happen silently inside codebuddy. "reject" stays as
-		// the backstop for dialects without settings enforcement (and note that
+		// the backstop for dialects without settings enforcement, and for a
+		// first-tier harness — reasonix — it is the ONLY confinement, which is
+		// why the receipt names it rather than a harness boundary: it bites only
+		// while that CLI boots in Ask (≤1.38.7; docs/adapters.md). Note that
 		// rejecting a codebuddy ACP request cancels the whole turn, which is
-		// exactly why readonly moved off plan mode).
+		// exactly why readonly moved off plan mode.
 		this.autoPermission = (this.dialect.failClosedPermissionModes ?? ["readonly"]).includes(input.mode) ? "reject" : "allow";
 		// The dialect's prepare hook runs before the spawn: a dialect that cannot
 		// provision what its process needs (dsh: the settings document and the

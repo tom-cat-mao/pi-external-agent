@@ -10,7 +10,8 @@ test("claude adapter basics", () => {
 	assert.equal(a.defaultMode, "yolo");
 	assert.equal(a.maxMode, "yolo");
 	assert.equal(a.enforcesReadOnly, true);
-	assert.equal(a.driverEnforcedReadOnly, true);
+	// The don't-ask CLI mode is the enforcer, not the driver's can_use_tool deny
+	assert.equal(a.readonlyEnforcement, "cli-mode");
 	assert.equal(a.degraded, "unverified against a real endpoint; fixture-tested only");
 	assert.equal(a.session?.steer, true);
 	assert.equal(a.session?.followUp, true);
@@ -24,14 +25,16 @@ test("claude is steerable and follow-up capable in the capability lists", () => 
 	assert.equal(FOLLOWUP_AGENT_IDS.includes("claude"), true);
 });
 
-test("claude stream-json mapping: mode to permission flags, readonly to driver enforcement", () => {
+test("claude stream-json mapping: mode to permission flags, readonly to the CLI mode", () => {
 	const ro = ADAPTERS.claude.buildDispatch({ task: "audit", cwd: "/tmp", mode: "readonly" });
 	assert.deepEqual(ro.argv.slice(0, 3), ["-p", "audit", "--output-format"]);
 	assert.equal(ro.argv[3], "stream-json");
 	assert.equal(ro.argv[ro.argv.indexOf("--permission-mode") + 1], "dontAsk");
 	assert.equal(ro.promptArgIndex, 1);
-	// readonly is answered by the driver's can_use_tool deny, not by the CLI
-	assert.equal(ro.readOnlyEnforcement, "driver-enforced");
+	// readonly is answered by claude's dontAsk mode: the CLI denies everything
+	// not pre-approved and never raises a can_use_tool callback, so the driver's
+	// deny is unreachable code on this path, not the enforcement point.
+	assert.equal(ro.readOnlyEnforcement, "cli-mode");
 	assert.match(ro.effectivePolicy ?? "", /dontAsk/);
 
 	const write = ADAPTERS.claude.buildDispatch({ task: "t", cwd: "/tmp", mode: "write" });

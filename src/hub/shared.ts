@@ -13,6 +13,7 @@ import {
 	ADAPTERS,
 	AGENT_IDS,
 	EFFORT_LEVELS,
+	READ_ONLY_ENFORCEMENTS,
 	type AdapterDispatch,
 	type AgentEvent,
 	type AgentId,
@@ -406,8 +407,10 @@ export function enforcementDisplay(receipt: DispatchReceipt): string {
 	switch (receipt.readOnlyEnforcement) {
 		case "harness-enforced":
 			return "harness-enforced";
-		case "driver-enforced":
-			return "driver-enforced (can_use_tool deny)";
+		case "cli-mode":
+			return "cli-mode (dontAsk denies everything not pre-approved)";
+		case "driver-rejected-prompts":
+			return "driver-rejected prompts (confines only ≤1.38.7; fail-open from 1.38.8)";
 		case "not-enforced":
 			return "NOT enforced by target harness";
 		default:
@@ -416,15 +419,17 @@ export function enforcementDisplay(receipt: DispatchReceipt): string {
 }
 
 /**
- * Readonly enforcement on the persistent path. Drivers that hand the tier to
- * the target harness (sandbox, tool allowlist, settings rules) report
- * harness-enforced; claude's stream-json driver answers can_use_tool with a
- * deny itself, so its receipt says driver-enforced rather than claiming a
- * harness boundary that does not exist.
+ * Readonly enforcement on the persistent path, read off the adapter's own
+ * declaration rather than a generic capability flag: drivers that hand the
+ * tier to the target harness (sandbox, tool allowlist, settings rules) report
+ * harness-enforced, claude reports the dontAsk CLI mode that preempts its
+ * driver's permission callback, and reasonix reports the driver rejecting ACP
+ * permission prompts. None of these is a claim the caller has to take on
+ * faith: docs/adapters.md states what each one rests on.
  */
 export function sessionReadOnlyEnforcement(agent: AgentId, mode: Mode): AdapterDispatch["readOnlyEnforcement"] {
 	if (mode !== "readonly") return "not-applicable";
-	return ADAPTERS[agent].driverEnforcedReadOnly ? "driver-enforced" : "harness-enforced";
+	return ADAPTERS[agent].readonlyEnforcement ?? "harness-enforced";
 }
 export function freezeDispatchReceipt(receipt: DispatchReceipt): DispatchReceipt {
 	return Object.freeze({
@@ -595,10 +600,7 @@ export function isDispatchReceipt(value: unknown): value is DispatchReceipt {
 		AGENT_IDS.includes(receipt.agent as AgentId) &&
 		isMode(receipt.requestedMode) &&
 		(receipt.effectivePolicy === null || typeof receipt.effectivePolicy === "string") &&
-		(receipt.readOnlyEnforcement === "harness-enforced" ||
-			receipt.readOnlyEnforcement === "driver-enforced" ||
-			receipt.readOnlyEnforcement === "not-enforced" ||
-			receipt.readOnlyEnforcement === "not-applicable") &&
+		(READ_ONLY_ENFORCEMENTS as readonly string[]).includes(receipt.readOnlyEnforcement as string) &&
 		!!receipt.model &&
 		typeof receipt.model === "object" &&
 		typeof receipt.model.forwarded === "boolean" &&
