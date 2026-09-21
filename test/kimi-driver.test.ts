@@ -632,7 +632,12 @@ test("kimi ACP session: the thinking vocabulary is re-read from the model's own 
 	try {
 		await harness.start({ mode: "yolo", model: "kimi-k2-thinking", effort: "high" });
 		await waitFor("the first session/prompt", () => ofKind(harness.records(), "prompt")[0]);
-		assert.deepEqual(harness.outcomes, []);
+		// Await the settle; never sample `outcomes` for emptiness after a log
+		// poll. The fixture ends the turn in the same tick it records the
+		// prompt, so the settle races the 20ms poll and wins under load. The
+		// status is the claim the emptiness check was reaching for: the level
+		// was accepted and the turn ran to completion.
+		assert.deepEqual(await harness.turnOutcome(), { status: "done" });
 		assert.deepEqual(
 			ofKind(harness.records(), "set_config_option").map((record) => [record.configId, record.value]),
 			[
