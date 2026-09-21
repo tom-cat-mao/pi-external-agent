@@ -21,7 +21,8 @@
  *   qoder     -> yolo default, stream-json driven; steering is version-gated.
  *                Why: .agents/notes/implemented/2026-09-15-qoder-steering-version-gate.md
  *   dsh       -> DeepSeek harness; yolo default, all three tiers enforced by dsh's own
- *                sandbox through DSH_PERMISSION_MODE in a dedicated DSH_HOME.
+ *                sandbox through DSH_PERMISSION_MODE, with --patch re-pointing dsh's
+ *                settings row at pi's empty settings document in the shared ~/.dsh.
  *
  * Effort flags as currently supported (hub/registry.ts refuses anything else):
  *   pi        -> --thinking <off|minimal|low|medium|high|xhigh|max>
@@ -36,7 +37,7 @@
  */
 
 import { fileURLToPath } from "node:url";
-import { ensureDshHome } from "./dsh-home.ts";
+import { dshOverlayPath, prepareDshLaunch, type DshProfile } from "./dsh-launch.ts";
 
 export type AgentId = "codex" | "pi" | "kimi" | "codebuddy" | "claude" | "reasonix" | "qoder" | "dsh";
 
@@ -178,19 +179,23 @@ export interface AdapterDispatch {
 	};
 	/**
 	 * Extra environment this dispatch needs, merged OVER process.env by both
-	 * spawn paths (never a replacement). dsh is the adapter that uses it: the
-	 * harness home and the requested permission tier travel as DSH_HOME and
-	 * DSH_PERMISSION_MODE.
+	 * spawn paths (never a replacement). A key whose value is `undefined` is
+	 * DELETED from the child's environment instead of being passed through —
+	 * see mergeSpawnEnv. dsh is the adapter that uses it: the requested
+	 * permission tier travels as DSH_PERMISSION_MODE, and an inherited
+	 * DSH_HOME is deleted, because a value exported in the user's shell would
+	 * otherwise point dsh at a different home than the one the overlay was
+	 * written into.
 	 */
-	env?: Record<string, string>;
+	env?: Record<string, string | undefined>;
 	/**
 	 * A non-fatal notice about this dispatch's environment. hub/registry.ts
 	 * records it as a task warning event, which is where non-fatal notices are
-	 * surfaced (external_agent_status: "non-fatal warnings"). dsh returns it from
-	 * provisioning: the harness home holds a local credentials copy instead of
-	 * the link to the user's file (the run still works, but that copy can be
-	 * stale), or there was no ~/.dsh/.credentials.yaml to link at all (the
-	 * default provider route or `.env` has to carry auth).
+	 * surfaced (external_agent_status: "non-fatal warnings"). dsh returns it
+	 * from its composition anchor: the offline probe found the composed config
+	 * disagreeing with what the adapter provisioned (a patch outranking our
+	 * overlay, a replaced sandbox/approval row, a preset in our settings
+	 * document), so the requested tier may not be the one in force.
 	 */
 	warning?: string;
 	/**
@@ -198,11 +203,36 @@ export interface AdapterDispatch {
 	 * the adapter refuses to spell out. hub/registry.ts fails the dispatch with
 	 * this reason instead of spawning a process that cannot work, so a refusal
 	 * is never a silent drop. dsh returns it for an effort request on the
-	 * one-shot path (no effort knob exists there) and for a harness home that
-	 * cannot be created at all (an unusable path); absent credentials are a
-	 * warning, not a refusal.
+	 * one-shot path (no effort knob exists there) and for a settings document or
+	 * overlay that cannot be created at all (an unusable path), since without
+	 * them the requested tier is not what governs the run.
 	 */
 	refusal?: string;
+}
+
+/**
+ * Merge an adapter's env over the inherited environment for a spawn. An
+ * `undefined` value is a deliberate DELETION: Node would drop the key on its
+ * own, but the intent has to be expressible, because a variable the adapter
+ * must not let through (dsh's DSH_HOME) can be sitting in the user's shell.
+ */
+export function mergeSpawnEnv(
+	base: NodeJS.ProcessEnv,
+	extra: Record<string, string | undefined>,
+): NodeJS.ProcessEnv {
+	const merged: NodeJS.ProcessEnv = { ...base };
+	for (const [key, value] of Object.entries(extra)) {
+		// Windows environment variables are case-insensitive, and process.env
+		// keeps whatever casing the OS reports: an override or a deletion has to
+		// find the variant already there, or the child ends up with both.
+		const upper = key.toUpperCase();
+		for (const existing of Object.keys(merged)) {
+			if (existing !== key && existing.toUpperCase() === upper) delete merged[existing];
+		}
+		if (value === undefined) delete merged[key];
+		else merged[key] = value;
+	}
+	return merged;
 }
 
 export interface Adapter {
@@ -902,11 +932,22 @@ const qoderAdapter: Adapter = {
 // denied; an escalation with no approval answerer fails closed, and over ACP it
 // arrives as session/request_permission, which the driver answers).
 //
-// DSH_HOME must point at the dedicated harness home from src/dsh-home.ts:
-// dsh's user settings (~/.dsh/settings.yaml, permission.defaultPreset) outrank
-// DSH_PERMISSION_MODE and any --patch overlay, so a run under the shared home
-// would not be bounded by the requested tier at all.
+// The tier only binds because of src/dsh-launch.ts: dsh reads the SETTINGS
+// DOCUMENT's permission.defaultPreset ahead of the variable, so a run under the
+// user's own ~/.dsh/settings.yaml would not be bounded by the requested tier at
+// all. --patch <overlay> replaces the settings row's whole config, pointing it at
+// pi's own empty document, and then the composed default — which the variable
+// drives — governs (verified 0.1.5-rc.2: against a real ~/.dsh holding
+// defaultPreset: danger-full-access, a read-only run's write was denied and the
+// escalation failed closed, settings.yaml untouched). --patch is a LAUNCHER flag:
+// it must precede the task positional.
 // ---------------------------------------------------------------------------
+
+/**
+ * The dsh profile a one-shot run boots. One constant, because the spawn's argv
+ * and the anchor probe have to name the same composition.
+ */
+const DSH_ONESHOT_PROFILE: DshProfile = "headless";
 
 const dshAdapter: Adapter = {
 	id: "dsh",
@@ -926,20 +967,27 @@ const dshAdapter: Adapter = {
 		// "Fail closed" is a readonly fact only: the ACP driver auto-denies
 		// session/request_permission for readonly and auto-allows it for
 		// write/yolo, where the requested tier permits the escalation.
-		`DSH_PERMISSION_MODE=${dshPermissionMode(mode)} under a dedicated DSH_HOME (dsh's own sandbox enforces the tier; ` +
+		`DSH_PERMISSION_MODE=${dshPermissionMode(mode)} with --patch replacing dsh's settings row config ` +
+		"(so the user's own settings document, whose permission.defaultPreset outranks that variable, is not read; " +
+		"dsh's own sandbox enforces the tier; " +
 		(mode === "readonly"
 			? "the driver denies session/request_permission escalations, so readonly fails closed)"
 			: "escalations the harness raises are allowed by the driver, as this tier permits)"),
 	enforcesReadOnly: true,
 	buildDispatch({ task, mode, model, effort }) {
-		const argv = ["--profile", "headless", task];
+		// The overlay path is a pure function of the home directory — spelling it
+		// here touches no filesystem, so even a refusal below can report the exact
+		// command the caller would otherwise run. --patch precedes the task: the
+		// launcher parses it, not dsh's task argument.
+		const overlay = dshOverlayPath();
+		const argv = ["--profile", DSH_ONESHOT_PROFILE, "--patch", overlay, task];
 		const dispatch: AdapterDispatch = {
 			argv,
 			promptArgIndex: argv.length - 1,
 			cwdForwardedToCli: false,
 			effectivePolicy:
-				`DSH_PERMISSION_MODE=${dshPermissionMode(mode)} under a dedicated DSH_HOME ` +
-				"(the user's shared ~/.dsh settings outrank that variable, so they must not be used)",
+				`DSH_PERMISSION_MODE=${dshPermissionMode(mode)} with --patch ${overlay} re-pointing dsh's settings row ` +
+				"at pi's empty settings document (a permissions preset in the user's own document would outrank that variable)",
 			readOnlyEnforcement: mode === "readonly" ? "harness-enforced" : "not-applicable",
 			model: model
 				? {
@@ -952,16 +1000,20 @@ const dshAdapter: Adapter = {
 		};
 		// The transport split first (it is the caller's to fix, and independent of
 		// this machine's state), then provisioning. Both are refusals, not throws:
-		// hub/registry.ts fails the dispatch with the reason they carry. A missing
-		// ~/.dsh/.credentials.yaml is NOT one of them — dsh runs credential-less on
-		// its default provider route, so that case comes back as a warning.
+		// hub/registry.ts fails the dispatch with the reason they carry, and a
+		// refusal never hands out an env — there is nothing to merge.
 		if (effort) return { ...dispatch, refusal: DSH_ONESHOT_EFFORT_REFUSAL };
-		const home = ensureDshHome();
-		if (!home.ok) return { ...dispatch, refusal: home.reason };
+		// The probe runs under the same profile this dispatch boots: the
+		// composition is per profile, so the anchor has to read the right one.
+		const launch = prepareDshLaunch(DSH_ONESHOT_PROFILE);
+		if (!launch.ok) return { ...dispatch, refusal: launch.reason };
 		return {
 			...dispatch,
-			...(home.warning ? { warning: home.warning } : {}),
-			env: { DSH_HOME: home.home, DSH_PERMISSION_MODE: dshPermissionMode(mode) },
+			...(launch.warning ? { warning: launch.warning } : {}),
+			// DSH_HOME is deleted rather than set: the overlay above already names
+			// the home, and an inherited value would point the child at a home
+			// neither provisioned nor anchored.
+			env: { DSH_PERMISSION_MODE: dshPermissionMode(mode), DSH_HOME: undefined },
 		};
 	},
 	// Plain-text stdout: no --json exists in this release, so every non-empty

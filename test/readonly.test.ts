@@ -18,7 +18,7 @@ import { SESSION_DRIVERS } from "../src/drivers/index.ts";
 
 const HOOK_PATH = fileURLToPath(new URL("../hooks/codebuddy-readonly.js", import.meta.url));
 const ADAPTERS_PATH = fileURLToPath(new URL("../src/adapters.ts", import.meta.url));
-const DSH_HOME_PATH = fileURLToPath(new URL("../src/dsh-home.ts", import.meta.url));
+const DSH_LAUNCH_PATH = fileURLToPath(new URL("../src/dsh-launch.ts", import.meta.url));
 
 function runHook(input: string): any {
 	const out = execFileSync("node", [HOOK_PATH], { input, encoding: "utf8" });
@@ -127,7 +127,7 @@ test("hook: invalid JSON fails closed", () => {
 test("settings hook command works from an install path with spaces and quotes", async () => {
 	const dir = mkdtempSync(path.join(tmpdir(), "ext 'a$gent sync-"));
 	// Mirrors the installed layout: adapters.ts sits in src/ next to the modules
-	// it imports (dsh-home.ts), and the hook in the sibling hooks/ directory it
+	// it imports (dsh-launch.ts), and the hook in the sibling hooks/ directory it
 	// resolves against.
 	const root = path.join(dir, "install dir");
 	const src = path.join(root, "src");
@@ -135,7 +135,7 @@ test("settings hook command works from an install path with spaces and quotes", 
 	mkdirSync(src);
 	mkdirSync(path.join(root, "hooks"));
 	copyFileSync(ADAPTERS_PATH, path.join(src, "adapters.ts"));
-	copyFileSync(DSH_HOME_PATH, path.join(src, "dsh-home.ts"));
+	copyFileSync(DSH_LAUNCH_PATH, path.join(src, "dsh-launch.ts"));
 	copyFileSync(HOOK_PATH, path.join(root, "hooks", "codebuddy-readonly.js"));
 	try {
 		const mod = await import(pathToFileURL(path.join(src, "adapters.ts")).href);
@@ -147,7 +147,7 @@ test("settings hook command works from an install path with spaces and quotes", 
 		assert.equal(JSON.parse(out).hookSpecificOutput.permissionDecision, "allow");
 	} finally {
 		unlinkSync(path.join(src, "adapters.ts"));
-		unlinkSync(path.join(src, "dsh-home.ts"));
+		unlinkSync(path.join(src, "dsh-launch.ts"));
 		unlinkSync(path.join(root, "hooks", "codebuddy-readonly.js"));
 		rmdirSync(path.join(root, "hooks"));
 		rmdirSync(src);

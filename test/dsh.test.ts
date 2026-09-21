@@ -2,38 +2,33 @@
  * dsh (DeepSeek harness) foundation, covering the pieces the rest of the dsh
  * work depends on:
  *   - the one-shot adapter: argv, per-mode env, effort tokens, refusals;
- *   - ensureDshHome: lazy, idempotent provisioning with injectable paths;
+ *   - ensureDshLaunch: the shared ~/.dsh home, our empty settings document and
+ *     the overlay that pins dsh to it, with injectable paths;
+ *   - the composition anchor: the memoized `--dump-config` probe and the three
+ *     ways the composed config can disagree with what provisioning wrote;
  *   - the generalized ACP entry argv and the dialect env/effort hooks;
- *   - the per-spawn env plumbing of both transports, and the hub's refusal path.
+ *   - the per-spawn env plumbing of both transports (including the DSH_HOME
+ *     deletion), and the hub's refusal path.
  *
  * The hardening pass below drives the same ground adversarially: per-mode argv
  * and env exactness, a refusal that precedes every filesystem dependency, the
- * provisioning arrangements that must not be touched, answer extraction from
- * stdout/stderr fixtures, and the tier at the ACP permission request.
+ * arrangements that must not be touched, answer extraction from stdout/stderr
+ * fixtures, and the tier at the ACP permission request.
  *
  * No live dsh run happens here: the ACP and one-shot paths run against mock
  * `dsh`/`kimi` executables placed on PATH, and the pure functions are called
  * directly. The dsh facts asserted below were verified by hand against
- * dsh 0.1.5-rc.2.
+ * dsh 0.1.5-rc.2, including the live run that pins the design: with the real
+ * ~/.dsh holding `defaultPreset: danger-full-access`, `DSH_PERMISSION_MODE=
+ * read-only dsh --profile headless --patch <overlay> "create a file"` had the
+ * write denied by dsh's sandbox and left settings.yaml untouched.
  *
  * Run with `node --test test/dsh.test.ts`.
  */
-import { afterEach, test } from "node:test";
+import { afterEach, beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
-import {
-	chmodSync,
-	existsSync,
-	lstatSync,
-	mkdirSync,
-	mkdtempSync,
-	readFileSync,
-	readdirSync,
-	readlinkSync,
-	symlinkSync,
-	unlinkSync,
-	writeFileSync,
-} from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -42,9 +37,23 @@ import {
 	EFFORT_LEVELS,
 	dshEffortToken,
 	dshPermissionMode,
+	mergeSpawnEnv,
 	type Effort,
 	type Mode,
 } from "../src/adapters.ts";
+import {
+	DSH_HOME_DIR_NAME,
+	DSH_OVERLAY_NAME,
+	DSH_SETTINGS_DOC_NAME,
+	dshCompositionWarnings,
+	dshOverlayContent,
+	dshOverlayPath,
+	dshSettingsDocPath,
+	dshSharedHome,
+	ensureDshLaunch,
+	resetDshCompositionGuard,
+	type DshProfile,
+} from "../src/dsh-launch.ts";
 import { SESSION_DRIVERS } from "../src/drivers/index.ts";
 import { answerOf, warningsOf, type Task } from "../src/hub/shared.ts";
 import {
@@ -57,14 +66,6 @@ import {
 	modelForwardedOnSession,
 	modelSessionNote,
 } from "../src/hub/registry.ts";
-import {
-	DSH_CREDENTIALS_LINK_NAME,
-	DSH_HARNESS_HOME_NAME,
-	dshCredentialsSource,
-	dshHomeDir,
-	ensureDshHome,
-	linkDshCredentials,
-} from "../src/dsh-home.ts";
 
 const STUBS: Record<string, string> = {
 	"@earendil-works/pi-coding-agent": `export function keyHint(key, description) { return key + " " + description; }`,
@@ -142,14 +143,30 @@ function makeFixtureDir(files: Record<string, string>): string {
 	return dir;
 }
 
-/** A fake user home; `dsh web`'s output file exists only when asked for. */
-function makeHome(withCredentials: boolean): string {
-	const home = mkdtempSync(path.join(tmpdir(), "dsh-user-home-"));
-	if (withCredentials) {
-		mkdirSync(path.join(home, ".dsh"), { recursive: true });
-		writeFileSync(path.join(home, ".dsh", ".credentials.yaml"), "token: test\n");
-	}
-	return home;
+/** A fake user home. Nothing is pre-created: provisioning makes the shared home. */
+function makeHome(): string {
+	return mkdtempSync(path.join(tmpdir(), "dsh-user-home-"));
+}
+
+/** The shared home under a fake user home — the one path every default hangs off. */
+function sharedHome(home: string): string {
+	return path.join(home, DSH_HOME_DIR_NAME);
+}
+
+function overlayIn(home: string): string {
+	return dshOverlayPath(sharedHome(home));
+}
+
+function settingsDocIn(home: string): string {
+	return dshSettingsDocPath(sharedHome(home));
+}
+
+/** A fixture home provisioned exactly the way a dispatch provisions the real one. */
+function launchFixture(): { home: string; overlay: string; settingsDoc: string } {
+	const home = makeHome();
+	const result = ensureDshLaunch({ homeDir: sharedHome(home) });
+	if (!result.ok) throw new Error(result.reason);
+	return { home, overlay: result.overlay, settingsDoc: result.settingsDoc };
 }
 
 function mockLog(file: string): any[] {
@@ -157,6 +174,91 @@ function mockLog(file: string): any[] {
 	const text = readFileSync(file, "utf8").trim();
 	return text ? text.split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
 }
+
+// ---------------------------------------------------------------------------
+// The composition anchor: one probe per process, warnings only
+// ---------------------------------------------------------------------------
+
+/**
+ * A `--dump-config` dump in the shape dsh 0.1.5-rc.2 prints: `- id:` rows with
+ * their own lines, a `# ... patched by <file>` comment above a patched row, and
+ * the row bodies carrying `!!js` expressions the launcher never evaluates.
+ */
+function dump(rows: Array<{ id: string; name?: string; patchedBy?: string; lines: string[] }>): string {
+	const out = ["# == @deepseek-ai/dsh-base"];
+	for (const row of rows) {
+		if (row.patchedBy) out.push(`# == @deepseek-ai/dsh-base, patched by ${row.patchedBy}`);
+		out.push(`- id: ${row.id}`, `  name: '${row.name ?? `@deepseek-ai/dsh-${row.id}`}'`, ...row.lines);
+	}
+	return `${out.join("\n")}\n`;
+}
+
+const settingsRow = (settingsDoc: string, patchedBy?: string) => ({
+	id: "settings",
+	name: "@deepseek-ai/dsh-settings-file",
+	patchedBy,
+	lines: ["  config:", `    path: ${settingsDoc}`],
+});
+
+const sandboxRow = (patchedBy?: string) => ({
+	id: "sandbox-policy",
+	name: "@deepseek-ai/dsh-sandbox-policy",
+	patchedBy,
+	lines: ["  config:", "    mode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'"],
+});
+
+const approvalRow = () => ({
+	id: "approval",
+	name: "@deepseek-ai/dsh-user-approval",
+	lines: ["  config:", "    policy: !!js (process.env.DSH_PERMISSION_MODE ?? 'workspace-write') === 'danger-full-access' ? 'never' : 'ask'"],
+});
+
+/** The two profiles the extension boots, and the two the anchor has to answer for. */
+const ANCHOR_PROFILES: readonly DshProfile[] = ["headless", "acp"];
+
+/** Probe one fixture home under one profile with a given dump; the memo is reset first, as a fresh process would. */
+function anchor(
+	fixture: { overlay: string; settingsDoc: string },
+	dumpText: string,
+	profile: DshProfile = "headless",
+): string[] {
+	resetDshCompositionGuard();
+	return dshCompositionWarnings({
+		overlay: fixture.overlay,
+		settingsDoc: fixture.settingsDoc,
+		profile,
+		run: () => ({ ok: true, dump: dumpText }),
+	});
+}
+
+/**
+ * A fixture home's composed config, as an injected probe returns it. `run` is
+ * the seam the production path fills with a real `dsh --dump-config` spawn, and
+ * the clean shape here is the one provisioning is supposed to produce.
+ */
+const CLEAN_OVERLAY = "/fixtures/overlay.yml";
+const CLEAN_SETTINGS_DOC = "/fixtures/settings.pi-external-agent.yaml";
+
+function cleanAnchor(): void {
+	resetDshCompositionGuard();
+	// EVERY profile: the memo is per profile, so arming one would leave a later
+	// test's spawn to probe this machine through whichever fixture `dsh` is
+	// first on PATH.
+	for (const profile of ANCHOR_PROFILES) {
+		dshCompositionWarnings({
+			overlay: CLEAN_OVERLAY,
+			settingsDoc: CLEAN_SETTINGS_DOC,
+			profile,
+			run: () => ({ ok: true, dump: dump([settingsRow(CLEAN_SETTINGS_DOC, CLEAN_OVERLAY), sandboxRow(), approvalRow()]) }),
+		});
+	}
+}
+
+/**
+ * Every test starts with the anchor already satisfied, for every profile. The
+ * guard's own tests below reset the memo themselves.
+ */
+beforeEach(cleanAnchor);
 
 // ---------------------------------------------------------------------------
 // The one-shot adapter
@@ -191,27 +293,26 @@ test("dsh session policy: fail-closed is a readonly fact, not a claim for write/
 	assert.match(policy("yolo"), /allowed by the driver/);
 });
 
-test("dsh one-shot dispatch: profile argv, dedicated harness home, and the mode's permission env", () => {
-	const home = makeHome(true);
+test("dsh one-shot dispatch: profile argv with the overlay before the task, and the mode's permission env", () => {
+	const home = makeHome();
 	const restoreHome = withEnv({ HOME: home });
 	try {
 		const readonly = ADAPTERS.dsh.buildDispatch({ task: "audit the repo", cwd: "/tmp", mode: "readonly" });
-		assert.deepEqual(readonly.argv, ["--profile", "headless", "audit the repo"]);
-		assert.equal(readonly.promptArgIndex, 2);
+		assert.deepEqual(readonly.argv, ["--profile", "headless", "--patch", overlayIn(home), "audit the repo"]);
+		assert.equal(readonly.promptArgIndex, 4);
 		assert.equal(readonly.argv[readonly.promptArgIndex], "audit the repo");
 		assert.equal(readonly.cwdForwardedToCli, false);
 		assert.equal(readonly.refusal, undefined);
-		assert.equal(readonly.env?.DSH_HOME, path.join(home, DSH_HARNESS_HOME_NAME));
-		assert.equal(readonly.env?.DSH_PERMISSION_MODE, "read-only");
+		assert.deepEqual(readonly.env, { DSH_PERMISSION_MODE: "read-only", DSH_HOME: undefined });
 		assert.equal(readonly.readOnlyEnforcement, "harness-enforced");
 		assert.match(readonly.effectivePolicy ?? "", /DSH_PERMISSION_MODE=read-only/);
-		assert.match(readonly.effectivePolicy ?? "", /shared ~\/\.dsh settings outrank/);
+		assert.match(readonly.effectivePolicy ?? "", /re-pointing dsh's settings row/);
 
-		// Provisioning ran: the harness home exists and its credentials entry is a
-		// symlink to the user's own file — never a copy.
-		const link = path.join(home, DSH_HARNESS_HOME_NAME, ".credentials.yaml");
-		assert.equal(lstatSync(link).isSymbolicLink(), true);
-		assert.equal(readlinkSync(link), path.join(home, ".dsh", ".credentials.yaml"));
+		// Provisioning ran, in the SHARED home: an empty settings document and the
+		// overlay that points dsh's settings row at it.
+		const settingsDoc = settingsDocIn(home);
+		assert.equal(readFileSync(settingsDoc, "utf8"), "");
+		assert.equal(readFileSync(overlayIn(home), "utf8"), dshOverlayContent(settingsDoc));
 
 		const write = ADAPTERS.dsh.buildDispatch({ task: "t", cwd: "/tmp", mode: "write" });
 		assert.equal(write.env?.DSH_PERMISSION_MODE, "workspace-write");
@@ -245,16 +346,16 @@ test("dshEffortToken maps all seven levels onto the ACP vocabulary off|low|high|
 });
 
 test("dsh one-shot refuses an effort request instead of dropping it", () => {
-	// No credentials on purpose: the refusal must be about the transport, not about
-	// this machine's provisioning state.
-	const home = makeHome(false);
+	const home = makeHome();
 	const restoreHome = withEnv({ HOME: home });
 	try {
 		const dispatch = ADAPTERS.dsh.buildDispatch({ task: "t", cwd: "/tmp", mode: "yolo", effort: "high" });
 		assert.match(dispatch.refusal ?? "", /only inside an ACP session/);
 		assert.match(dispatch.refusal ?? "", /one-shot headless profile has no effort knob/);
 		assert.equal(dispatch.argv.includes("--effort"), false);
-		assert.deepEqual(dispatch.argv, ["--profile", "headless", "t"]);
+		// The refusal is about the transport, but the command it reports is still
+		// the real one: the overlay path is a pure function of the home.
+		assert.deepEqual(dispatch.argv, ["--profile", "headless", "--patch", overlayIn(home), "t"]);
 		assert.equal(dispatch.effort.requested, "high");
 		assert.equal(dispatch.effort.forwarded, false);
 		assert.match(dispatch.effort.note, /NOT forwarded/);
@@ -264,62 +365,15 @@ test("dsh one-shot refuses an effort request instead of dropping it", () => {
 	}
 });
 
-test("dsh one-shot dispatch proceeds without a credentials link, warning with the remedy", () => {
-	// A user with no ~/.dsh/.credentials.yaml is not a user who cannot run: an
-	// empty harness home completes a headless run on the default provider route
-	// (verified 0.1.5-rc.2), and dsh reads project/user `.env` fallbacks too.
-	const home = makeHome(false);
-	const restoreHome = withEnv({ HOME: home });
-	try {
-		const dispatch = ADAPTERS.dsh.buildDispatch({ task: "t", cwd: "/tmp", mode: "write" });
-		assert.equal(dispatch.refusal, undefined);
-		assert.equal(dispatch.env?.DSH_HOME, path.join(home, DSH_HARNESS_HOME_NAME));
-		assert.equal(dispatch.env?.DSH_PERMISSION_MODE, "workspace-write");
-		const warning = dispatch.warning ?? "";
-		assert.match(warning, /no .*\.credentials\.yaml to link/);
-		assert.ok(warning.includes(path.join(home, ".dsh", ".credentials.yaml")), "the warning names the file that is missing");
-		assert.match(warning, /default provider route or \.env must carry auth/);
-		assert.match(warning, /run `dsh web` once to manage credentials/);
-		// The home is still provisioned — the requested tier needs it — but there
-		// is no credentials entry at all, which is the state a credential-less dsh
-		// run works in: never a dangling link for dsh to read.
-		assert.equal(lstatSync(path.join(home, DSH_HARNESS_HOME_NAME)).isDirectory(), true);
-		assert.throws(() => lstatSync(path.join(home, DSH_HARNESS_HOME_NAME, DSH_CREDENTIALS_LINK_NAME)), /ENOENT/);
-	} finally {
-		restoreHome();
-	}
-});
-
-test("dsh one-shot dispatch: a forked credentials copy is a warning, not a refusal", () => {
-	const home = makeHome(true);
-	// dsh's atomic credential write leaves a real file where the link was.
-	mkdirSync(path.join(home, DSH_HARNESS_HOME_NAME), { recursive: true });
-	const fork = path.join(home, DSH_HARNESS_HOME_NAME, DSH_CREDENTIALS_LINK_NAME);
-	writeFileSync(fork, "token: older\n");
-	const restoreHome = withEnv({ HOME: home });
-	try {
-		const dispatch = ADAPTERS.dsh.buildDispatch({ task: "t", cwd: "/tmp", mode: "write" });
-		// The run is still spelled out and still gets its home: the copy works,
-		// it may just be stale.
-		assert.equal(dispatch.refusal, undefined);
-		assert.equal(dispatch.env?.DSH_HOME, path.join(home, DSH_HARNESS_HOME_NAME));
-		assert.match(dispatch.warning ?? "", /local credentials copy/);
-		assert.match(dispatch.warning ?? "", /Delete .*\.credentials\.yaml to re-link it/);
-		assert.equal(readFileSync(fork, "utf8"), "token: older\n");
-	} finally {
-		restoreHome();
-	}
-});
-
 test("dsh reports a model override as not forwarded rather than claiming it traveled", () => {
-	const home = makeHome(true);
+	const home = makeHome();
 	const restoreHome = withEnv({ HOME: home });
 	try {
 		const dispatch = ADAPTERS.dsh.buildDispatch({ task: "t", cwd: "/tmp", mode: "yolo", model: "deepseek-chat" });
 		assert.equal(dispatch.model.requested, "deepseek-chat");
 		assert.equal(dispatch.model.forwarded, false);
 		assert.match(dispatch.model.note, /NOT forwarded/);
-		assert.deepEqual(dispatch.argv, ["--profile", "headless", "t"]);
+		assert.equal(dispatch.argv.includes("--model"), false);
 	} finally {
 		restoreHome();
 	}
@@ -335,171 +389,490 @@ test("dsh parseEvent: plain-text stdout is the answer, reasoning stays reasoning
 });
 
 // ---------------------------------------------------------------------------
-// ensureDshHome
+// ensureDshLaunch: the shared home's two files
 // ---------------------------------------------------------------------------
 
-test("ensureDshHome creates the harness home and the credentials symlink, idempotently", () => {
-	const root = mkdtempSync(path.join(tmpdir(), "dsh-provision-"));
-	const homeDir = path.join(root, "harness-home");
-	const credentialsSource = path.join(root, "dsh", ".credentials.yaml");
-	mkdirSync(path.dirname(credentialsSource), { recursive: true });
-	writeFileSync(credentialsSource, "token: test\n");
+test("ensureDshLaunch creates the empty settings document and our overlay, idempotently", () => {
+	const home = makeHome();
+	const homeDir = sharedHome(home);
+	const settingsDoc = settingsDocIn(home);
+	const overlay = overlayIn(home);
 
-	const first = ensureDshHome({ homeDir, credentialsSource });
+	const first = ensureDshLaunch({ homeDir });
 	assert.equal(first.ok, true);
 	if (!first.ok) return;
-	assert.equal(first.home, homeDir);
-	const link = path.join(homeDir, ".credentials.yaml");
-	assert.equal(first.credentials, link);
-	assert.equal(lstatSync(link).isSymbolicLink(), true);
-	assert.equal(readlinkSync(link), credentialsSource);
+	assert.equal(first.overlay, overlay);
+	assert.equal(first.settingsDoc, settingsDoc);
+	// EMPTY, and exactly the documented patch entry naming the absolute doc path.
+	assert.equal(readFileSync(settingsDoc, "utf8"), "");
+	assert.equal(readFileSync(overlay, "utf8"), dshOverlayContent(settingsDoc));
+	assert.match(readFileSync(overlay, "utf8"), /# Written by pi-external-agent/);
+	assert.match(readFileSync(overlay, "utf8"), new RegExp(`^- id: settings\\n  config:\\n    path: ${settingsDoc}$`, "m"));
 
-	// A second call leaves the correct link untouched (same inode, same target).
-	const inode = lstatSync(link).ino;
-	const second = ensureDshHome({ homeDir, credentialsSource });
+	// Provisioning is idempotent: the second call is a no-op, not a rewrite (the
+	// document is only ever CREATED, so an existing one is never truncated, and
+	// the overlay is left alone while its content already matches). A read-only
+	// file is how that is observable: a write would fail, and a write that is
+	// not needed cannot.
+	chmodSync(overlay, 0o444);
+	const second = ensureDshLaunch({ homeDir });
 	assert.equal(second.ok, true);
-	assert.equal(lstatSync(link).ino, inode);
-	assert.equal(readlinkSync(link), credentialsSource);
+	assert.equal(readFileSync(settingsDoc, "utf8"), "");
+	assert.equal(readFileSync(overlay, "utf8"), dshOverlayContent(settingsDoc));
 });
 
-test("ensureDshHome replaces a link that points elsewhere and leaves real files alone", () => {
-	const root = mkdtempSync(path.join(tmpdir(), "dsh-provision-"));
-	const homeDir = path.join(root, "harness-home");
-	const credentialsSource = path.join(root, "dsh", ".credentials.yaml");
-	mkdirSync(path.dirname(credentialsSource), { recursive: true });
-	writeFileSync(credentialsSource, "token: test\n");
-	mkdirSync(homeDir, { recursive: true });
-	const link = path.join(homeDir, ".credentials.yaml");
+test("ensureDshLaunch never clobbers an existing settings document", () => {
+	const fixture = launchFixture();
+	const { settingsDoc, overlay } = fixture;
+	// A user (or an earlier build) wrote something into it. It is not ours to
+	// erase — the anchor reports a preset in it as a warning instead.
+	writeFileSync(settingsDoc, "permission:\n  defaultPreset: danger-full-access\n");
 
-	// A stale link target (a home that moved) means dsh reads no credentials: replace it.
-	writeFileSync(path.join(root, "stale.yaml"), "old\n");
-	symlinkSync(path.join(root, "stale.yaml"), link);
-	const replaced = ensureDshHome({ homeDir, credentialsSource });
-	assert.equal(replaced.ok, true);
-	assert.equal(readlinkSync(link), credentialsSource);
-
-	// A real file at that name is the user's own arrangement: never deleted, and
-	// not a failure either.
-	unlinkSync(link);
-	writeFileSync(link, "hand-managed\n");
-	const kept = ensureDshHome({ homeDir, credentialsSource });
-	assert.equal(kept.ok, true);
-	assert.equal(lstatSync(link).isSymbolicLink(), false);
-	assert.equal(readFileSync(link, "utf8"), "hand-managed\n");
-});
-
-test("ensureDshHome: a local credentials copy is kept and warned about, with the one-line fix", () => {
-	const root = mkdtempSync(path.join(tmpdir(), "dsh-provision-"));
-	const homeDir = path.join(root, "harness-home");
-	const credentialsSource = path.join(root, "dsh", ".credentials.yaml");
-	mkdirSync(path.dirname(credentialsSource), { recursive: true });
-	writeFileSync(credentialsSource, "token: user\n");
-	mkdirSync(homeDir, { recursive: true });
-	const link = path.join(homeDir, ".credentials.yaml");
-	// What a dsh-side credentials write leaves behind: a real file where the
-	// symlink used to be, holding a copy that drifts as the user's file rotates.
-	writeFileSync(link, "token: older\n");
-
-	const result = ensureDshHome({ homeDir, credentialsSource });
+	const result = ensureDshLaunch({ homeDir: sharedHome(fixture.home) });
 	assert.equal(result.ok, true);
-	if (!result.ok) return;
-	assert.equal(result.credentials, link);
-	// Provisioning succeeds and never clobbers the copy: it may be the only
-	// credentials that still work.
-	assert.equal(lstatSync(link).isSymbolicLink(), false);
-	assert.equal(readFileSync(link, "utf8"), "token: older\n");
-	assert.ok(result.warning, "a local copy must be reported, not silently accepted");
-	assert.match(result.warning, /local credentials copy/);
-	assert.ok(result.warning.includes(link), "the warning names the file to delete");
-	assert.ok(result.warning.includes(credentialsSource), "and the file it should be linked to");
+	assert.equal(readFileSync(settingsDoc, "utf8"), "permission:\n  defaultPreset: danger-full-access\n");
+	assert.equal(readFileSync(overlay, "utf8"), dshOverlayContent(settingsDoc));
+});
+
+test("ensureDshLaunch rewrites a stale overlay and leaves a current one alone", () => {
+	const home = makeHome();
+	const homeDir = sharedHome(home);
+	const overlay = overlayIn(home);
+	ensureDshLaunch({ homeDir });
+	// A stale overlay from an earlier build: it points at a document nothing
+	// maintains, so the settings row would read the wrong file.
+	writeFileSync(overlay, "- id: settings\n  config:\n    path: /somewhere/else.yaml\n");
+	const rewritten = ensureDshLaunch({ homeDir });
+	assert.equal(rewritten.ok, true);
+	assert.equal(readFileSync(overlay, "utf8"), dshOverlayContent(settingsDocIn(home)));
+
+	// With the content matching, the file is not touched again: a read-only
+	// overlay is still a successful provisioning run.
+	chmodSync(overlay, 0o444);
+	const second = ensureDshLaunch({ homeDir });
+	assert.equal(second.ok, true);
+	assert.equal(readFileSync(overlay, "utf8"), dshOverlayContent(settingsDocIn(home)));
+});
+
+test("ensureDshLaunch replaces a symlinked settings document instead of carrying its target into the run", () => {
+	const fixture = launchFixture();
+	const { settingsDoc } = fixture;
+	// The reserved name pointed at a document we did not write — the one thing
+	// the whole module exists to keep dsh from reading.
+	const target = path.join(fixture.home, "user-settings.yaml");
+	writeFileSync(target, "permission:\n  defaultPreset: danger-full-access\n");
+	unlinkSync(settingsDoc);
+	symlinkSync(target, settingsDoc);
+
+	const result = ensureDshLaunch({ homeDir: sharedHome(fixture.home) });
+	assert.equal(result.ok, true);
+	assert.equal(lstatSync(settingsDoc).isSymbolicLink(), false, "the symlink must be replaced by a regular file");
+	assert.equal(readFileSync(settingsDoc, "utf8"), "");
+	// The link's TARGET is the user's own file: replaced, never touched.
+	assert.equal(readFileSync(target, "utf8"), "permission:\n  defaultPreset: danger-full-access\n");
+});
+
+test("ensureDshLaunch replaces a symlinked overlay with the real thing", () => {
+	const fixture = launchFixture();
+	const overlay = overlayIn(fixture.home);
+	const elsewhere = path.join(fixture.home, "elsewhere.yml");
+	writeFileSync(elsewhere, "hand-written\n");
+	unlinkSync(overlay);
+	symlinkSync(elsewhere, overlay);
+
+	const result = ensureDshLaunch({ homeDir: sharedHome(fixture.home) });
+	assert.equal(result.ok, true);
+	assert.equal(lstatSync(overlay).isSymbolicLink(), false, "the symlink must be replaced by a regular file");
+	assert.equal(readFileSync(overlay, "utf8"), dshOverlayContent(settingsDocIn(fixture.home)));
+	assert.equal(readFileSync(elsewhere, "utf8"), "hand-written\n", "the link's target is untouched");
+});
+
+test("ensureDshLaunch: an unusable home path is a refusal that names it", () => {
+	const root = mkdtempSync(path.join(tmpdir(), "dsh-provision-"));
+	const homeDir = path.join(root, "not-a-directory");
+	writeFileSync(homeDir, "a real file where the shared home should be\n");
+
+	const result = ensureDshLaunch({ homeDir });
+	assert.equal(result.ok, false);
+	if (result.ok) return;
+	assert.match(result.reason, /could not create dsh's shared home/);
+	assert.ok(result.reason.includes(homeDir));
+	// The file it could not replace is reported, never deleted.
+	assert.equal(readFileSync(homeDir, "utf8"), "a real file where the shared home should be\n");
+});
+
+test("ensureDshLaunch: a settings document that cannot be created is a refusal that names it", () => {
+	const home = makeHome();
+	const homeDir = sharedHome(home);
+	mkdirSync(homeDir, { recursive: true });
+	// A file where the document's parent directory would have to be: the path
+	// cannot hold a file at all, which is the one failure that must refuse.
+	const blocked = path.join(homeDir, "blocked");
+	writeFileSync(blocked, "in the way\n");
+	const settingsDoc = path.join(blocked, DSH_SETTINGS_DOC_NAME);
+
+	const result = ensureDshLaunch({ homeDir, settingsDoc });
+	assert.equal(result.ok, false);
+	if (result.ok) return;
+	assert.match(result.reason, /could not create the empty dsh settings document/);
+	assert.ok(result.reason.includes(settingsDoc));
+	assert.equal(readFileSync(blocked, "utf8"), "in the way\n");
+});
+
+test("ensureDshLaunch: an overlay that cannot be written is a refusal that names it", () => {
+	const home = makeHome();
+	const homeDir = sharedHome(home);
+	mkdirSync(homeDir, { recursive: true });
+	// A directory at the overlay's name: reading it fails, and the write that
+	// follows cannot produce the file dsh needs.
+	const overlay = path.join(homeDir, DSH_OVERLAY_NAME);
+	mkdirSync(overlay);
+
+	const result = ensureDshLaunch({ homeDir, overlay });
+	assert.equal(result.ok, false);
+	if (result.ok) return;
+	assert.match(result.reason, /could not write the dsh overlay/);
+	assert.ok(result.reason.includes(overlay));
+	// The empty document was still created: it is provisioned first, and it is
+	// not the failure.
+	assert.equal(readFileSync(settingsDocIn(home), "utf8"), "");
+	assert.equal(lstatSync(overlay).isDirectory(), true);
+});
+
+test("ensureDshLaunch: the default paths hang off HOME, and name the shared home's files", () => {
+	const home = makeHome();
+	const restoreHome = withEnv({ HOME: home });
+	try {
+		assert.equal(dshSharedHome(), sharedHome(home));
+		assert.equal(settingsDocIn(home), path.join(home, DSH_HOME_DIR_NAME, DSH_SETTINGS_DOC_NAME));
+		assert.equal(overlayIn(home), path.join(home, DSH_HOME_DIR_NAME, DSH_OVERLAY_NAME));
+
+		const result = ensureDshLaunch();
+		assert.equal(result.ok, true);
+		if (!result.ok) return;
+		assert.equal(result.settingsDoc, settingsDocIn(home));
+		assert.equal(result.overlay, overlayIn(home));
+		assert.equal(readFileSync(settingsDocIn(home), "utf8"), "");
+	} finally {
+		restoreHome();
+	}
+});
+
+// ---------------------------------------------------------------------------
+// The composition anchor
+// ---------------------------------------------------------------------------
+
+test("the composition anchor probes each profile as itself, and a clean composition stays silent", () => {
+	const fixture = launchFixture();
+	const probes: string[][] = [];
+	const run = (argv: string[]) => {
+		probes.push(argv);
+		return { ok: true, dump: dump([settingsRow(fixture.settingsDoc, fixture.overlay), sandboxRow(), approvalRow()]) };
+	};
+	for (const profile of ANCHOR_PROFILES) {
+		resetDshCompositionGuard();
+		const warnings = dshCompositionWarnings({ overlay: fixture.overlay, settingsDoc: fixture.settingsDoc, profile, run });
+		assert.deepEqual(warnings, [], `a clean composition must stay silent, got ${JSON.stringify(warnings)}`);
+	}
+	// Offline and unambiguous: each probe composes THE PROFILE THE SPAWN BOOTS —
+	// dsh composes base → profile → home → `--patch`, so a probe under the wrong
+	// profile reports on a composition nobody runs.
+	assert.deepEqual(probes, [
+		["--profile", "headless", "--patch", fixture.overlay, "--dump-config"],
+		["--profile", "acp", "--patch", fixture.overlay, "--dump-config"],
+	]);
+});
+
+test("anchor (a): a settings row left reading another file warns with the offending patch", () => {
+	const fixture = launchFixture();
+	const warnings = anchor(
+		fixture,
+		dump([settingsRow("/etc/company/dsh-settings.yaml", "/etc/company/dsh.patch.yml"), sandboxRow(), approvalRow()]),
+	);
+	assert.equal(warnings.length, 1, `expected one warning, got ${JSON.stringify(warnings)}`);
+	const warning = warnings[0];
+	assert.ok(warning.includes("/etc/company/dsh.patch.yml"), "the warning names the patch that won");
+	assert.ok(warning.includes("/etc/company/dsh-settings.yaml"), "and the document dsh would read instead");
+	assert.ok(warning.includes(fixture.settingsDoc), "and the document we wrote");
+	assert.match(warning, /outranks DSH_PERMISSION_MODE/);
+	assert.match(warning, /may not be the one in force/);
+});
+
+test("anchor (a): a settings row with no path at all names our overlay as the patch that lost", () => {
+	const fixture = launchFixture();
+	const warnings = anchor(fixture, dump([{ id: "settings", lines: [] }, sandboxRow(), approvalRow()]));
+	assert.equal(warnings.length, 1, `expected one warning, got ${JSON.stringify(warnings)}`);
+	assert.ok(warnings[0].includes(fixture.overlay), "our overlay is the file that did not take effect");
+	assert.match(warnings[0], /reading no path instead of/);
+});
+
+test("anchor (b): a sandbox-policy row replaced with a literal warns with the patch that did it", () => {
+	const fixture = launchFixture();
+	const warnings = anchor(
+		fixture,
+		dump([
+			settingsRow(fixture.settingsDoc, fixture.overlay),
+			{ id: "sandbox-policy", patchedBy: "/etc/company/dsh.patch.yml", lines: ["  config:", "    mode: read-only"] },
+			approvalRow(),
+		]),
+	);
+	assert.equal(warnings.length, 1, `expected one warning, got ${JSON.stringify(warnings)}`);
+	assert.ok(warnings[0].includes("/etc/company/dsh.patch.yml"), "the warning names the offending patch");
+	assert.match(warnings[0], /sandbox-policy row with config that no longer reads DSH_PERMISSION_MODE/);
+	assert.match(warnings[0], /not what governs the run/);
+});
+
+test("anchor (b): a missing approval row warns that nothing reads the variable", () => {
+	const fixture = launchFixture();
+	const warnings = anchor(fixture, dump([settingsRow(fixture.settingsDoc, fixture.overlay), sandboxRow()]));
+	assert.equal(warnings.length, 1, `expected one warning, got ${JSON.stringify(warnings)}`);
+	assert.match(warnings[0], /dsh's approval row is missing from the composed config/);
+	assert.match(warnings[0], /nothing reads DSH_PERMISSION_MODE/);
+});
+
+test("anchor (b): a decoy comment cannot stand in for a row that no longer reads the variable", () => {
+	const fixture = launchFixture();
+	// The live shape of the spoof: the config pins one literal mode and a
+	// comment mentions the variable, which a substring scan reads as a hook.
+	const warnings = anchor(
+		fixture,
+		dump([
+			settingsRow(fixture.settingsDoc, fixture.overlay),
+			{
+				id: "sandbox-policy",
+				patchedBy: "/etc/company/dsh.patch.yml",
+				lines: ["  config:", "    mode: read-only", "    # pinned: DSH_PERMISSION_MODE is not read here any more"],
+			},
+			approvalRow(),
+		]),
+	);
+	assert.equal(warnings.length, 1, `expected one warning, got ${JSON.stringify(warnings)}`);
+	assert.ok(warnings[0].includes("/etc/company/dsh.patch.yml"), "the warning names the offending patch");
+	assert.match(warnings[0], /sandbox-policy row with config that no longer reads DSH_PERMISSION_MODE/);
+
+	// A `#` inside a quoted scalar is not a comment, so a row whose live config
+	// carries the variable alongside a trailing comment still passes.
+	assert.deepEqual(
+		anchor(
+			fixture,
+			dump([
+				settingsRow(fixture.settingsDoc, fixture.overlay),
+				sandboxRow(),
+				{ id: "approval", lines: ["  config:", "    policy: !!js process.env.DSH_PERMISSION_MODE === 'danger-full-access' ? 'never' : 'ask' # tuned"] },
+			]),
+		),
+		[],
+	);
+});
+
+test("anchor: a settings document that is not a regular file warns and skips the probe", () => {
+	const fixture = launchFixture();
+	resetDshCompositionGuard();
+	unlinkSync(fixture.settingsDoc);
+	mkdirSync(fixture.settingsDoc);
+	let probes = 0;
+	const warnings = dshCompositionWarnings({
+		overlay: fixture.overlay,
+		settingsDoc: fixture.settingsDoc,
+		profile: "headless",
+		run: () => {
+			probes += 1;
+			return { ok: true, dump: "" };
+		},
+	});
+	assert.equal(warnings.length, 1, `expected one warning, got ${JSON.stringify(warnings)}`);
+	assert.ok(warnings[0].includes(fixture.settingsDoc), "the warning names the path");
+	assert.match(warnings[0], /not a regular file/);
+	assert.match(warnings[0], /composition anchor is skipped/);
+	assert.equal(probes, 0, "the probe must not run when the document cannot be read as settings");
+});
+
+test("anchor (a): the path is read from the row's config block, and the last patch that wrote it is named", () => {
+	const fixture = launchFixture();
+	// A sibling `path:` outside `config:` is not what dsh composes: the patch
+	// entry replaces the block wholesale, so only the block counts.
+	assert.deepEqual(
+		anchor(
+			fixture,
+			dump([
+				{
+					id: "settings",
+					patchedBy: fixture.overlay,
+					lines: ["  options:", "    path: /somewhere/else.yaml", "  config:", `    path: ${fixture.settingsDoc}`],
+				},
+				sandboxRow(),
+				approvalRow(),
+			]),
+		),
+		[],
+	);
+
+	// Several patches wrote the row; dsh lists them in composition order, so the
+	// one that won — the file a warning has to name — is the last.
+	const warnings = anchor(
+		fixture,
+		dump([
+			settingsRow("/etc/company/dsh-settings.yaml", "/etc/first.patch.yml, patched by /etc/last.patch.yml"),
+			sandboxRow(),
+			approvalRow(),
+		]),
+	);
+	assert.equal(warnings.length, 1, `expected one warning, got ${JSON.stringify(warnings)}`);
+	assert.ok(warnings[0].includes("/etc/last.patch.yml"), `the winning patch is named: ${warnings[0]}`);
+	assert.equal(warnings[0].includes("/etc/first.patch.yml"), false, "the patch that lost is not named");
+});
+
+test("anchor (c): a permission section written into our document warns and names it", () => {
+	const fixture = launchFixture();
+	writeFileSync(fixture.settingsDoc, "permission:\n  defaultPreset: danger-full-access\n");
+	const warnings = anchor(fixture, dump([settingsRow(fixture.settingsDoc, fixture.overlay), sandboxRow(), approvalRow()]));
+	assert.equal(warnings.length, 1, `expected one warning, got ${JSON.stringify(warnings)}`);
+	assert.ok(warnings[0].includes(fixture.settingsDoc), "the warning names the document");
+	assert.match(warnings[0], /permission: section/);
+	assert.match(warnings[0], /outranks DSH_PERMISSION_MODE/);
+	assert.match(warnings[0], /exists only to be empty/);
 
 	// Doing exactly what the warning says is the whole fix.
-	unlinkSync(link);
-	const relinked = ensureDshHome({ homeDir, credentialsSource });
-	assert.equal(relinked.ok, true);
-	if (!relinked.ok) return;
-	assert.equal(relinked.warning, undefined, "a correct link carries no warning");
-	assert.equal(readlinkSync(link), credentialsSource);
+	writeFileSync(fixture.settingsDoc, "");
+	assert.deepEqual(anchor(fixture, dump([settingsRow(fixture.settingsDoc, fixture.overlay), sandboxRow(), approvalRow()])), []);
 });
 
-test("linkDshCredentials: losing the provisioning race to a correct link is not a failure", () => {
-	const root = mkdtempSync(path.join(tmpdir(), "dsh-race-"));
-	const homeDir = path.join(root, "harness-home");
-	mkdirSync(homeDir, { recursive: true });
-	const credentialsSource = path.join(root, "dsh", ".credentials.yaml");
-	mkdirSync(path.dirname(credentialsSource), { recursive: true });
-	writeFileSync(credentialsSource, "token: test\n");
-	const link = path.join(homeDir, ".credentials.yaml");
+test("the anchor is memoized per profile: one probe each, and neither profile answers for the other", () => {
+	const fixture = launchFixture();
+	resetDshCompositionGuard();
+	const probes: string[] = [];
+	// The two profiles compose DIFFERENTLY: `acp` carries a company patch that
+	// re-points its settings row, `headless` is clean. One shared memo would
+	// report whichever probed first for both of them.
+	const run = (argv: string[]) => {
+		const profile = argv[argv.indexOf("--profile") + 1];
+		probes.push(profile);
+		return profile === "acp"
+			? {
+					ok: true,
+					dump: dump([settingsRow("/etc/company/dsh-settings.yaml", "/etc/company/dsh.patch.yml"), sandboxRow(), approvalRow()]),
+				}
+			: { ok: true, dump: dump([settingsRow(fixture.settingsDoc, fixture.overlay), sandboxRow(), approvalRow()]) };
+	};
+	const call = (profile: DshProfile) =>
+		dshCompositionWarnings({ overlay: fixture.overlay, settingsDoc: fixture.settingsDoc, profile, run });
 
-	// A second pi process provisioned the same home between our check and our
-	// symlinkSync: EEXIST, with the correct link now present. That is the race.
-	symlinkSync(credentialsSource, link);
-	assert.deepEqual(linkDshCredentials(credentialsSource, link), { ok: true });
-	assert.equal(readlinkSync(link), credentialsSource);
-
-	// A link to somewhere else is not a peer's success: report it, touch nothing.
-	const other = path.join(root, "other.yaml");
-	writeFileSync(other, "token: other\n");
-	unlinkSync(link);
-	symlinkSync(other, link);
-	const wrong = linkDshCredentials(credentialsSource, link);
-	assert.equal(wrong.ok, false);
-	if (wrong.ok) return;
-	assert.match(wrong.reason, /could not link/);
-	assert.ok(wrong.reason.includes(link));
-	assert.equal(readlinkSync(link), other);
-
-	// A real file cannot be displaced by a link either.
-	unlinkSync(link);
-	writeFileSync(link, "hand-managed\n");
-	const realFile = linkDshCredentials(credentialsSource, link);
-	assert.equal(realFile.ok, false);
-	assert.equal(readFileSync(link, "utf8"), "hand-managed\n");
+	assert.deepEqual(call("headless"), []);
+	const acp = call("acp");
+	assert.equal(acp.length, 1, `expected one warning, got ${JSON.stringify(acp)}`);
+	assert.ok(acp[0].includes("/etc/company/dsh.patch.yml"), "the acp composition is reported as itself");
+	// A second dispatch — another mode, another task — must not spawn the probe
+	// again: the answer is about this machine and this profile, not one dispatch.
+	assert.deepEqual(call("headless"), []);
+	assert.deepEqual(call("acp"), acp);
+	assert.deepEqual(probes, ["headless", "acp"], "the probe ran more than once per profile");
 });
 
-test("ensureDshHome: no credentials to link succeeds with the remedy, and links nothing", () => {
-	const root = mkdtempSync(path.join(tmpdir(), "dsh-provision-"));
-	const homeDir = path.join(root, "harness-home");
-	const credentialsSource = path.join(root, "dsh", ".credentials.yaml");
-	const result = ensureDshHome({ homeDir, credentialsSource });
-	assert.equal(result.ok, true);
-	if (!result.ok) return;
-	assert.equal(result.home, homeDir);
-	assert.equal(result.credentials, path.join(homeDir, DSH_CREDENTIALS_LINK_NAME));
-	const warning = result.warning ?? "";
-	assert.match(warning, /no .*\.credentials\.yaml to link/);
-	assert.ok(warning.includes(credentialsSource), "the warning names the missing source");
-	assert.match(warning, /default provider route or \.env must carry auth/);
-	assert.match(warning, /run `dsh web` once to manage credentials/);
-	// The home exists — the requested tier needs it — and holds no credentials
-	// entry, so dsh reads no broken link.
-	assert.equal(lstatSync(homeDir).isDirectory(), true);
-	assert.throws(() => lstatSync(path.join(homeDir, DSH_CREDENTIALS_LINK_NAME)), /ENOENT/);
-	assert.equal(existsSync(credentialsSource), false, "provisioning never invents the user's file");
+test("an anchor probe that cannot run warns, and is retried on the next dispatch", () => {
+	const fixture = launchFixture();
+	resetDshCompositionGuard();
+	let probes = 0;
+	const run = () => {
+		probes += 1;
+		return { ok: false, reason: "spawnSync dsh ENOENT" };
+	};
+	const call = (profile: DshProfile) =>
+		dshCompositionWarnings({ overlay: fixture.overlay, settingsDoc: fixture.settingsDoc, profile, run });
 
-	// The next run links by itself once the file exists: the source is the switch.
-	mkdirSync(path.dirname(credentialsSource), { recursive: true });
-	writeFileSync(credentialsSource, "token: test\n");
-	const linked = ensureDshHome({ homeDir, credentialsSource });
-	assert.equal(linked.ok, true);
-	if (!linked.ok) return;
-	assert.equal(linked.warning, undefined);
-	assert.equal(readlinkSync(path.join(homeDir, DSH_CREDENTIALS_LINK_NAME)), credentialsSource);
+	const warnings = call("headless");
+	assert.equal(warnings.length, 1, `expected one warning, got ${JSON.stringify(warnings)}`);
+	assert.match(warnings[0], /^dsh composition anchor unavailable: /);
+	assert.ok(warnings[0].includes("spawnSync dsh ENOENT"), "the warning carries the probe's own reason");
+	assert.match(warnings[0], /may not be the one in force/);
+	// Not memoized as silence: an unavailable anchor says nothing about the
+	// composition dsh will use, so the next dispatch probes again — and an
+	// unavailable `headless` probe says nothing about `acp` either.
+	assert.equal(call("headless").length, 1);
+	assert.equal(call("acp").length, 1);
+	assert.equal(probes, 3, "a failed probe must not be memoized");
+});
+
+test("dsh one-shot: an anchor warning rides AdapterDispatch.warning, and never refuses the dispatch", () => {
+	// The real probe against a fixture `dsh` whose composition points its
+	// settings row at a company file: the adapter must report the disagreement
+	// and still spell out a runnable dispatch.
+	const dir = makeFixtureDir({ dsh: DSH_ONESHOT_MOCK });
+	const home = makeHome();
+	const restorePath = usePath(dir);
+	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: path.join(dir, "dsh-log.jsonl"), DSH_MOCK_DUMP: "foreign" });
+	resetDshCompositionGuard();
+	try {
+		const dispatch = ADAPTERS.dsh.buildDispatch({ task: "t", cwd: "/tmp", mode: "readonly" });
+		assert.equal(dispatch.refusal, undefined, "an anchor warning must never refuse a dispatch");
+		assert.deepEqual(dispatch.argv, ["--profile", "headless", "--patch", overlayIn(home), "t"]);
+		assert.deepEqual(dispatch.env, { DSH_PERMISSION_MODE: "read-only", DSH_HOME: undefined });
+		const warning = dispatch.warning ?? "";
+		assert.ok(warning.includes("/etc/company/dsh.patch.yml"), `the warning names the offending patch: ${warning}`);
+		assert.match(warning, /may not be the one in force/);
+		// The probe is a launcher invocation, not a task: nothing recorded it as one.
+		assert.deepEqual(mockLog(path.join(dir, "dsh-log.jsonl")), []);
+	} finally {
+		restoreEnv();
+		restorePath();
+		cleanAnchor();
+	}
+});
+
+test("dsh one-shot: the real probe over a fixture home composes clean and warns about nothing", () => {
+	// The other half of the anchor's contract: a dsh whose dump reflects what
+	// provisioning wrote (the overlay's own path, both env-hooked rows) produces
+	// no warning at all, so a healthy machine never sees one.
+	const dir = makeFixtureDir({ dsh: DSH_ONESHOT_MOCK });
+	const home = makeHome();
+	const restorePath = usePath(dir);
+	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: path.join(dir, "dsh-log.jsonl") });
+	resetDshCompositionGuard();
+	try {
+		const dispatch = ADAPTERS.dsh.buildDispatch({ task: "t", cwd: "/tmp", mode: "yolo" });
+		assert.equal(dispatch.warning, undefined);
+		assert.equal(dispatch.refusal, undefined);
+		assert.deepEqual(dispatch.env, { DSH_PERMISSION_MODE: "danger-full-access", DSH_HOME: undefined });
+	} finally {
+		restoreEnv();
+		restorePath();
+		cleanAnchor();
+	}
+});
+
+test("no dsh launch surface references the retired harness home", () => {
+	// The dedicated home is gone from the design; the directory may still sit in
+	// a user's home as data, but nothing here may reach for it again.
+	const sources = ["../src/adapters.ts", "../src/dsh-launch.ts", "../src/drivers/index.ts", "../src/drivers/acp.ts", "../src/drivers/base.ts"];
+	for (const source of sources) {
+		const text = readFileSync(new URL(source, import.meta.url), "utf8");
+		assert.doesNotMatch(text, /\.dsh-external-agent|DSH_HARNESS_HOME|\.credentials\.yaml/, `${source} still references the retired harness home`);
+	}
+	for (const mode of ["readonly", "write", "yolo"] as Mode[]) {
+		const dispatch = ADAPTERS.dsh.buildDispatch({ task: "t", cwd: "/tmp", mode });
+		const surface = [dispatch.argv.join(" "), JSON.stringify(dispatch.env), dispatch.effectivePolicy ?? "", dispatch.warning ?? ""].join("\n");
+		assert.doesNotMatch(surface, /dsh-external-agent/, `${mode}: the dispatch surface still references the retired home`);
+	}
 });
 
 // ---------------------------------------------------------------------------
 // The ACP dialect: entry argv, env and effort
 // ---------------------------------------------------------------------------
 
-test("ACP entry argv is dialect-provided: --acp by default, --profile acp for dsh", () => {
+test("ACP entry argv is dialect-provided: --acp by default, --profile acp --patch <overlay> for dsh", () => {
 	assert.deepEqual(SESSION_DRIVERS.reasonix!().buildArgv({ task: "t", cwd: "/tmp", mode: "yolo" }), ["--acp"]);
 	const codebuddy = SESSION_DRIVERS.codebuddy!().buildArgv({ task: "t", cwd: "/tmp", mode: "readonly" });
 	assert.equal(codebuddy[0], "--acp");
 	assert.equal(codebuddy[1], "--permission-mode");
-	const dsh = SESSION_DRIVERS.dsh!().buildArgv({ task: "t", cwd: "/tmp", mode: "yolo" });
-	assert.deepEqual(dsh, ["--profile", "acp"]);
-	// The prompt travels over the protocol, never in the startup argv.
-	assert.equal(dsh.includes("t"), false);
+	const home = makeHome();
+	const restoreHome = withEnv({ HOME: home });
+	try {
+		const dsh = SESSION_DRIVERS.dsh!().buildArgv({ task: "t", cwd: "/tmp", mode: "yolo" });
+		assert.deepEqual(dsh, ["--profile", "acp", "--patch", overlayIn(home)]);
+		// The prompt travels over the protocol, never in the startup argv.
+		assert.equal(dsh.includes("t"), false);
+	} finally {
+		restoreHome();
+	}
 });
 
 test("ACP dialects with an effort flag are unchanged; dsh never gets one", () => {
@@ -507,18 +880,72 @@ test("ACP dialects with an effort flag are unchanged; dsh never gets one", () =>
 	assert.equal(codebuddy[codebuddy.indexOf("--effort") + 1], "high");
 	const reasonix = SESSION_DRIVERS.reasonix!().buildArgv({ task: "t", cwd: "/tmp", mode: "yolo", effort: "high" });
 	assert.equal(reasonix.includes("--effort"), false);
-	const dsh = SESSION_DRIVERS.dsh!().buildArgv({ task: "t", cwd: "/tmp", mode: "yolo", effort: "high" });
-	assert.equal(dsh.includes("--effort"), false);
+	const home = makeHome();
+	const restoreHome = withEnv({ HOME: home });
+	try {
+		const dsh = SESSION_DRIVERS.dsh!().buildArgv({ task: "t", cwd: "/tmp", mode: "yolo", effort: "high" });
+		assert.equal(dsh.includes("--effort"), false);
+	} finally {
+		restoreHome();
+	}
+});
+
+test("dsh ACP session: the anchor probes the acp profile, so a clean acp composition stays silent", async () => {
+	// The fixture's composition is clean ONLY under `--profile acp`: a probe that
+	// composed the one-shot profile would read a settings row someone else wrote
+	// and warn here, which is what makes this a test of the wiring rather than of
+	// the mock.
+	const dir = makeFixtureDir({ dsh: DSH_ACP_MOCK });
+	const home = makeHome();
+	const restorePath = usePath(dir);
+	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: path.join(dir, "dsh-log.jsonl") });
+	resetDshCompositionGuard();
+	try {
+		const driver = SESSION_DRIVERS.dsh!();
+		const warnings: string[] = [];
+		driver.onEvent((event) => {
+			if (event.kind === "warning") warnings.push(event.text);
+		});
+		await driver.start({ task: "t", cwd: dir, mode: "yolo" });
+		driver.kill();
+		assert.deepEqual(warnings, [], "the session's composition was probed under the wrong profile");
+	} finally {
+		restorePath();
+		restoreEnv();
+		cleanAnchor();
+	}
 });
 
 const DSH_ACP_MOCK = `#!/usr/bin/env node
 const fs = require("node:fs");
+const argv = process.argv.slice(2);
 const log = process.env.DSH_MOCK_LOG;
 function record(entry) { if (log) fs.appendFileSync(log, JSON.stringify(entry) + "\\n"); }
 function send(value) { process.stdout.write(JSON.stringify(value) + "\\n"); }
+if (argv.includes("--dump-config")) {
+  // A stand-in for the real composition dump the anchor reads: the settings row
+  // copied out of the overlay we were handed, plus the two rows that read the
+  // tier from the environment. The probe is not a task run, so nothing is
+  // recorded for it.
+  // dsh composes PER PROFILE, so this composition is only clean when it is
+  // read under the profile this fixture stands for: a probe under any other
+  // profile reports a settings row somebody else wrote.
+  const mode = process.env.DSH_MOCK_DUMP || "clean";
+  const profile = argv[argv.indexOf("--profile") + 1];
+  const docPath = /^\\s*path:\\s*(.+)$/m.exec(fs.readFileSync(argv[argv.indexOf("--patch") + 1], "utf8"))[1];
+  const rows = mode === "foreign" || profile !== "acp"
+    ? "# == base, patched by /etc/company/dsh.patch.yml\\n- id: settings\\n  name: '@deepseek-ai/dsh-settings-file'\\n  config:\\n    path: /etc/company/dsh-settings.yaml\\n"
+    : "- id: settings\\n  name: '@deepseek-ai/dsh-settings-file'\\n  config:\\n    path: " + docPath + "\\n";
+  process.stdout.write(
+    rows +
+    "- id: sandbox-policy\\n  name: '@deepseek-ai/dsh-sandbox-policy'\\n  config:\\n    mode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'\\n" +
+    "- id: approval\\n  name: '@deepseek-ai/dsh-user-approval'\\n  config:\\n    policy: !!js (process.env.DSH_PERMISSION_MODE ?? 'workspace-write') === 'danger-full-access' ? 'never' : 'ask'\\n",
+  );
+  process.exit(0);
+}
 record({
   kind: "spawn",
-  argv: process.argv.slice(2),
+  argv: argv,
   env: {
     DSH_HOME: process.env.DSH_HOME || null,
     DSH_PERMISSION_MODE: process.env.DSH_PERMISSION_MODE || null,
@@ -577,9 +1004,9 @@ process.stdin.on("data", (chunk) => {
 });
 `;
 
-test("dsh ACP session: --profile acp, the dedicated DSH_HOME, the mode env, and effort via set_config_option", async () => {
+test("dsh ACP session: --patch overlay, the shared home provisioned, the mode env, and effort via set_config_option", async () => {
 	const dir = makeFixtureDir({ dsh: DSH_ACP_MOCK });
-	const home = makeHome(true);
+	const home = makeHome();
 	const log = path.join(dir, "dsh-log.jsonl");
 	const restorePath = usePath(dir);
 	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: log });
@@ -588,16 +1015,15 @@ test("dsh ACP session: --profile acp, the dedicated DSH_HOME, the mode env, and 
 		await driver.start({ task: "do the thing", cwd: dir, mode: "write", effort: "high" });
 
 		const [spawned, configured] = mockLog(log);
-		assert.deepEqual(spawned.argv, ["--profile", "acp"]);
-		assert.equal(spawned.env.DSH_HOME, path.join(home, DSH_HARNESS_HOME_NAME));
+		assert.deepEqual(spawned.argv, ["--profile", "acp", "--patch", overlayIn(home)]);
+		assert.equal(spawned.env.DSH_HOME, null, "an inherited DSH_HOME must never reach the session");
 		assert.equal(spawned.env.DSH_PERMISSION_MODE, "workspace-write");
 		// Merged over process.env, not a replacement: the CLI still has its PATH.
 		assert.equal(spawned.env.PATH_INHERITED, true);
-		// Provisioning ran before the session start.
-		assert.equal(
-			readlinkSync(path.join(home, DSH_HARNESS_HOME_NAME, ".credentials.yaml")),
-			path.join(home, ".dsh", ".credentials.yaml"),
-		);
+		// Provisioning ran before the session start: the empty document and the
+		// overlay that points dsh's settings row at it.
+		assert.equal(readFileSync(settingsDocIn(home), "utf8"), "");
+		assert.equal(readFileSync(overlayIn(home), "utf8"), dshOverlayContent(settingsDocIn(home)));
 		// Effort has no flag on this CLI: it goes over the protocol, mapped.
 		assert.deepEqual(configured, { kind: "set_config_option", sessionId: "s1", configId: "reasoning_effort", value: "high" });
 	} finally {
@@ -607,9 +1033,62 @@ test("dsh ACP session: --profile acp, the dedicated DSH_HOME, the mode env, and 
 	}
 });
 
+test("dsh ACP session: an ambient DSH_HOME is deleted from the child's environment", async () => {
+	const dir = makeFixtureDir({ dsh: DSH_ACP_MOCK });
+	const home = makeHome();
+	const log = path.join(dir, "dsh-log.jsonl");
+	const restorePath = usePath(dir);
+	// A user who exported DSH_HOME (the retired design, or their own harness
+	// home) must not be able to point this session at another home.
+	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: log, DSH_HOME: "/tmp/some-other-dsh-home", DSH_PERMISSION_MODE: "danger-full-access" });
+	const driver = SESSION_DRIVERS.dsh!();
+	try {
+		await driver.start({ task: "t", cwd: dir, mode: "readonly" });
+		const [spawned] = mockLog(log);
+		assert.equal(spawned.env.DSH_HOME, null);
+		assert.equal(spawned.env.DSH_PERMISSION_MODE, "read-only", "the requested tier must win over an inherited one");
+		// The overlay it was handed is the one provisioning wrote, in the shared home.
+		assert.equal(spawned.argv[spawned.argv.indexOf("--patch") + 1], overlayIn(home));
+	} finally {
+		driver.kill();
+		restoreEnv();
+		restorePath();
+	}
+});
+
+test("dsh ACP session: a provisioning failure refuses the session start, spawning nothing", async () => {
+	const dir = makeFixtureDir({ dsh: DSH_ACP_MOCK });
+	const log = path.join(dir, "dsh-log.jsonl");
+	const root = mkdtempSync(path.join(tmpdir(), "dsh-blocked-"));
+	// A file where the shared home would have to be: neither of provisioning's
+	// two files can exist, and without them dsh would read the user's own
+	// settings document — so the session must not start at all.
+	const blocked = path.join(root, ".dsh");
+	writeFileSync(blocked, "in the way\n");
+	const restorePath = usePath(dir);
+	const restoreEnv = withEnv({ HOME: root, DSH_MOCK_LOG: log });
+	const driver = SESSION_DRIVERS.dsh!();
+	try {
+		await assert.rejects(
+			() => driver.start({ task: "t", cwd: dir, mode: "yolo" }),
+			(err: Error) => {
+				assert.match(err.message, /could not create dsh's shared home/);
+				assert.ok(err.message.includes(blocked));
+				return true;
+			},
+		);
+		assert.deepEqual(mockLog(log), [], "a refused session start must not spawn dsh");
+		assert.equal(readFileSync(blocked, "utf8"), "in the way\n");
+	} finally {
+		driver.kill();
+		restoreEnv();
+		restorePath();
+	}
+});
+
 test("dsh ACP session: a rejected set_config_option fails the session start", async () => {
 	const dir = makeFixtureDir({ dsh: DSH_ACP_MOCK });
-	const home = makeHome(true);
+	const home = makeHome();
 	const restorePath = usePath(dir);
 	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: path.join(dir, "dsh-log.jsonl"), DSH_MOCK_FAIL_CONFIG: "1" });
 	const driver = SESSION_DRIVERS.dsh!();
@@ -618,38 +1097,6 @@ test("dsh ACP session: a rejected set_config_option fails the session start", as
 			() => driver.start({ task: "t", cwd: dir, mode: "yolo", effort: "max" }),
 			/session\/set_config_option: unknown config option/,
 		);
-	} finally {
-		driver.kill();
-		restoreEnv();
-		restorePath();
-	}
-});
-
-test("dsh ACP session: a home without credentials starts unlinked, with the remedy as a warning", async () => {
-	const dir = makeFixtureDir({ dsh: DSH_ACP_MOCK });
-	const home = makeHome(false);
-	const log = path.join(dir, "dsh-log.jsonl");
-	const restorePath = usePath(dir);
-	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: log });
-	const driver = SESSION_DRIVERS.dsh!();
-	const warnings: string[] = [];
-	driver.onEvent((event) => {
-		if (event.kind === "warning") warnings.push(event.text);
-	});
-	try {
-		// Never refused: dsh's default provider route needs no credentials, so the
-		// session starts in the dedicated home and the notice travels alongside it.
-		await driver.start({ task: "t", cwd: dir, mode: "yolo" });
-
-		const [spawned] = mockLog(log);
-		assert.deepEqual(spawned.argv, ["--profile", "acp"]);
-		assert.equal(spawned.env.DSH_HOME, path.join(home, DSH_HARNESS_HOME_NAME));
-		assert.equal(spawned.env.DSH_PERMISSION_MODE, "danger-full-access");
-		assert.throws(() => lstatSync(path.join(home, DSH_HARNESS_HOME_NAME, DSH_CREDENTIALS_LINK_NAME)), /ENOENT/);
-		assert.equal(warnings.length, 1, `expected one warning, got ${JSON.stringify(warnings)}`);
-		assert.match(warnings[0], /no .*\.credentials\.yaml to link/);
-		assert.match(warnings[0], /default provider route or \.env must carry auth/);
-		assert.match(warnings[0], /run `dsh web` once to manage credentials/);
 	} finally {
 		driver.kill();
 		restoreEnv();
@@ -688,6 +1135,47 @@ test("hub one-shot: an adapter's env is merged over process.env, never replacing
 	}
 });
 
+test("hub one-shot: an adapter's undefined env value deletes an inherited variable", async () => {
+	// The sentinel dsh uses to strip an ambient DSH_HOME: `undefined` must mean
+	// DELETED from the child's environment, not passed through as a string or
+	// silently dropped by Node after being merged as a value.
+	const dir = makeFixtureDir({ kimi: KIMI_ENV_MOCK });
+	const restorePath = usePath(dir);
+	const restoreEnv = withEnv({ DSH_TEST_MARKER: "from-the-shell" });
+	const original = ADAPTERS.kimi.buildDispatch;
+	try {
+		const kept = await call("external_agent_start", { agent: "kimi", task: "t", mode: "yolo", cwd: dir, notify: "off" });
+		const keptWait = await call("external_agent_wait", { taskIds: [kept.details.task.taskId], timeout: 5 });
+		assert.match(keptWait.content[0].text, /marker=from-the-shell;path=yes/);
+
+		ADAPTERS.kimi.buildDispatch = (input) => ({ ...original(input), env: { DSH_TEST_MARKER: undefined } });
+		const stripped = await call("external_agent_start", { agent: "kimi", task: "t", mode: "yolo", cwd: dir, notify: "off" });
+		const strippedWait = await call("external_agent_wait", { taskIds: [stripped.details.task.taskId], timeout: 5 });
+		assert.match(strippedWait.content[0].text, /marker=absent;path=yes/);
+	} finally {
+		ADAPTERS.kimi.buildDispatch = original;
+		await call("external_agent_stop", { all: true });
+		restoreEnv();
+		restorePath();
+	}
+});
+
+test("mergeSpawnEnv: values are merged over the base, and undefined deletes", () => {
+	const merged = mergeSpawnEnv({ KEEP: "base", DROP: "base", OVERRIDE: "base" }, { DROP: undefined, OVERRIDE: "adapter", ADDED: "adapter" });
+	assert.deepEqual(merged, { KEEP: "base", OVERRIDE: "adapter", ADDED: "adapter" });
+	assert.equal("DROP" in merged, false);
+});
+
+test("mergeSpawnEnv: an override and a deletion find the key whatever case the environment reports", () => {
+	// Windows hands process.env whatever casing the OS stores, so a delete that
+	// only matched `DSH_HOME` exactly would leave `Dsh_Home` behind — pointing
+	// the child at a home nothing provisioned.
+	const merged = mergeSpawnEnv({ Dsh_Home: "/somewhere/else/.dsh", Path: "base" }, { DSH_HOME: undefined, PATH: "/usr/bin" });
+	assert.deepEqual(merged, { PATH: "/usr/bin" });
+	assert.equal("Dsh_Home" in merged, false);
+	assert.equal("Path" in merged, false);
+});
+
 test("hub one-shot: an adapter refusal fails the dispatch with its reason and spawns nothing", async () => {
 	const dir = makeFixtureDir({ kimi: KIMI_ENV_MOCK });
 	const restorePath = usePath(dir);
@@ -719,34 +1207,38 @@ const DSH_MODES: ReadonlyArray<readonly [Mode, string]> = [
 /** Flags a later edit might reach for; none of them exists in dsh 0.1.5-rc.2. */
 const DSH_UNVERIFIED_FLAGS = ["--json", "--session-id", "--model", "--effort", "--permission-mode", "--sandbox", "-c", "-C", "--dir", "--acp"];
 
-test("dsh one-shot: every mode's argv is exactly the profile plus the task, and its env exactly home plus tier", () => {
+test("dsh one-shot: every mode's argv is the profile, our overlay and the task, and its env exactly the tier plus the DSH_HOME deletion", () => {
 	for (const [mode, permissionMode] of DSH_MODES) {
-		const home = makeHome(true);
+		const home = makeHome();
 		const restoreHome = withEnv({ HOME: home });
 		try {
 			const task = "audit the repo\nsecond line";
 			const dispatch = ADAPTERS.dsh.buildDispatch({ task, cwd: "/tmp/dsh-cwd-not-forwarded", mode });
-			assert.deepEqual(dispatch.argv, ["--profile", "headless", task], `${mode}: argv`);
-			assert.equal(dispatch.promptArgIndex, 2);
+			assert.deepEqual(dispatch.argv, ["--profile", "headless", "--patch", overlayIn(home), task], `${mode}: argv`);
+			assert.equal(dispatch.promptArgIndex, 4);
 			assert.equal(dispatch.argv[dispatch.promptArgIndex], task);
+			// --patch is a LAUNCHER flag: it must precede the task positional.
+			assert.ok(dispatch.argv.indexOf("--patch") < dispatch.promptArgIndex, `${mode}: --patch must come before the task`);
 			assert.equal(dispatch.refusal, undefined);
 			assert.equal(dispatch.cwdForwardedToCli, false);
 			assert.equal(dispatch.argv.includes("/tmp/dsh-cwd-not-forwarded"), false, `${mode}: the cwd has no flag`);
 			for (const flag of DSH_UNVERIFIED_FLAGS) {
 				assert.equal(dispatch.argv.includes(flag), false, `${mode}: ${flag} does not exist in this release`);
 			}
-			// Exactly two keys: an extra one would widen the contract silently.
+			// Exactly two keys, and DSH_HOME carries the deletion: an extra value
+			// would widen the contract silently, and a missing deletion would let an
+			// ambient DSH_HOME through.
 			assert.deepEqual(Object.keys(dispatch.env ?? {}).sort(), ["DSH_HOME", "DSH_PERMISSION_MODE"]);
-			assert.equal(dispatch.env?.DSH_HOME, path.join(home, DSH_HARNESS_HOME_NAME));
+			assert.equal(dispatch.env?.DSH_HOME, undefined);
 			assert.equal(dispatch.env?.DSH_PERMISSION_MODE, permissionMode);
+			assert.equal("DSH_HOME" in (dispatch.env ?? {}), true, "the deletion must be explicit, not absent");
 			assert.equal(dispatch.readOnlyEnforcement, mode === "readonly" ? "harness-enforced" : "not-applicable");
 			assert.match(dispatch.effectivePolicy ?? "", new RegExp(`DSH_PERMISSION_MODE=${permissionMode}`));
-			assert.match(dispatch.effectivePolicy ?? "", /shared ~\/\.dsh settings outrank/);
-			// Provisioning ran for this mode, as a link to the user's own file.
-			assert.equal(
-				readlinkSync(path.join(home, DSH_HARNESS_HOME_NAME, ".credentials.yaml")),
-				path.join(home, ".dsh", ".credentials.yaml"),
-			);
+			assert.match(dispatch.effectivePolicy ?? "", /re-pointing dsh's settings row/);
+			// Provisioning ran for this mode: the empty document, and the overlay
+			// that keeps dsh's settings row off the user's own settings.yaml.
+			assert.equal(readFileSync(settingsDocIn(home), "utf8"), "");
+			assert.equal(readFileSync(overlayIn(home), "utf8"), dshOverlayContent(settingsDocIn(home)));
 			// The adapter contributes env for the child; it must never touch the hub's own.
 			assert.equal(process.env.DSH_HOME, undefined);
 			assert.equal(process.env.DSH_PERMISSION_MODE, undefined);
@@ -756,45 +1248,48 @@ test("dsh one-shot: every mode's argv is exactly the profile plus the task, and 
 	}
 });
 
-test("dsh one-shot: one home serves every mode, and the tier is never memoized across dispatches", () => {
-	const home = makeHome(true);
+test("dsh one-shot: one overlay serves every mode, and the tier is never memoized across dispatches", () => {
+	const home = makeHome();
 	const restoreHome = withEnv({ HOME: home });
 	try {
 		const readonly = ADAPTERS.dsh.buildDispatch({ task: "t", cwd: "/tmp", mode: "readonly" });
-		const link = path.join(home, DSH_HARNESS_HOME_NAME, ".credentials.yaml");
-		const inode = lstatSync(link).ino;
+		// Read-only now: a later dispatch that rewrote it (or re-created the
+		// document) would fail provisioning instead of quietly returning a
+		// refusal, so this also pins that provisioning is not repeated work.
+		chmodSync(overlayIn(home), 0o444);
 		const write = ADAPTERS.dsh.buildDispatch({ task: "t", cwd: "/tmp", mode: "write" });
 		const yolo = ADAPTERS.dsh.buildDispatch({ task: "t", cwd: "/tmp", mode: "yolo" });
 		assert.deepEqual(
 			[readonly.env?.DSH_PERMISSION_MODE, write.env?.DSH_PERMISSION_MODE, yolo.env?.DSH_PERMISSION_MODE],
 			["read-only", "workspace-write", "danger-full-access"],
 		);
-		assert.equal(new Set([readonly.env?.DSH_HOME, write.env?.DSH_HOME, yolo.env?.DSH_HOME]).size, 1);
-		// Provisioning is idempotent: the same link, untouched (same inode).
-		assert.equal(lstatSync(link).ino, inode);
+		assert.equal(new Set([readonly.argv[3], write.argv[3], yolo.argv[3]]).size, 1, "every mode gets the same overlay");
+		assert.deepEqual([write.refusal, yolo.refusal], [undefined, undefined]);
 	} finally {
 		restoreHome();
 	}
 });
 
-test("dsh one-shot: an ambient DSH_HOME or DSH_PERMISSION_MODE cannot override the dispatch's own", () => {
-	// A user who exported either variable must not be able to widen a task's
-	// tier (or point it at the shared home) from their shell profile.
-	const home = makeHome(true);
-	const restoreHome = withEnv({ HOME: home, DSH_HOME: "/tmp/some-shared-dsh-home", DSH_PERMISSION_MODE: "danger-full-access" });
+test("dsh one-shot: an inherited DSH_HOME cannot reach the child, and cannot point the shared home elsewhere", () => {
+	// A user who exported DSH_HOME (the retired design, or their own harness
+	// home) must not be able to redirect a hub dispatch: the overlay is written
+	// into the shared home, so a different home would compose a different config.
+	const home = makeHome();
+	const restoreHome = withEnv({ HOME: home, DSH_HOME: "/tmp/some-other-dsh-home" });
 	try {
-		const dispatch = ADAPTERS.dsh.buildDispatch({ task: "t", cwd: "/tmp", mode: "readonly" });
-		assert.equal(dispatch.env?.DSH_HOME, path.join(home, DSH_HARNESS_HOME_NAME));
-		assert.equal(dispatch.env?.DSH_PERMISSION_MODE, "read-only");
+		const dispatch = ADAPTERS.dsh.buildDispatch({ task: "t", cwd: "/tmp", mode: "yolo" });
+		assert.equal(dispatch.env?.DSH_HOME, undefined);
+		assert.equal(dispatch.argv[dispatch.argv.indexOf("--patch") + 1], overlayIn(home), "the overlay is the shared home's");
+		assert.equal(mergeSpawnEnv(process.env, dispatch.env ?? {}).DSH_HOME, undefined);
 	} finally {
 		restoreHome();
 	}
 });
 
 test("dsh one-shot: an effort request is refused before any provisioning, for every level and mode", () => {
-	// HOME points at a path that does not exist and has no ~/.dsh: the refusal
-	// must be about the transport, not about this machine, and it must not touch
-	// the filesystem on the way to saying so.
+	// HOME points at a path that does not exist: the refusal must be about the
+	// transport, not about this machine, and it must not touch the filesystem on
+	// the way to saying so.
 	const root = mkdtempSync(path.join(tmpdir(), "dsh-no-home-"));
 	const home = path.join(root, "does-not-exist");
 	const restoreHome = withEnv({ HOME: home });
@@ -805,29 +1300,47 @@ test("dsh one-shot: an effort request is refused before any provisioning, for ev
 				assert.equal(dispatch.refusal, DSH_ONESHOT_EFFORT_REFUSAL, `${mode}/${level}: refusal`);
 				// A refusal never hands out an env: there is nothing to merge.
 				assert.equal(dispatch.env, undefined, `${mode}/${level}: env`);
-				assert.deepEqual(dispatch.argv, ["--profile", "headless", "t"], `${mode}/${level}: argv`);
+				assert.equal(dispatch.argv.length, 5, `${mode}/${level}: argv`);
 				assert.equal(dispatch.effort.requested, level);
 				assert.equal(dispatch.effort.forwarded, false);
 				assert.match(dispatch.effort.note, /NOT forwarded/);
 			}
 		}
 		assert.equal(existsSync(home), false);
-		assert.equal(existsSync(path.join(home, DSH_HARNESS_HOME_NAME)), false);
+		assert.equal(existsSync(sharedHome(home)), false);
 	} finally {
 		restoreHome();
 	}
 });
 
-test("dsh one-shot: an effort request is refused even when credentials exist, and nothing is provisioned", () => {
-	const home = makeHome(true);
-	const restoreHome = withEnv({ HOME: home });
+test("dsh one-shot: an effort request is refused even when the shared home exists, and nothing is provisioned", () => {
+	const fixture = launchFixture();
+	// Read-only: a dispatch that ran provisioning anyway would fail on the write
+	// and report a provisioning refusal instead of the transport one.
+	chmodSync(fixture.settingsDoc, 0o444);
+	chmodSync(fixture.overlay, 0o444);
+	const restoreHome = withEnv({ HOME: fixture.home });
 	try {
 		const dispatch = ADAPTERS.dsh.buildDispatch({ task: "t", cwd: "/tmp", mode: "yolo", effort: "max" });
 		assert.equal(dispatch.refusal, DSH_ONESHOT_EFFORT_REFUSAL);
 		assert.equal(dispatch.env, undefined);
-		// Provisioning would have succeeded here. It must not have run at all:
-		// the transport split is decided before the machine's state is consulted.
-		assert.equal(existsSync(path.join(home, DSH_HARNESS_HOME_NAME)), false);
+	} finally {
+		restoreHome();
+	}
+});
+
+test("dsh one-shot: a provisioning refusal fails the dispatch instead of running under the user's settings", () => {
+	const root = mkdtempSync(path.join(tmpdir(), "dsh-blocked-"));
+	const blocked = path.join(root, ".dsh");
+	writeFileSync(blocked, "in the way\n");
+	const restoreHome = withEnv({ HOME: root });
+	try {
+		const dispatch = ADAPTERS.dsh.buildDispatch({ task: "t", cwd: "/tmp", mode: "readonly" });
+		assert.match(dispatch.refusal ?? "", /could not create dsh's shared home/);
+		assert.ok((dispatch.refusal ?? "").includes(blocked), "the refusal names the path it could not use");
+		assert.equal(dispatch.env, undefined);
+		// The dispatch is still spelled out, so the reason has a command to attach to.
+		assert.deepEqual(dispatch.argv, ["--profile", "headless", "--patch", overlayIn(root), "t"]);
 	} finally {
 		restoreHome();
 	}
@@ -868,16 +1381,16 @@ test("hub validation: dsh passes every mode and every effort level on to the ada
 });
 
 test("dsh one-shot: the task travels as one argv element, flag-shaped or multi-line", () => {
-	const home = makeHome(true);
+	const home = makeHome();
 	const restoreHome = withEnv({ HOME: home });
 	try {
 		// The registry spawns with shell: false and this argv array, so the task
 		// can never be split, globbed or word-split on the way to dsh.
 		for (const task of ["--help", "-x --y", "line one\nline two", "unicode ✓ and 'quotes'", "  leading and trailing  "]) {
 			const dispatch = ADAPTERS.dsh.buildDispatch({ task, cwd: "/tmp", mode: "yolo" });
-			assert.deepEqual(dispatch.argv, ["--profile", "headless", task]);
-			assert.equal(dispatch.argv.length, 3, "the task must never become extra arguments");
-			assert.equal(dispatch.argv[2], task, "the task must arrive verbatim, not trimmed or quoted");
+			assert.deepEqual(dispatch.argv, ["--profile", "headless", "--patch", overlayIn(home), task]);
+			assert.equal(dispatch.argv.length, 5, "the task must never become extra arguments");
+			assert.equal(dispatch.argv[4], task, "the task must arrive verbatim, not trimmed or quoted");
 		}
 	} finally {
 		restoreHome();
@@ -895,174 +1408,6 @@ test("dsh receipts: a session model request is not claimed as forwarded, and eff
 	assert.match(note, /never on its one-shot path/);
 	// Both paths agree on one mapping, whatever it is.
 	assert.ok(note.includes(`reasoning_effort=${dshEffortToken("xhigh")}`));
-});
-
-// ---------------------------------------------------------------------------
-// ensureDshHome: the arrangements it must not touch, and the failures it must explain
-// ---------------------------------------------------------------------------
-
-test("ensureDshHome: a directory at the credentials name is the user's own arrangement, left alone", () => {
-	const root = mkdtempSync(path.join(tmpdir(), "dsh-provision-"));
-	const homeDir = path.join(root, "harness-home");
-	const credentialsSource = path.join(root, "dsh", ".credentials.yaml");
-	mkdirSync(path.dirname(credentialsSource), { recursive: true });
-	writeFileSync(credentialsSource, "token: test\n");
-	const link = path.join(homeDir, ".credentials.yaml");
-	mkdirSync(link, { recursive: true });
-
-	const result = ensureDshHome({ homeDir, credentialsSource });
-	assert.equal(result.ok, true);
-	if (!result.ok) return;
-	assert.equal(result.credentials, link);
-	assert.equal(lstatSync(link).isDirectory(), true);
-	assert.equal(readdirSync(link).length, 0);
-});
-
-test("ensureDshHome: an unusable home path fails with a reason instead of throwing", () => {
-	const root = mkdtempSync(path.join(tmpdir(), "dsh-provision-"));
-	const homeDir = path.join(root, "not-a-directory");
-	const credentialsSource = path.join(root, "dsh", ".credentials.yaml");
-	mkdirSync(path.dirname(credentialsSource), { recursive: true });
-	writeFileSync(credentialsSource, "token: test\n");
-	writeFileSync(homeDir, "a real file where the home should be\n");
-
-	const result = ensureDshHome({ homeDir, credentialsSource });
-	assert.equal(result.ok, false);
-	if (result.ok) return;
-	assert.match(result.reason, /could not create the dsh harness home/);
-	assert.ok(result.reason.includes(homeDir));
-	// The file it could not replace is reported, never deleted.
-	assert.equal(readFileSync(homeDir, "utf8"), "a real file where the home should be\n");
-});
-
-test("ensureDshHome: a dangling credentials source is as good as missing, and clears a link of ours", () => {
-	const root = mkdtempSync(path.join(tmpdir(), "dsh-provision-"));
-	const homeDir = path.join(root, "harness-home");
-	const credentialsSource = path.join(root, "credentials.yaml");
-	symlinkSync(path.join(root, "gone.yaml"), credentialsSource);
-
-	const result = ensureDshHome({ homeDir, credentialsSource });
-	assert.equal(result.ok, true);
-	if (!result.ok) return;
-	assert.match(result.warning ?? "", /no .*credentials\.yaml to link/);
-	const link = path.join(homeDir, DSH_CREDENTIALS_LINK_NAME);
-	assert.throws(() => lstatSync(link), /ENOENT/);
-
-	// A home that had linked the source before it went away does not keep a
-	// dangling entry: dsh gets either a working credentials file or none.
-	symlinkSync(credentialsSource, link);
-	const relinked = ensureDshHome({ homeDir, credentialsSource });
-	assert.equal(relinked.ok, true);
-	assert.throws(() => lstatSync(link), /ENOENT/);
-
-	// And a link of the user's own, pointing at a file that does exist, is not
-	// ours to clear while the source is missing.
-	const other = path.join(root, "other.yaml");
-	writeFileSync(other, "token: other\n");
-	symlinkSync(other, link);
-	const kept = ensureDshHome({ homeDir, credentialsSource });
-	assert.equal(kept.ok, true);
-	assert.equal(readlinkSync(link), other);
-});
-
-test("ensureDshHome: the harness home is created 0o700", () => {
-	const root = mkdtempSync(path.join(tmpdir(), "dsh-provision-"));
-	const homeDir = path.join(root, "harness-home");
-	const credentialsSource = path.join(root, "dsh", ".credentials.yaml");
-	mkdirSync(path.dirname(credentialsSource), { recursive: true });
-	writeFileSync(credentialsSource, "token: test\n");
-
-	const result = ensureDshHome({ homeDir, credentialsSource });
-	assert.equal(result.ok, true);
-	// The home holds dsh's settings and a credentials entry, so nobody else gets
-	// to read or write it. mkdir's mode is masked by the umask, so assert the
-	// property that matters: owner rwx, nothing for group/other.
-	const mode = lstatSync(homeDir).mode & 0o777;
-	assert.equal(mode & 0o700, 0o700, `owner needs full access (mode ${mode.toString(8)})`);
-	assert.equal(mode & 0o077, 0, `group/other must have no access (mode ${mode.toString(8)})`);
-});
-
-test("ensureDshHome: a home left world-readable by an earlier build is tightened to 0o700", () => {
-	const root = mkdtempSync(path.join(tmpdir(), "dsh-provision-"));
-	const homeDir = path.join(root, "harness-home");
-	const credentialsSource = path.join(root, "dsh", ".credentials.yaml");
-	mkdirSync(path.dirname(credentialsSource), { recursive: true });
-	writeFileSync(credentialsSource, "token: test\n");
-	// The previous dev build created the home without a mode (0o755 under a
-	// typical umask); mkdir's mode never revisits an existing directory.
-	mkdirSync(homeDir, { recursive: true });
-	chmodSync(homeDir, 0o755);
-
-	const result = ensureDshHome({ homeDir, credentialsSource });
-	assert.equal(result.ok, true);
-	const mode = lstatSync(homeDir).mode & 0o777;
-	assert.equal(mode & 0o700, 0o700, `owner needs full access (mode ${mode.toString(8)})`);
-	assert.equal(mode & 0o077, 0, `group/other must have no access (mode ${mode.toString(8)})`);
-});
-
-test("ensureDshHome: a symlinked home path is provisioned through the link, not refused", () => {
-	// dsh's own home resolution canonicalizes paths (realpath) and its SAFETY.md
-	// claims no symlink hardening, so `~/dotfiles -> another volume` is a
-	// legitimate layout: the link stays a link and the home is provisioned where
-	// it points.
-	const root = mkdtempSync(path.join(tmpdir(), "dsh-provision-"));
-	const elsewhere = path.join(root, "elsewhere");
-	mkdirSync(elsewhere, { recursive: true });
-	writeFileSync(path.join(elsewhere, "existing.txt"), "user data\n");
-	const homeDir = path.join(root, "harness-home");
-	symlinkSync(elsewhere, homeDir);
-	const credentialsSource = path.join(root, "dsh", ".credentials.yaml");
-	mkdirSync(path.dirname(credentialsSource), { recursive: true });
-	writeFileSync(credentialsSource, "token: test\n");
-
-	const first = ensureDshHome({ homeDir, credentialsSource });
-	assert.equal(first.ok, true);
-	if (!first.ok) return;
-	assert.equal(first.home, homeDir);
-	assert.equal(lstatSync(homeDir).isSymbolicLink(), true, "the link is ours to follow, not to replace");
-	assert.equal(readlinkSync(homeDir), elsewhere);
-	const link = path.join(elsewhere, DSH_CREDENTIALS_LINK_NAME);
-	assert.equal(readlinkSync(link), credentialsSource);
-	assert.deepEqual(readdirSync(elsewhere).sort(), [DSH_CREDENTIALS_LINK_NAME, "existing.txt"], "pre-existing data untouched");
-
-	// Idempotent through the link, and the mode fix reaches the target directory
-	// dsh actually uses without breaking the link.
-	const second = ensureDshHome({ homeDir, credentialsSource });
-	assert.equal(second.ok, true);
-	assert.equal(lstatSync(homeDir).isSymbolicLink(), true);
-	assert.equal(readlinkSync(link), credentialsSource);
-	const mode = lstatSync(elsewhere).mode & 0o777;
-	assert.equal(mode & 0o077, 0, `the linked directory is not owner-only (mode ${mode.toString(8)})`);
-});
-
-test("ensureDshHome: the default paths hang off HOME, and the warning names the file and the fix", () => {
-	const home = mkdtempSync(path.join(tmpdir(), "dsh-user-home-"));
-	const restoreHome = withEnv({ HOME: home });
-	try {
-		assert.equal(dshHomeDir(), path.join(home, DSH_HARNESS_HOME_NAME));
-		assert.equal(dshCredentialsSource(), path.join(home, ".dsh", DSH_CREDENTIALS_LINK_NAME));
-
-		const missing = ensureDshHome();
-		assert.equal(missing.ok, true);
-		if (!missing.ok) return;
-		assert.equal(missing.home, dshHomeDir());
-		assert.ok((missing.warning ?? "").includes(dshCredentialsSource()), "the warning must name the file, not just the directory");
-		assert.match(missing.warning ?? "", /run `dsh web` once to manage credentials/);
-
-		// Doing exactly what the warning says is the whole fix.
-		mkdirSync(path.join(home, ".dsh"), { recursive: true });
-		writeFileSync(dshCredentialsSource(), "token: test\n");
-		const provisioned = ensureDshHome();
-		assert.equal(provisioned.ok, true);
-		if (!provisioned.ok) return;
-		assert.equal(provisioned.warning, undefined, "a correct link carries no warning");
-		assert.equal(
-			readlinkSync(path.join(provisioned.home, DSH_CREDENTIALS_LINK_NAME)),
-			dshCredentialsSource(),
-		);
-	} finally {
-		restoreHome();
-	}
 });
 
 // ---------------------------------------------------------------------------
@@ -1120,14 +1465,32 @@ async function settle(task: Task, timeoutMs = 10_000): Promise<void> {
  * One-shot `dsh` stand-in: plain text on stdout, `dsh: reasoning:` on stderr,
  * and an env/argv record so the spawn's contract can be read back. The happy
  * path opens with CRLF (the reader's framing tolerance) and closes without a
- * newline (the close-time buffer flush).
+ * newline (the close-time buffer flush). `--dump-config` is answered from the
+ * overlay it was given, so the anchor's probe is not recorded as a task run.
  */
 const DSH_ONESHOT_MOCK = `#!/usr/bin/env node
 const fs = require("node:fs");
+const argv = process.argv.slice(2);
 const log = process.env.DSH_MOCK_LOG;
+if (argv.includes("--dump-config")) {
+  // The composition the anchor reads, in the shape the real launcher prints.
+  // Clean only under the profile this fixture stands for: dsh composes per
+  // profile, so a probe under the wrong one must not look healthy.
+  const mode = process.env.DSH_MOCK_DUMP || "clean";
+  const profile = argv[argv.indexOf("--profile") + 1];
+  const docPath = /^\\s*path:\\s*(.+)$/m.exec(fs.readFileSync(argv[argv.indexOf("--patch") + 1], "utf8"))[1];
+  process.stdout.write(
+    (mode === "foreign" || profile !== "headless"
+      ? "# == base, patched by /etc/company/dsh.patch.yml\\n- id: settings\\n  name: '@deepseek-ai/dsh-settings-file'\\n  config:\\n    path: /etc/company/dsh-settings.yaml\\n"
+      : "- id: settings\\n  name: '@deepseek-ai/dsh-settings-file'\\n  config:\\n    path: " + docPath + "\\n") +
+    "- id: sandbox-policy\\n  name: '@deepseek-ai/dsh-sandbox-policy'\\n  config:\\n    mode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'\\n" +
+    "- id: approval\\n  name: '@deepseek-ai/dsh-user-approval'\\n  config:\\n    policy: !!js (process.env.DSH_PERMISSION_MODE ?? 'workspace-write') === 'danger-full-access' ? 'never' : 'ask'\\n",
+  );
+  process.exit(0);
+}
 if (log) fs.appendFileSync(log, JSON.stringify({
   kind: "spawn",
-  argv: process.argv.slice(2),
+  argv: argv,
   env: {
     DSH_HOME: process.env.DSH_HOME || null,
     DSH_PERMISSION_MODE: process.env.DSH_PERMISSION_MODE || null,
@@ -1152,9 +1515,7 @@ process.exit(0);
 test("hub one-shot dsh: an effort request fails the dispatch with the transport reason, spawning and provisioning nothing", async () => {
 	const dir = makeFixtureDir({ dsh: DSH_ONESHOT_MOCK });
 	const log = path.join(dir, "dsh-log.jsonl");
-	// Credentials are present on purpose: the refusal must not be a provisioning
-	// failure wearing the transport's words.
-	const home = makeHome(true);
+	const home = makeHome();
 	const restorePath = usePath(dir);
 	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: log });
 	const restoreDrivers = withoutDshDriver();
@@ -1172,10 +1533,10 @@ test("hub one-shot dsh: an effort request fails the dispatch with the transport 
 		assert.ok(started.content[0].text.includes(DSH_ONESHOT_EFFORT_REFUSAL), "the dispatch must carry the adapter's own reason");
 		assert.equal(started.details.task.state, "failed");
 		assert.equal(started.details.task.exitCode, null);
-		// A refusal is not a spawn that failed: no process, no record, no home.
+		// A refusal is not a spawn that failed: no process, no record, no files.
 		assert.equal(tasks.get(started.details.task.taskId)?.proc, null);
 		assert.deepEqual(mockLog(log), []);
-		assert.equal(existsSync(path.join(home, DSH_HARNESS_HOME_NAME)), false);
+		assert.equal(existsSync(sharedHome(home)), false);
 		// ...and it is not a dispatch the meter counts: the refusal is reported
 		// under its own label, so /external_agent_stats never claims a run that
 		// was refused before it existed.
@@ -1203,7 +1564,7 @@ test("hub one-shot dsh: an effort request fails the dispatch with the transport 
 test("hub one-shot dsh: stdout lines become the answer, stderr reasoning never does", async () => {
 	const dir = makeFixtureDir({ dsh: DSH_ONESHOT_MOCK });
 	const log = path.join(dir, "dsh-log.jsonl");
-	const home = makeHome(true);
+	const home = makeHome();
 	const restorePath = usePath(dir);
 	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: log, DSH_TEST_INHERITED: "from-pi", DSH_MOCK_MODE: "success" });
 	const restoreDrivers = withoutDshDriver();
@@ -1223,18 +1584,17 @@ test("hub one-shot dsh: stdout lines become the answer, stderr reasoning never d
 		assert.doesNotMatch(answerOf(task), /weighing the two options/);
 
 		const [spawned] = mockLog(log);
-		assert.deepEqual(spawned.argv, ["--profile", "headless", "do the thing"]);
-		assert.equal(spawned.env.DSH_HOME, path.join(home, DSH_HARNESS_HOME_NAME));
+		assert.deepEqual(spawned.argv, ["--profile", "headless", "--patch", overlayIn(home), "do the thing"]);
+		assert.equal(spawned.env.DSH_HOME, null, "the shared home is the one resolved, so DSH_HOME must be gone");
 		assert.equal(spawned.env.DSH_PERMISSION_MODE, "read-only");
 		// Merged over the hub's own environment, never a replacement.
 		assert.equal(spawned.env.PATH_PRESENT, true);
 		assert.equal(spawned.env.INHERITED, "from-pi");
-		assert.equal(
-			readlinkSync(path.join(home, DSH_HARNESS_HOME_NAME, ".credentials.yaml")),
-			path.join(home, ".dsh", ".credentials.yaml"),
-		);
+		// Provisioning ran before the spawn: the empty document plus our overlay.
+		assert.equal(readFileSync(settingsDocIn(home), "utf8"), "");
+		assert.equal(readFileSync(overlayIn(home), "utf8"), dshOverlayContent(settingsDocIn(home)));
 		// The receipt carries what the process actually got.
-		assert.deepEqual(task.dispatch.argv, ["--profile", "headless", "do the thing"]);
+		assert.deepEqual(task.dispatch.argv, ["--profile", "headless", "--patch", overlayIn(home), "do the thing"]);
 		assert.equal(task.dispatch.executable, "dsh");
 		assert.match(task.dispatch.effectivePolicy, /DSH_PERMISSION_MODE=read-only/);
 		assert.match(task.dispatch.effort.note, /no effort override requested/i);
@@ -1248,7 +1608,7 @@ test("hub one-shot dsh: stdout lines become the answer, stderr reasoning never d
 test("hub one-shot dsh: a non-zero exit is the failure, and its stderr stays out of the answer", async () => {
 	const dir = makeFixtureDir({ dsh: DSH_ONESHOT_MOCK });
 	const log = path.join(dir, "dsh-log.jsonl");
-	const home = makeHome(true);
+	const home = makeHome();
 	const restorePath = usePath(dir);
 	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: log, DSH_MOCK_MODE: "fail" });
 	const restoreDrivers = withoutDshDriver();
@@ -1273,7 +1633,7 @@ test("hub one-shot dsh: a non-zero exit is the failure, and its stderr stays out
 
 test("hub one-shot dsh: exit 0 with no output settles done, with no answer and no invented events", async () => {
 	const dir = makeFixtureDir({ dsh: DSH_ONESHOT_MOCK });
-	const home = makeHome(true);
+	const home = makeHome();
 	const restorePath = usePath(dir);
 	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: path.join(dir, "dsh-log.jsonl"), DSH_MOCK_MODE: "empty" });
 	const restoreDrivers = withoutDshDriver();
@@ -1296,7 +1656,7 @@ test("hub one-shot dsh: exit 0 with no output settles done, with no answer and n
 
 test("hub one-shot dsh: a reasoning line misrouted to stdout is kept out of the answer", async () => {
 	const dir = makeFixtureDir({ dsh: DSH_ONESHOT_MOCK });
-	const home = makeHome(true);
+	const home = makeHome();
 	const restorePath = usePath(dir);
 	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: path.join(dir, "dsh-log.jsonl"), DSH_MOCK_MODE: "misrouted-reasoning" });
 	const restoreDrivers = withoutDshDriver();
@@ -1317,9 +1677,9 @@ test("hub one-shot dsh: a reasoning line misrouted to stdout is kept out of the 
 	}
 });
 
-test("hub one-shot dsh: a home without credentials dispatches, warned and counted, never refused", async () => {
+test("hub one-shot dsh: a dispatch provisions the shared home, is counted, and carries no warning", async () => {
 	const dir = makeFixtureDir({ dsh: DSH_ONESHOT_MOCK });
-	const home = makeHome(false);
+	const home = makeHome();
 	const restorePath = usePath(dir);
 	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: path.join(dir, "dsh-log.jsonl") });
 	const restoreDrivers = withoutDshDriver();
@@ -1327,46 +1687,21 @@ test("hub one-shot dsh: a home without credentials dispatches, warned and counte
 	try {
 		// An id no earlier test can have used: dispatchTotal counts distinct task
 		// ids, and registry ids restart with each session.
-		const task = startTask("dsh", "t", dir, "readonly", "off", 0, undefined, undefined, { taskId: "dsh-no-credentials" });
+		const task = startTask("dsh", "t", dir, "readonly", "off", 0, undefined, undefined, { taskId: "dsh-shared-home" });
 		await settle(task);
 
-		// No credentials file, and the run still happened.
 		assert.equal(task.state, "done");
 		assert.equal(task.exitCode, 0);
-		assert.match(warningsOf(task), /no .*\.credentials\.yaml to link/);
-		assert.match(warningsOf(task), /default provider route or \.env must carry auth/);
-		assert.equal(existsSync(path.join(home, DSH_HARNESS_HOME_NAME, DSH_CREDENTIALS_LINK_NAME)), false);
-		// A warned dispatch is a dispatch: the meter files it as one and leaves the
-		// refusals alone, which is what this path did before the link went
-		// best-effort.
+		// A clean composition is silent: no warnings, and specifically nothing
+		// about credentials — the shared home is the user's own.
+		assert.equal(warningsOf(task), "");
+		assert.equal(readFileSync(settingsDocIn(home), "utf8"), "");
+		assert.equal(readFileSync(overlayIn(home), "utf8"), dshOverlayContent(settingsDocIn(home)));
+		// A dispatch with nothing to warn about is filed as a dispatch, and never
+		// as a refusal.
 		const after = meter.snapshot();
-		assert.equal(after.dispatchTotal, before.dispatchTotal + 1, "a warned dispatch must be counted as a dispatch");
-		assert.deepEqual(after.refusedTotal, before.refusedTotal, "absent credentials are not a refusal");
-	} finally {
-		restoreDrivers();
-		restorePath();
-		restoreEnv();
-	}
-});
-
-test("hub one-shot dsh: a forked credentials copy rides the task's warning stream", async () => {
-	const dir = makeFixtureDir({ dsh: DSH_ONESHOT_MOCK });
-	const home = makeHome(true);
-	mkdirSync(path.join(home, DSH_HARNESS_HOME_NAME), { recursive: true });
-	const fork = path.join(home, DSH_HARNESS_HOME_NAME, DSH_CREDENTIALS_LINK_NAME);
-	writeFileSync(fork, "token: older\n");
-	const restorePath = usePath(dir);
-	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: path.join(dir, "dsh-log.jsonl") });
-	const restoreDrivers = withoutDshDriver();
-	try {
-		const task = startTask("dsh", "t", dir, "readonly", "off", 0);
-		await settle(task);
-
-		// The run happened; the warning is a notice on it, not a failure of it.
-		assert.equal(task.state, "done");
-		assert.match(warningsOf(task), /local credentials copy/);
-		assert.ok(warningsOf(task).includes(fork));
-		assert.equal(readFileSync(fork, "utf8"), "token: older\n");
+		assert.equal(after.dispatchTotal, before.dispatchTotal + 1, "a clean dispatch must be counted as a dispatch");
+		assert.deepEqual(after.refusedTotal, before.refusedTotal);
 	} finally {
 		restoreDrivers();
 		restorePath();
@@ -1391,7 +1726,7 @@ async function waitForLog(file: string, predicate: (records: any[]) => boolean, 
 
 test("dsh ACP: each effort request is one set_config_option — \"off\" included, and none when unasked", async () => {
 	const dir = makeFixtureDir({ dsh: DSH_ACP_MOCK });
-	const home = makeHome(true);
+	const home = makeHome();
 	const log = path.join(dir, "dsh-log.jsonl");
 	const restorePath = usePath(dir);
 	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: log });
@@ -1423,6 +1758,8 @@ test("dsh ACP: each effort request is one set_config_option — \"off\" included
 			spawns.map((spawn) => spawn.env.DSH_PERMISSION_MODE),
 			["read-only", "workspace-write", "danger-full-access"],
 		);
+		// No session ever inherits a home override: the overlay names the home.
+		assert.deepEqual(spawns.map((spawn) => spawn.env.DSH_HOME), [null, null, null]);
 	} finally {
 		restorePath();
 		restoreEnv();
@@ -1431,7 +1768,7 @@ test("dsh ACP: each effort request is one set_config_option — \"off\" included
 
 test("dsh ACP: a readonly session rejects a permission escalation; yolo allows it", async () => {
 	const dir = makeFixtureDir({ dsh: DSH_ACP_MOCK });
-	const home = makeHome(true);
+	const home = makeHome();
 	const log = path.join(dir, "dsh-log.jsonl");
 	const restorePath = usePath(dir);
 	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: log, DSH_MOCK_PERMISSION: "1" });
@@ -1455,7 +1792,7 @@ test("dsh ACP: a readonly session rejects a permission escalation; yolo allows i
 });
 
 // ---------------------------------------------------------------------------
-// A session start is told about its forked credentials, and stays running
+// A composition warning rides the warning channel, and the session stays up
 // ---------------------------------------------------------------------------
 
 /** Poll until the predicate holds (driver start, settle finalize and pushes are async). */
@@ -1472,16 +1809,14 @@ function waitForEvent(task: Task, predicate: (event: { kind: string; text: strin
 	return waitFor(() => task.events.some(predicate), `the task's warning event (stderr: ${task.stderr})`, timeoutMs);
 }
 
-test("dsh ACP session: a forked credentials copy reaches status, the settle notice and the wait report", async () => {
+test("dsh ACP session: a composition warning reaches status, the settle notice and the wait report", async () => {
 	const dir = makeFixtureDir({ dsh: DSH_ACP_MOCK });
-	const home = makeHome(true);
-	// What dsh's atomic credential write leaves behind in the harness home.
-	const harnessHome = path.join(home, DSH_HARNESS_HOME_NAME);
-	mkdirSync(harnessHome, { recursive: true });
-	const fork = path.join(harnessHome, DSH_CREDENTIALS_LINK_NAME);
-	writeFileSync(fork, "token: older\n");
+	const home = makeHome();
 	const restorePath = usePath(dir);
-	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: path.join(dir, "dsh-log.jsonl") });
+	const restoreEnv = withEnv({ HOME: home, DSH_MOCK_LOG: path.join(dir, "dsh-log.jsonl"), DSH_MOCK_DUMP: "foreign" });
+	// The anchor is memoized for the whole process, so this test has to un-arm
+	// the clean composition every other test starts from.
+	resetDshCompositionGuard();
 	// Arm the settle push the way a session start does, then forget anything
 	// earlier tests left queued in the registry.
 	lifecycle.get("session_start")!({ reason: "" });
@@ -1490,29 +1825,28 @@ test("dsh ACP session: a forked credentials copy reaches status, the settle noti
 		const task = startTask("dsh", "do the thing", dir, "yolo", "steer", 0);
 		await waitForEvent(task, (event) => String(event.kind) === "warning");
 		// The existing warning surface — what external_agent_status prints as
-		// "non-fatal warnings" — carries the notice and the fix.
+		// "non-fatal warnings" — carries the notice and the file that caused it.
 		const warnings = warningsOf(task);
-		assert.match(warnings, /local credentials copy/);
-		assert.ok(warnings.includes(fork), "the warning names the file to delete");
-		assert.match(warnings, /Delete .*\.credentials\.yaml to re-link it/);
-		// The session was not failed or blocked over it, and the copy is intact.
-		assert.equal(readFileSync(fork, "utf8"), "token: older\n");
+		assert.ok(warnings.includes("/etc/company/dsh.patch.yml"), `the warning names the offending patch: ${warnings}`);
+		assert.match(warnings, /outranks DSH_PERMISSION_MODE/);
+		// The session was not failed or blocked over it: the caller gets a run,
+		// plus the notice that the tier it asked for may not be the tier in force.
 		assert.notEqual(task.state, "failed");
+		assert.equal(task.events.some((event) => event.kind === "error"), false);
 
 		// A caller that ends its turn instead of polling gets the same line on the
 		// settle notice...
 		await waitFor(() => pushes.length > 0, "the settle notification");
-		assert.match(pushes.join("\n"), /non-fatal warnings: .*local credentials copy/);
+		assert.match(pushes.join("\n"), /non-fatal warnings: .*outranks DSH_PERMISSION_MODE/);
 		// ...and one that blocks in external_agent_wait gets it in the report that
-		// replaces that notice. Both surfaces truncate the line like the status
-		// report does, so the head is what a caller reads here; the untruncated
-		// text above already names the fix.
+		// replaces that notice.
 		const report = await call("external_agent_wait", { taskIds: [task.id], mode: "any", timeout: 5 });
-		assert.match(report.content[0].text, /non-fatal warnings: .*local credentials copy/);
-		assert.ok(report.content[0].text.includes(fork), "the report names the file to delete");
+		assert.match(report.content[0].text, /non-fatal warnings: .*outranks DSH_PERMISSION_MODE/);
+		assert.ok(report.content[0].text.includes("/etc/company/dsh.patch.yml"), "the report names the offending patch");
 		task.driver?.kill();
 	} finally {
 		restorePath();
 		restoreEnv();
+		cleanAnchor();
 	}
 });

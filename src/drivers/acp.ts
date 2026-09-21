@@ -7,9 +7,10 @@
  * defined"), so permissions are answered over session/request_permission and
  * effort cannot be forwarded. codebuddy is plain ACP: steering is a second
  * session/prompt on the active session. dsh spells the same entry point as a
- * profile (`--profile acp`, verified 0.1.5-rc.2) and has no effort flag either,
- * but its session exposes a reasoning_effort config option, so effort is
- * forwarded with session/set_config_option.
+ * profile (`--profile acp`, verified 0.1.5-rc.2) followed by `--patch` and its
+ * overlay, and has no effort flag either, but its session exposes a
+ * reasoning_effort config option, so effort is forwarded with
+ * session/set_config_option.
  */
 
 import { ADAPTERS, type AgentEvent, type AgentId, type Effort, type Mode } from "../adapters.ts";
@@ -39,15 +40,18 @@ export interface AcpDialect {
 	baseArgv: (input: SessionStartInput) => string[];
 	/**
 	 * Everything this dialect settles before its process is spawned. `env` is
-	 * merged over process.env by spawnProcess (never a replacement); dsh uses it
-	 * to point DSH_HOME at the dedicated harness home and to carry the tier as
-	 * DSH_PERMISSION_MODE. `warning` is a non-fatal notice about the start (dsh:
-	 * the harness home holds a local credentials copy instead of the link, or
-	 * there was no user credentials file to link) that the driver emits into the
-	 * task's warning stream, where external_agent_status reports it. Throwing
-	 * here fails the session start with that reason, before anything is spawned.
+	 * merged over process.env by spawnProcess (never a replacement), and a
+	 * value of `undefined` DELETES that key from the child's environment; dsh
+	 * uses both — DSH_PERMISSION_MODE carries the tier, and an inherited
+	 * DSH_HOME is removed so the shared home the overlay was written into is the
+	 * one dsh resolves. `warning` is a non-fatal notice about the start (dsh:
+	 * the composition anchor found the composed config disagreeing with what
+	 * provisioning wrote, so the requested tier may not be the one in force)
+	 * that the driver emits into the task's warning stream, where
+	 * external_agent_status reports it. Throwing here fails the session start
+	 * with that reason, before anything is spawned.
 	 */
-	prepare?: (input: SessionStartInput) => { env?: Record<string, string>; warning?: string } | undefined;
+	prepare?: (input: SessionStartInput) => { env?: Record<string, string | undefined>; warning?: string } | undefined;
 	failClosedPermissionModes?: Mode[];
 	/**
 	 * Effort forwarding over the protocol, for dialects whose CLI has no effort
@@ -121,17 +125,17 @@ export class AcpDriver extends BaseSessionDriver implements SessionDriver {
 		// exactly why readonly moved off plan mode).
 		this.autoPermission = (this.dialect.failClosedPermissionModes ?? ["readonly"]).includes(input.mode) ? "reject" : "allow";
 		// The dialect's prepare hook runs before the spawn: a dialect that cannot
-		// provision what its process needs (dsh: the harness home) throws here,
-		// and the session start fails with that reason instead of running a
-		// process that cannot work.
+		// provision what its process needs (dsh: the settings document and the
+		// overlay that pins dsh to it) throws here, and the session start fails
+		// with that reason instead of running a process that cannot work.
 		const prepared = this.dialect.prepare?.(input);
 		this.spawnProcess(ADAPTERS[this.dialect.id].bin, this.buildArgv(input), input.cwd, prepared?.env);
 		this.onNotification((method, params) => this.handleNotification(method, params));
 		this.onRequest((msg) => this.handleRequest(msg));
-		// A dialect-level warning about this start (dsh: a credentials fork, or
-		// nothing linked because the user has no credentials file yet) rides the
-		// task's warning stream — the hub's existing surface for non-fatal
-		// notices — rather than being dropped or promoted to a failure.
+		// A dialect-level warning about this start (dsh: the composition anchor
+		// found a patch, or a replaced row, that leaves the requested tier not in
+		// force) rides the task's warning stream — the hub's existing surface for
+		// non-fatal notices — rather than being dropped or promoted to a failure.
 		if (prepared?.warning) this.emit({ kind: "warning", text: prepared.warning });
 
 		const init = await this.request(
