@@ -43,6 +43,7 @@ import {
 	taskPromptPreview,
 	taskSnapshot,
 	truncate,
+	warningsOf,
 	type DispatchExtras,
 	type ExternalAgentCompareDetails,
 	type ExternalAgentFollowUpDetails,
@@ -615,6 +616,11 @@ export function registerHubTools(pi: ExtensionAPI): void {
 						lines.push(summarize(task));
 						lines.push(eventProfileLine(task, task.eventSeq - (seqAtWait.get(task) ?? 0)));
 						if (task.worktree) lines.push(`worktree: ${task.worktree.path} (branch ${task.worktree.branch})`);
+						// The same non-fatal notices external_agent_status prints (dsh:
+						// the harness home's credentials fork): this report replaces the
+						// settle push, so it has to carry what that push carries.
+						const warns = warningsOf(task);
+						if (warns) lines.push(`non-fatal warnings: ${truncate(warns, 400).text}`);
 						if (task.state !== "running") {
 							// Settled evidence, worded like the notice this report replaces.
 							if (task.retainedWorktrees) lines.push(task.retainedWorktrees);

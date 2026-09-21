@@ -91,13 +91,18 @@ export abstract class StdioProcess {
 		return this.spawnErrorMessage;
 	}
 
-	protected spawnProcess(executable: string, argv: string[], cwd: string): void {
+	/**
+	 * `extraEnv` is merged OVER process.env, never a replacement: a dialect
+	 * contributes what its CLI needs (dsh: DSH_HOME and DSH_PERMISSION_MODE)
+	 * without taking away the environment the process has to run in at all.
+	 */
+	protected spawnProcess(executable: string, argv: string[], cwd: string, extraEnv?: Record<string, string>): void {
 		this.spawnArgv = argv;
 		const proc = spawn(executable, argv, {
 			cwd,
 			// stdin is a live protocol channel here, not the "ignore" of the one-shot path.
 			stdio: ["pipe", "pipe", "pipe"],
-			env: process.env,
+			env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
 		});
 		this.proc = proc;
 
@@ -284,6 +289,29 @@ abstract class JsonRpcConnection extends StdioProcess {
 		}
 		if (!msg || typeof msg !== "object") return;
 
+		// A message carrying a method is a request or a notification, never a
+		// response — even when its id matches a request we are waiting on. Both
+		// sides number their requests independently, so a harness counting its
+		// permission requests from its own small counter (dsh escalates several
+		// times inside one turn) eventually hands one the id of the pending
+		// session/prompt; reading that as the reply settles the turn early and
+		// leaves the escalation unanswered.
+		if (typeof msg.method === "string") {
+			// A message carrying both method and id is a request we must answer;
+			// without an id it is a fire-and-forget notification. Only NUMERIC
+			// ids are routed as requests: JSON-RPC 2.0 also allows string ids,
+			// and the ACP dialects (reasonix, codebuddy, dsh) number their
+			// requests with integers, which is the type respond() replies in. A
+			// string-id request would fall through to the notification callback
+			// and never be answered — the ACP contract, not a case to guess at.
+			if (typeof msg.id === "number") {
+				for (const cb of this.requestCbs) cb(msg);
+				return;
+			}
+			for (const cb of this.notificationCbs) cb(msg.method, msg.params);
+			return;
+		}
+
 		if (typeof msg.id === "number" && this.pending.has(msg.id)) {
 			const entry = this.pending.get(msg.id)!;
 			this.pending.delete(msg.id);
@@ -294,17 +322,7 @@ abstract class JsonRpcConnection extends StdioProcess {
 			} else {
 				entry.resolve(msg.result);
 			}
-			return;
 		}
-
-		if (typeof msg.method !== "string") return;
-		// A message carrying both method and id is a request we must answer;
-		// without an id it is a fire-and-forget notification.
-		if (typeof msg.id === "number") {
-			for (const cb of this.requestCbs) cb(msg);
-			return;
-		}
-		for (const cb of this.notificationCbs) cb(msg.method, msg.params);
 	}
 }
 

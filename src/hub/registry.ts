@@ -15,7 +15,7 @@ import { appendFile, mkdir, readFile, readdir, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionAPI, SessionShutdownEvent } from "@earendil-works/pi-coding-agent";
-import { ADAPTERS, AGENT_IDS, type AgentEvent, type AgentId, type Effort, type Mode } from "../adapters.ts";
+import { ADAPTERS, AGENT_IDS, dshEffortToken, type AgentEvent, type AgentId, type Effort, type Mode } from "../adapters.ts";
 import { ensureStored, extractSummary, placeholderFor } from "../artifacts.ts";
 import {
 	FOLLOWUP_AGENT_IDS,
@@ -51,6 +51,7 @@ import {
 	stallClock,
 	taskSnapshot,
 	truncate,
+	warningsOf,
 	type DispatchExtras,
 	type DispatchReceipt,
 	type NotifyMode,
@@ -377,6 +378,12 @@ function notifySettled(pi: ExtensionAPI, task: Task): void {
 	if (task.spawnError) lines.push(`spawn error: ${task.spawnError}`);
 	const errs = errorsOf(task);
 	if (errs) lines.push(`errors: ${truncate(errs, 500).text}`);
+	// Non-fatal notices (dsh: the harness home's credentials fork) belong on the
+	// push too, not only in external_agent_status: a caller that ends its turn and
+	// waits for this notice would otherwise never learn of them. Same wording as
+	// the status report, and a line only when there is something to say.
+	const warns = warningsOf(task);
+	if (warns) lines.push(`non-fatal warnings: ${truncate(warns, 400).text}`);
 	if (task.worktree) lines.push(`worktree: ${task.worktree.path} (branch ${task.worktree.branch})`);
 
 	if (task.state === "done") {
@@ -834,7 +841,9 @@ function createTask(
 		relaysReceived: 0,
 	};
 	tasks.set(task.id, task);
-	meter.recordDispatch(task.id);
+	// Dispatch counting belongs to the start paths, not here: a task can be
+	// created and immediately refused (AdapterDispatch.refusal), and a refused
+	// dispatch never ran — see startOneshotTask.
 	ensureWatchdogTimer();
 	return task;
 }
@@ -904,7 +913,7 @@ function startPersistentTask(
 		effectivePolicy: adapter.sessionPolicy?.(mode) ?? `${adapter.session?.steerNote ?? "session"} (persistent session)`,
 		readOnlyEnforcement: sessionReadOnlyEnforcement(agent, mode),
 		model: model
-			? { requested: model, forwarded: true, note: "Passed to the persistent session at startup." }
+			? { requested: model, forwarded: modelForwardedOnSession(agent), note: modelSessionNote(agent, model) }
 			: { forwarded: false, note: "No model override requested; target CLI/config selects the model." },
 		effort: effort
 			? {
@@ -923,6 +932,9 @@ function startPersistentTask(
 
 	const task = createTask(agent, taskText, cwd, mode, notify, watchdogMs, dispatch, "persistent", extras.taskId);
 	applyExtras(task, extras);
+	// The session is started below, so this is a dispatch that runs (a start
+	// failure is a failed dispatch, not a refusal the hub decided on).
+	meter.recordDispatch(task.id);
 	task.driver = driver;
 
 	driver.onEvent((event) => {
@@ -977,7 +989,27 @@ export function effortSessionNote(agent: AgentId, effort: Effort): string {
 	if (agent === "reasonix") {
 		return `requested "${effort}"; NOT forwarded — reasonix --acp accepts no effort flag (the one-shot path would have passed --effort).`;
 	}
+	if (agent === "dsh") {
+		return `Set inside the ACP session as session/set_config_option reasoning_effort=${dshEffortToken(effort)}; dsh accepts effort only there, never on its one-shot path.`;
+	}
 	return `Passed to the persistent session for "${effort}".`;
+}
+
+/**
+ * Whether the persistent path forwards a model override. dsh takes its model
+ * from the run profile (`--profile` is the whole entry point, verified
+ * 0.1.5-rc.2) and no session-start model flag is verified, so a request is
+ * reported as not forwarded rather than claimed.
+ */
+export function modelForwardedOnSession(agent: AgentId): boolean {
+	return agent !== "dsh";
+}
+
+export function modelSessionNote(agent: AgentId, model: string): string {
+	if (agent === "dsh") {
+		return `requested "${model}"; NOT forwarded — dsh selects its model from the run profile, not from a session-start flag.`;
+	}
+	return "Passed to the persistent session at startup.";
 }
 
 /** Append an event, keeping the ring cap and the current-turn window aligned. */
@@ -1061,6 +1093,23 @@ export function beginFollowUpTurn(task: Task): void {
 	clearIdleReap(task);
 }
 
+/**
+ * A dispatch that fails before it spawns is reported by its tool result, not by
+ * a notification: the caller already holds the reason, exactly as a wait receipt
+ * claims a settled task instead of letting its notice fire. Marking the task
+ * settled here is what keeps that failure from being replayed — session_start
+ * re-delivers every task that is neither running nor notified, so a task left
+ * unnotified would come back as a stale failure notice after a /reload.
+ */
+function failBeforeStart(task: Task, reason: string): Task {
+	task.state = "failed";
+	task.endedAt = Date.now();
+	task.spawnError = reason;
+	task.notified = true;
+	task.finalizePromise = Promise.resolve();
+	return task;
+}
+
 function startOneshotTask(
 	agent: AgentId,
 	taskText: string,
@@ -1109,19 +1158,38 @@ function startOneshotTask(
 	const task = createTask(agent, taskText, cwd, mode, notify, watchdogMs, dispatch, "oneshot", extras.taskId);
 	applyExtras(task, extras);
 
+	// An adapter that cannot honour the request says so instead of spelling out a
+	// command whose result would mislead the caller (dsh: an effort request on a
+	// path with no effort knob, or a harness home that cannot be provisioned at
+	// all). It fails like a spawn that never started — reason recorded, nothing
+	// spawned.
+	if (adapterDispatch.refusal) {
+		// A refused dispatch is not a dispatch: counting it would inflate the
+		// meter's dispatchTotal. It is recorded under its own label instead, which
+		// is what /external_agent_stats prints under "refusals".
+		meter.recordRefused("adapter refusal");
+		return failBeforeStart(task, adapterDispatch.refusal);
+	}
+	// Non-fatal dispatch-time notices (dsh: the harness home holds a local
+	// credentials copy, or had no user credentials file to link) ride the task's
+	// warning stream, where the status report already surfaces them as "non-fatal
+	// warnings". Such a dispatch IS a dispatch: it is counted like any other.
+	if (adapterDispatch.warning) pushEvent(task, { kind: "warning", text: adapterDispatch.warning });
+	meter.recordDispatch(task.id);
+
 	let proc: ChildProcess;
 	try {
 		// No shell: args are passed as an array so task text cannot inject commands.
 		proc = spawn(task.dispatch.executable, task.dispatch.argv, {
 			cwd: task.dispatch.cwd,
 			stdio: ["ignore", "pipe", "pipe"],
-			env: process.env,
+			// Adapter-contributed env is merged OVER the inherited environment,
+			// never a replacement: it carries what the CLI needs (dsh's DSH_HOME
+			// and DSH_PERMISSION_MODE) without removing the rest.
+			env: adapterDispatch.env ? { ...process.env, ...adapterDispatch.env } : process.env,
 		});
 	} catch (err) {
-		task.state = "failed";
-		task.endedAt = Date.now();
-		task.spawnError = err instanceof Error ? err.message : String(err);
-		return task;
+		return failBeforeStart(task, err instanceof Error ? err.message : String(err));
 	}
 
 	task.proc = proc;

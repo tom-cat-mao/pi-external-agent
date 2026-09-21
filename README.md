@@ -13,7 +13,7 @@ pi install git:github.com/tom-cat-mao/pi-external-agent@v0.6.1
 pi install git:github.com/tom-cat-mao/pi-external-agent
 ```
 
-Requires pi ≥ 0.85 and whichever agent CLIs you want to drive (they don't all need to be installed). Qoder needs `qodercli` on `PATH`, signed in; steering additionally needs an announced stable qodercli ≥ 1.1.49 — see [docs/qoder.md](docs/qoder.md).
+Requires pi ≥ 0.85 and whichever agent CLIs you want to drive (they don't all need to be installed). Qoder needs `qodercli` on `PATH`, signed in; steering additionally needs an announced stable qodercli ≥ 1.1.49 — see [docs/qoder.md](docs/qoder.md). dsh needs `dsh web` only when your provider key lives in `~/.dsh/.credentials.yaml`: its dedicated harness home symlinks that file when it exists, and otherwise runs credential-less on the default provider route or an `.env`.
 
 Releases are published by tag: pushing `vX.Y.Z` runs the suite and typecheck, then creates the GitHub Release.
 
@@ -54,12 +54,12 @@ All off by default; enable per call — `template` (output contract), `verify` (
 | `qoder` | Alibaba | yolo | follow-up ✅; steer ✅ when the announced CLI meets the 1.1.49 baseline |
 | `kimi` | Moonshot | yolo only (its headless mode rejects permission flags) | ❌ |
 | `claude` | Anthropic | yolo (readonly–yolo; effort low–max, no off) | ✅ via stream-json |
+| `dsh` | DeepSeek harness | yolo (readonly–yolo; dsh's own sandbox enforces the tier) | ✅ via ACP |
 
 ## Documentation
 
 - [AGENTS.md](AGENTS.md) — repository layout, commands, invariants, documentation rules
-- [docs/architecture.md](docs/architecture.md) — dispatch flow, receipts, transports · [docs/adapters.md](docs/adapters.md) — per-CLI capability matrix
-- [docs/capabilities.md](docs/capabilities.md) — archive, verify, templates, relay, isolate, board, meter · [docs/qoder.md](docs/qoder.md) — Qoder stream-json contract · [.agents/notes/](.agents/notes/) — decision records
+- [docs/architecture.md](docs/architecture.md) — dispatch flow, receipts, transports · [docs/adapters.md](docs/adapters.md) — per-CLI capability matrix · [docs/capabilities.md](docs/capabilities.md) — archive, verify, templates, relay, isolate, board, meter · [docs/qoder.md](docs/qoder.md) — Qoder stream-json contract · [.agents/notes/](.agents/notes/) — decision records
 
 ## Community
 

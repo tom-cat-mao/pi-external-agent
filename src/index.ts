@@ -15,7 +15,7 @@
  * 2. Permission tiers are enforced mechanically — by the target harness, or by the
  *    session driver answering protocol permission requests (claude's can_use_tool) —
  *    never by a prompt request, and defaults are per-adapter:
- *    codex/pi/kimi/codebuddy/reasonix/qoder/claude
+ *    codex/pi/kimi/codebuddy/reasonix/qoder/claude/dsh
  *    yolo; kimi is yolo-only (headless mode rejects permission flags), so readonly/write are refused;
  *    concurrent write/yolo tasks in the same directory are refused outright. Why: .agents/notes/implemented/2026-09-07-kimi-yolo-only.md
  *

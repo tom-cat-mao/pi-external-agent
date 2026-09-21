@@ -10,6 +10,7 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, mkdtempSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { ADAPTERS } from "../src/adapters.ts";
 
 const STUBS: Record<string, string> = {
 	"@earendil-works/pi-coding-agent": `export function keyHint(key, description) { return key + " " + description; }`,
@@ -364,6 +365,30 @@ test("wait-dedup: a task held by an unfinished wait is re-delivered once by sess
 	} finally {
 		restore();
 		restorePath();
+	}
+});
+
+test("wait-dedup: a dispatch that fails before it starts owes no notice, and a reload does not replay it", async () => {
+	const original = ADAPTERS.kimi.buildDispatch;
+	armNotifications();
+	try {
+		// kimi is one-shot only, so an adapter refusal is the path a rejected
+		// dispatch takes: the task is failed before anything spawns.
+		ADAPTERS.kimi.buildDispatch = (input) => ({ ...original(input), refusal: "kimi cannot run this request" });
+		const started = await call("external_agent_start", { agent: "kimi", task: "t", mode: "yolo", notify: "nextTurn" });
+		// The tool result carries the whole report, notice mode notwithstanding.
+		assert.match(resultText(started), /Failed to start kimi: kimi cannot run this request/);
+		await sleep(200);
+		assert.equal(pushes.length, 0, `the receipt carries the failure, not a push: ${pushes.join(" | ")}`);
+
+		// A reload keeps the registry, and session_start re-delivers every task
+		// that is neither running nor notified — a settled one must not look owed.
+		lifecycle.get("session_shutdown")!({ reason: "reload" });
+		armNotifications();
+		await sleep(200);
+		assert.equal(pushes.length, 0, `the refused dispatch was replayed after a reload: ${pushes.join(" | ")}`);
+	} finally {
+		ADAPTERS.kimi.buildDispatch = original;
 	}
 });
 

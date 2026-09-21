@@ -13,7 +13,7 @@
  *
  *   PiRpcDriver           pi --mode rpc        — line JSON commands + events
  *   CodexAppServerDriver  codex app-server     — JSON-RPC 2.0, experimental
- *   AcpDriver             reasonix / codebuddy — JSON-RPC 2.0 ACP over stdio
+ *   AcpDriver             reasonix/codebuddy/dsh — JSON-RPC 2.0 ACP over stdio
  *   ClaudeStreamJsonDriver claude              — LF stream-json (anthropic contract)
  *   QoderStreamJsonDriver  qoder               — LF stream-json with version gate
  *
@@ -41,13 +41,21 @@
  *   codebuddy-> plain ACP: steering is a second session/prompt on the active
  *               session; it lands at the next model step boundary, or becomes a
  *               follow-up if the turn is stuck inside one long tool call.
+ *   dsh      -> `--profile acp` (verified 0.1.5-rc.2): standard ACP v1, with
+ *               sessionCapabilities close/list/resume and no advertised steer
+ *               method, so steering is the codebuddy fallback. session/new
+ *               returns configOptions (model, reasoning_effort), and effort is
+ *               forwarded with session/set_config_option — the CLI has no
+ *               effort flag. DSH_HOME must be the dedicated harness home, and
+ *               DSH_PERMISSION_MODE carries the tier.
  *
  * Steering is never an immediate interrupt. All five deliver at a step boundary
  * (between tool calls), so a steer cannot cancel a bash command that is already
  * running — only change what the agent does next.
  */
 
-import { ADAPTERS, buildReadonlySettings, type AgentId } from "../adapters.ts";
+import { ADAPTERS, buildReadonlySettings, dshEffortToken, dshPermissionMode, type AgentId } from "../adapters.ts";
+import { ensureDshHome } from "../dsh-home.ts";
 import type { SessionDriver } from "./base.ts";
 import { PiRpcDriver } from "./pi-rpc.ts";
 import { CodexAppServerDriver } from "./codex-app-server.ts";
@@ -91,6 +99,40 @@ export const SESSION_DRIVERS: Partial<Record<AgentId, () => SessionDriver>> = {
 		}),
 	claude: () => new ClaudeStreamJsonDriver(),
 	qoder: () => new QoderStreamJsonDriver(),
+	dsh: () =>
+		new AcpDriver({
+			id: "dsh",
+			// dsh spells the ACP entry as a profile rather than a flag (verified
+			// 0.1.5-rc.2: standard ACP v1, no advertised steer method, so steering
+			// is a second session/prompt on the active session).
+			acpArgv: ["--profile", "acp"],
+			// The model comes from the profile; no session-start model flag is
+			// verified for this CLI, so nothing is appended. The receipt reports a
+			// model request as not forwarded rather than claiming it traveled.
+			baseArgv: () => [],
+			// DSH_HOME must be the dedicated harness home (src/dsh-home.ts): the
+			// user's shared ~/.dsh settings outrank DSH_PERMISSION_MODE, so a run
+			// under the shared home would not be bounded by the requested tier at
+			// all. Provisioning runs before the spawn and is lazy/idempotent; it
+			// fails the session start only when the home itself cannot exist (an
+			// unusable path — a symlinked home is followed, as dsh follows it).
+			// Missing credentials never do: dsh runs credential-less on its default
+			// provider route, so the home is started unlinked and the warning
+			// carries the remedy — as does a home that already holds a local
+			// credentials copy.
+			prepare: (input) => {
+				const home = ensureDshHome();
+				if (!home.ok) throw new Error(home.reason);
+				return {
+					env: { DSH_HOME: home.home, DSH_PERMISSION_MODE: dshPermissionMode(input.mode) },
+					warning: home.warning,
+				};
+			},
+			// No effort flag exists on this CLI: the session sets the config option
+			// instead. A rejected set_config_option fails the session start, so the
+			// turn never runs at a default the caller did not ask for.
+			effort: { configId: "reasoning_effort", token: dshEffortToken },
+		}),
 };
 
 export const SESSION_AGENT_IDS = Object.keys(SESSION_DRIVERS) as AgentId[];

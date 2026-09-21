@@ -385,7 +385,7 @@ test("compare: the schema requires 2..8 agents and execute refuses counts outsid
 	assert.equal(agents.minItems, 2);
 	assert.equal(agents.maxItems, 8);
 	assert.equal(agents.items.properties.agent.type, "string");
-	assert.deepEqual(agents.items.properties.agent.enum, ["codex", "pi", "kimi", "codebuddy", "claude", "reasonix", "qoder"]);
+	assert.deepEqual(agents.items.properties.agent.enum, ["codex", "pi", "kimi", "codebuddy", "claude", "reasonix", "qoder", "dsh"]);
 
 	const single = await compare({ task: "t", agents: [{ agent: "claude", mode: "readonly" }] });
 	assert.match(single.content[0].text, /at least 2 agent specs \(got 1\)/);

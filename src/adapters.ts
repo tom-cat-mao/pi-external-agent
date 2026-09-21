@@ -20,6 +20,8 @@
  *   reasonix  -> DeepSeek-native harness (prefix-cache tuned), yolo default
  *   qoder     -> yolo default, stream-json driven; steering is version-gated.
  *                Why: .agents/notes/implemented/2026-09-15-qoder-steering-version-gate.md
+ *   dsh       -> DeepSeek harness; yolo default, all three tiers enforced by dsh's own
+ *                sandbox through DSH_PERMISSION_MODE in a dedicated DSH_HOME.
  *
  * Effort flags as currently supported (hub/registry.ts refuses anything else):
  *   pi        -> --thinking <off|minimal|low|medium|high|xhigh|max>
@@ -29,11 +31,14 @@
  *   kimi      -> none; requests are refused
  *   reasonix  -> --effort <LEVEL> mapped onto the relay's vocabulary disabled|low|high|max
  *   qoder     -> --reasoning-effort <off|low|medium|high|xhigh|max> (no "minimal")
+ *   dsh       -> none on the one-shot path (refused, see DSH_ONESHOT_EFFORT_REFUSAL);
+ *                inside an ACP session: session/set_config_option reasoning_effort <off|low|high|max>
  */
 
 import { fileURLToPath } from "node:url";
+import { ensureDshHome } from "./dsh-home.ts";
 
-export type AgentId = "codex" | "pi" | "kimi" | "codebuddy" | "claude" | "reasonix" | "qoder";
+export type AgentId = "codex" | "pi" | "kimi" | "codebuddy" | "claude" | "reasonix" | "qoder" | "dsh";
 
 /** Permission mode requested at dispatch; each adapter maps it to real CLI flags. */
 export type Mode = "readonly" | "write" | "yolo";
@@ -77,6 +82,44 @@ const REASONIX_EFFORT_TOKENS: Record<Effort, string> = {
 export function reasonixEffortToken(effort: Effort): string {
 	return REASONIX_EFFORT_TOKENS[effort];
 }
+
+/**
+ * dsh's reasoning-effort vocabulary (the reasoning_effort config option an ACP
+ * session exposes, verified 0.1.5-rc.2: off|low|high|max). Same four steps as
+ * the reasonix relay, so the same mapping:
+ *   off->off  minimal->low  low->low  medium->high  high->high
+ *   xhigh->max  max->max
+ */
+const DSH_EFFORT_TOKENS: Record<Effort, string> = {
+	off: "off",
+	minimal: "low",
+	low: "low",
+	medium: "high",
+	high: "high",
+	xhigh: "max",
+	max: "max",
+};
+
+export function dshEffortToken(effort: Effort): string {
+	return DSH_EFFORT_TOKENS[effort];
+}
+
+/** The codex-vocabulary value dsh reads from DSH_PERMISSION_MODE. */
+export function dshPermissionMode(mode: Mode): string {
+	return mode === "readonly" ? "read-only" : mode === "write" ? "workspace-write" : "danger-full-access";
+}
+
+/**
+ * Why an effort request is refused on dsh's one-shot path. The headless profile
+ * has no effort knob at all (verified 0.1.5-rc.2), while an ACP session sets
+ * reasoning_effort over the protocol; the hub's own effort check in
+ * hub/registry.ts is adapter-level and cannot see that split, so the adapter
+ * refuses here rather than dropping the override silently.
+ */
+export const DSH_ONESHOT_EFFORT_REFUSAL =
+	"dsh forwards reasoning effort only inside an ACP session (session/set_config_option reasoning_effort); " +
+	"its one-shot headless profile has no effort knob, so the request is refused rather than dropped. " +
+	"Drop the effort parameter, or run dsh over its persistent session.";
 
 /** Token counts a CLI reports for one result, in the meter's field names. */
 export interface CliUsage {
@@ -133,6 +176,33 @@ export interface AdapterDispatch {
 		forwarded: boolean;
 		note: string;
 	};
+	/**
+	 * Extra environment this dispatch needs, merged OVER process.env by both
+	 * spawn paths (never a replacement). dsh is the adapter that uses it: the
+	 * harness home and the requested permission tier travel as DSH_HOME and
+	 * DSH_PERMISSION_MODE.
+	 */
+	env?: Record<string, string>;
+	/**
+	 * A non-fatal notice about this dispatch's environment. hub/registry.ts
+	 * records it as a task warning event, which is where non-fatal notices are
+	 * surfaced (external_agent_status: "non-fatal warnings"). dsh returns it from
+	 * provisioning: the harness home holds a local credentials copy instead of
+	 * the link to the user's file (the run still works, but that copy can be
+	 * stale), or there was no ~/.dsh/.credentials.yaml to link at all (the
+	 * default provider route or `.env` has to carry auth).
+	 */
+	warning?: string;
+	/**
+	 * Set when this dispatch cannot run as asked — not a bad argv, but a request
+	 * the adapter refuses to spell out. hub/registry.ts fails the dispatch with
+	 * this reason instead of spawning a process that cannot work, so a refusal
+	 * is never a silent drop. dsh returns it for an effort request on the
+	 * one-shot path (no effort knob exists there) and for a harness home that
+	 * cannot be created at all (an unusable path); absent credentials are a
+	 * warning, not a refusal.
+	 */
+	refusal?: string;
 }
 
 export interface Adapter {
@@ -807,6 +877,113 @@ const qoderAdapter: Adapter = {
 };
 
 // ---------------------------------------------------------------------------
+// dsh — DeepSeek harness; plain-text stdout, ACP sessions. Verified by hand
+// against dsh 0.1.5-rc.2 (installed at ~/.bun/bin/dsh):
+//
+//   one-shot: `dsh --profile headless "<task>"` prints the final assistant
+//             answer as plain text on stdout and streams reasoning on stderr as
+//             lines prefixed `dsh: reasoning:`; exit 0 on success, non-zero on
+//             failure. There is NO --json and NO --session-id in this release
+//             (both exist only in newer alphas), so stdout has no structure to
+//             parse and the exit code is the authority on success.
+//   session:  `dsh --profile acp` speaks standard ACP v1 over stdio;
+//             initialize advertises sessionCapabilities {close, list, resume}
+//             and no steer method, so steering is a second session/prompt on
+//             the active session (the codebuddy fallback in AcpDriver), and
+//             effort is settable with session/set_config_option
+//             (configId reasoning_effort, values off|low|high|max). See
+//             SESSION_DRIVERS.dsh in drivers/index.ts.
+//
+// Permission modes are codex's vocabulary, carried in the environment:
+//   readonly -> DSH_PERMISSION_MODE=read-only
+//   write    -> DSH_PERMISSION_MODE=workspace-write
+//   yolo     -> DSH_PERMISSION_MODE=danger-full-access
+// dsh's own sandbox enforces them mechanically (writes outside the mode are
+// denied; an escalation with no approval answerer fails closed, and over ACP it
+// arrives as session/request_permission, which the driver answers).
+//
+// DSH_HOME must point at the dedicated harness home from src/dsh-home.ts:
+// dsh's user settings (~/.dsh/settings.yaml, permission.defaultPreset) outrank
+// DSH_PERMISSION_MODE and any --patch overlay, so a run under the shared home
+// would not be bounded by the requested tier at all.
+// ---------------------------------------------------------------------------
+
+const dshAdapter: Adapter = {
+	id: "dsh",
+	bin: "dsh",
+	provider: "DeepSeek harness (dsh)",
+	useFor:
+		"Execution workhorse on a DeepSeek-native harness; dsh's own sandbox enforces the requested permission tier.",
+	defaultMode: "yolo",
+	maxMode: "yolo",
+	supportedEfforts: EFFORT_LEVELS,
+	session: {
+		steer: true,
+		followUp: true,
+		steerNote: "second session/prompt on the active session; injected at the next model step boundary",
+	},
+	sessionPolicy: (mode) =>
+		// "Fail closed" is a readonly fact only: the ACP driver auto-denies
+		// session/request_permission for readonly and auto-allows it for
+		// write/yolo, where the requested tier permits the escalation.
+		`DSH_PERMISSION_MODE=${dshPermissionMode(mode)} under a dedicated DSH_HOME (dsh's own sandbox enforces the tier; ` +
+		(mode === "readonly"
+			? "the driver denies session/request_permission escalations, so readonly fails closed)"
+			: "escalations the harness raises are allowed by the driver, as this tier permits)"),
+	enforcesReadOnly: true,
+	buildDispatch({ task, mode, model, effort }) {
+		const argv = ["--profile", "headless", task];
+		const dispatch: AdapterDispatch = {
+			argv,
+			promptArgIndex: argv.length - 1,
+			cwdForwardedToCli: false,
+			effectivePolicy:
+				`DSH_PERMISSION_MODE=${dshPermissionMode(mode)} under a dedicated DSH_HOME ` +
+				"(the user's shared ~/.dsh settings outrank that variable, so they must not be used)",
+			readOnlyEnforcement: mode === "readonly" ? "harness-enforced" : "not-applicable",
+			model: model
+				? {
+						requested: model,
+						forwarded: false,
+						note: "NOT forwarded: dsh 0.1.5-rc.2 takes its model from the run profile, and no one-shot model flag is verified.",
+					}
+				: { forwarded: false, note: "No model override requested; the run profile selects the model." },
+			effort: effortReceipt(effort, false, `NOT forwarded: ${DSH_ONESHOT_EFFORT_REFUSAL}`),
+		};
+		// The transport split first (it is the caller's to fix, and independent of
+		// this machine's state), then provisioning. Both are refusals, not throws:
+		// hub/registry.ts fails the dispatch with the reason they carry. A missing
+		// ~/.dsh/.credentials.yaml is NOT one of them — dsh runs credential-less on
+		// its default provider route, so that case comes back as a warning.
+		if (effort) return { ...dispatch, refusal: DSH_ONESHOT_EFFORT_REFUSAL };
+		const home = ensureDshHome();
+		if (!home.ok) return { ...dispatch, refusal: home.reason };
+		return {
+			...dispatch,
+			...(home.warning ? { warning: home.warning } : {}),
+			env: { DSH_HOME: home.home, DSH_PERMISSION_MODE: dshPermissionMode(mode) },
+		};
+	},
+	// Plain-text stdout: no --json exists in this release, so every non-empty
+	// line is answer prose, and hub/registry.ts joins the message events back
+	// with newlines (plus its close-time flush for a final line without one).
+	// Reasoning never reaches here — it streams on stderr as `dsh: reasoning:`
+	// lines, captured raw as stderr by the one-shot path — but a line carrying
+	// that prefix anyway is reported as reasoning rather than smuggled into the
+	// answer. Failures are a non-zero exit, not stdout text.
+	parseEvent(line) {
+		const trimmed = line.trim();
+		if (!trimmed) return null;
+		const reasoning = /^dsh:\s*reasoning:\s*(.*)$/.exec(trimmed);
+		// A bare prefix carries no thinking text. Reporting it would put an empty
+		// event into the log, and the hub counts reasoning as progress for the
+		// stall watchdog, so noise would reset a stall clock for nothing.
+		if (reasoning) return reasoning[1] ? { kind: "reasoning", text: reasoning[1] } : null;
+		return { kind: "message", text: line };
+	},
+};
+
+// ---------------------------------------------------------------------------
 // Pi — a child pi process; verified by hand on 2026-07-31 with a real
 // `pi --mode json --no-session --no-extensions --tools read,grep,find,ls` run
 // ---------------------------------------------------------------------------
@@ -990,6 +1167,7 @@ export const ADAPTERS: Record<AgentId, Adapter> = {
 	),
 	reasonix: reasonixAdapter,
 	qoder: qoderAdapter,
+	dsh: dshAdapter,
 };
 
 export const AGENT_IDS = Object.keys(ADAPTERS) as AgentId[];
