@@ -2,15 +2,20 @@
  * dsh (DeepSeek harness) ACP session driver, over a fake `dsh` executable.
  *
  * What the driver owes dsh 0.1.5-rc.2, and what this suite pins down:
- *   - the entry is a profile, `--profile acp`, never a bare `--acp`, and the
- *     task travels on the protocol rather than in the startup argv;
- *   - every spawn carries the dedicated DSH_HOME and the tier as
- *     DSH_PERMISSION_MODE, merged over process.env (never replacing it);
+ *   - the entry is a profile, `--profile acp`, never a bare `--acp`, followed by
+ *     the `--patch` overlay that keeps dsh's settings row off the user's own
+ *     settings document, and the task travels on the protocol rather than in the
+ *     startup argv;
+ *   - every spawn carries the tier as DSH_PERMISSION_MODE and DELETES an
+ *     inherited DSH_HOME (the home is the shared ~/.dsh the overlay was written
+ *     into), merged over process.env (never replacing it);
  *   - effort has no flag on this CLI, so it is set on the session as
  *     reasoning_effort AFTER session/new, mapped off|low|high|max — and no
  *     frame at all is sent when the caller requested no effort;
  *   - a rejected set_config_option fails the start with the server's own error,
  *     so a turn never runs at a default the caller did not ask for;
+ *   - a settings document or overlay that cannot be created fails the start
+ *     before anything is spawned: without them the requested tier stops binding;
  *   - permission requests are answered mechanically: readonly selects the
  *     reject option (or cancels when the server offers none), write/yolo allow
  *     — and an escalation is answered even when the harness, numbering its own
@@ -21,18 +26,28 @@
  *     keeps using it — the reasonix regression at the end).
  *
  * No live dsh run happens here: the protocol client talks to the fixture, and
- * provisioning is exercised against a temporary HOME.
+ * provisioning is exercised against a temporary HOME. The composition anchor's
+ * probe is memoized per process and would otherwise let whichever fixture `dsh`
+ * happens to be first on PATH answer for every test after it, so the suite arms
+ * it with a clean composition (see armedAnchor) and leaves the anchor's own
+ * behaviour to test/dsh.test.ts.
  *
  * Run with `node --test test/dsh-driver.test.ts`.
  */
 import { afterEach, test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { ADAPTERS, EFFORT_LEVELS, type Effort, type Mode } from "../src/adapters.ts";
+import {
+	DSH_OVERLAY_NAME,
+	DSH_SETTINGS_DOC_NAME,
+	dshCompositionWarnings,
+	dshSettingsDocPath,
+	resetDshCompositionGuard,
+} from "../src/dsh-launch.ts";
 import { SESSION_DRIVERS, type SessionDriver, type TurnOutcome } from "../src/drivers/index.ts";
-import { DSH_CREDENTIALS_LINK_NAME, DSH_HARNESS_HOME_NAME } from "../src/dsh-home.ts";
 
 /**
  * A fake ACP harness for both dsh and reasonix. It records every frame it
@@ -195,14 +210,52 @@ function makeFixtureDir(files: Record<string, string>): string {
 	return dir;
 }
 
-/** A fake user home; dsh's credentials file exists only when asked for. */
-function makeHome(withCredentials: boolean): string {
-	const home = mkdtempSync(path.join(tmpdir(), "dsh-driver-home-"));
-	if (withCredentials) {
-		mkdirSync(path.join(home, ".dsh"), { recursive: true });
-		writeFileSync(path.join(home, ".dsh", ".credentials.yaml"), "token: test\n");
-	}
-	return home;
+/** A fake user home. Nothing is pre-created: provisioning makes the shared home. */
+function makeHome(): string {
+	return mkdtempSync(path.join(tmpdir(), "dsh-driver-home-"));
+}
+
+/** The shared home under a fake user home, and the two files provisioning puts in it. */
+function sharedHome(home: string): string {
+	return path.join(home, ".dsh");
+}
+
+function settingsDocIn(home: string): string {
+	return dshSettingsDocPath(sharedHome(home));
+}
+
+function overlayIn(home: string): string {
+	return path.join(sharedHome(home), DSH_OVERLAY_NAME);
+}
+
+/**
+ * A composed config that satisfies every anchor check, as the probe would print
+ * it for these fixture files. The anchor itself is test/dsh.test.ts's subject;
+ * this suite needs it silent so that the fixture `dsh` — which answers the ACP
+ * handshake, not `--dump-config` — is never asked to compose anything.
+ */
+function armedAnchor(home: string): void {
+	const settingsDoc = settingsDocIn(home);
+	resetDshCompositionGuard();
+	dshCompositionWarnings({
+		overlay: overlayIn(home),
+		settingsDoc,
+		run: () =>
+			[
+				`# == @deepseek-ai/dsh-base, patched by ${overlayIn(home)}`,
+				"- id: settings",
+				"  name: '@deepseek-ai/dsh-settings-file'",
+				"  config:",
+				`    path: ${settingsDoc}`,
+				"- id: sandbox-policy",
+				"  config:",
+				"    mode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'",
+				"- id: approval",
+				"  config:",
+				"    policy: !!js process.env.DSH_PERMISSION_MODE === 'danger-full-access' ? 'never' : 'ask'",
+				"",
+			].join("\n"),
+	});
 }
 
 /** Tolerates a torn trailing line while the fixture is still appending. */
@@ -254,6 +307,9 @@ function makeHarness(agent: "dsh" | "reasonix", options: { home?: string; mockEn
 	setEnv("DSH_MOCK_LOG", logPath);
 	if (options.home) setEnv("HOME", options.home);
 	for (const [key, value] of Object.entries(options.mockEnv ?? {})) setEnv(key, value);
+	// The anchor's probe is memoized for the whole process: arm it for this
+	// fixture home so the fixture `dsh` is never asked to compose a config.
+	if (agent === "dsh" && options.home) armedAnchor(options.home);
 
 	const driver = SESSION_DRIVERS[agent]!();
 	const settled = new Promise<TurnOutcome>((resolve) => driver.onTurnEnd(resolve));
@@ -290,19 +346,26 @@ afterEach(() => {
 // argv and environment
 // ---------------------------------------------------------------------------
 
-test("dsh ACP session spawns `--profile acp` — never --acp — with the task on the protocol", async () => {
-	const home = makeHome(true);
+test("dsh ACP session spawns `--profile acp --patch <overlay>` — never --acp — with the task on the protocol", async () => {
+	const home = makeHome();
 	const harness = makeHarness("dsh", { home });
 	try {
 		await harness.start({ mode: "yolo", task: "audit the repo" });
 
 		// The receipt's argv (what the caller is told) and the argv the process
-		// actually got are the same profile entry.
-		assert.deepEqual(harness.driver.argv, ["--profile", "acp"]);
+		// actually got are the same profile entry, with the overlay that keeps
+		// dsh's settings row off the user's own settings document.
+		const expected = ["--profile", "acp", "--patch", overlayIn(home)];
+		assert.deepEqual(harness.driver.argv, expected);
 		const spawn = harness.records()[0];
 		assert.equal(spawn.kind, "spawn");
-		assert.deepEqual(spawn.argv, ["--profile", "acp"]);
+		assert.deepEqual(spawn.argv, expected);
 		assert.equal(spawn.argv.includes("--acp"), false);
+
+		// The overlay is provisioned, and dsh's settings row is pinned to an
+		// empty document rather than to the user's settings.yaml.
+		assert.equal(readFileSync(settingsDocIn(home), "utf8"), "");
+		assert.match(readFileSync(overlayIn(home), "utf8"), new RegExp(`path: ${settingsDocIn(home)}`));
 
 		// No prompt, model or effort flag in the startup argv: the task is a
 		// protocol frame, and this CLI has no effort flag at all.
@@ -316,19 +379,24 @@ test("dsh ACP session spawns `--profile acp` — never --acp — with the task o
 	}
 });
 
-test("dsh ACP session env: dedicated DSH_HOME and the mode's DSH_PERMISSION_MODE, merged over process.env", async () => {
-	const home = makeHome(true);
+test("dsh ACP session env: the mode's DSH_PERMISSION_MODE, no inherited DSH_HOME, merged over process.env", async () => {
+	const home = makeHome();
 	const modes: Array<[Mode, string]> = [
 		["readonly", "read-only"],
 		["write", "workspace-write"],
 		["yolo", "danger-full-access"],
 	];
 	for (const [mode, permission] of modes) {
-		const harness = makeHarness("dsh", { home, mockEnv: { DSH_MOCK_INHERITED: `marker-${mode}` } });
+		// DSH_HOME comes from the environment on purpose: it must not survive
+		// into the child, where it would resolve a home nothing provisioned.
+		const harness = makeHarness("dsh", {
+			home,
+			mockEnv: { DSH_MOCK_INHERITED: `marker-${mode}`, DSH_HOME: "/somewhere/else/.dsh" },
+		});
 		try {
 			await harness.start({ mode });
 			const spawn = await waitFor(`the ${mode} spawn`, () => harness.records()[0]);
-			assert.equal(spawn.env.DSH_HOME, path.join(home, DSH_HARNESS_HOME_NAME), `${mode} did not get the harness home`);
+			assert.equal(spawn.env.DSH_HOME, null, `${mode} carried an inherited DSH_HOME`);
 			assert.equal(spawn.env.DSH_PERMISSION_MODE, permission, `${mode} did not get its tier`);
 			// Merged over process.env, not a replacement: the CLI keeps the
 			// environment it has to run in.
@@ -340,35 +408,29 @@ test("dsh ACP session env: dedicated DSH_HOME and the mode's DSH_PERMISSION_MODE
 	}
 });
 
-test("dsh ACP session: a home without credentials still starts, unlinked, with the remedy as a warning", async () => {
-	const home = makeHome(false);
-	const harness = makeHarness("dsh", { home });
-	const warnings: string[] = [];
-	harness.driver.onEvent((event) => {
-		if (event.kind === "warning") warnings.push(event.text);
-	});
+test("dsh ACP session: an unusable shared home refuses the session start instead of running under the user's settings", async () => {
+	const root = mkdtempSync(path.join(tmpdir(), "dsh-driver-blocked-"));
+	// A file where the shared home would have to be: neither of provisioning's
+	// two files can exist, and without them dsh would read the user's own
+	// settings document, whose permission.defaultPreset outranks the tier.
+	const blocked = sharedHome(root);
+	writeFileSync(blocked, "in the way\n");
+	const harness = makeHarness("dsh", { home: root });
+	// No clean anchor here: this start must reach provisioning and fail there,
+	// before anything consults the composition.
+	resetDshCompositionGuard();
 	try {
-		// Not a provisioning failure: dsh completes a run credential-less on its
-		// default provider route (verified 0.1.5-rc.2 against an empty home), so
-		// the session starts in the dedicated home and links nothing.
-		await harness.start({ mode: "yolo" });
-
-		const spawn = await waitFor("the spawn record", () => harness.records()[0]);
-		assert.equal(spawn.kind, "spawn");
-		assert.equal(spawn.env.DSH_HOME, path.join(home, DSH_HARNESS_HOME_NAME), "the tier still needs its home");
-		assert.equal(spawn.env.DSH_PERMISSION_MODE, "danger-full-access");
-		// The home exists and holds no credentials entry, so dsh reads no broken
-		// link — the arrangement an empty harness home runs on.
-		assert.equal(lstatSync(path.join(home, DSH_HARNESS_HOME_NAME)).isDirectory(), true);
-		assert.throws(() => lstatSync(path.join(home, DSH_HARNESS_HOME_NAME, DSH_CREDENTIALS_LINK_NAME)), /ENOENT/);
-
-		// The turn runs, and the notice says what has to carry auth instead.
-		await waitFor("the first session/prompt", () => ofKind(harness.records(), "prompt")[0]);
-		assert.equal(harness.driver.alive, true);
-		assert.equal(warnings.length, 1, `expected one warning, got ${JSON.stringify(warnings)}`);
-		assert.match(warnings[0], /no .*\.credentials\.yaml to link/);
-		assert.match(warnings[0], /default provider route or \.env must carry auth/);
-		assert.match(warnings[0], /run `dsh web` once to manage credentials/);
+		await assert.rejects(
+			() => harness.start({ mode: "yolo" }),
+			(err: Error) => {
+				assert.match(err.message, /could not create dsh's shared home/);
+				assert.ok(err.message.includes(blocked), "the refusal names the path it could not use");
+				return true;
+			},
+		);
+		// Nothing was spawned, and the file it could not replace is untouched.
+		assert.deepEqual(ofKind(harness.records(), "spawn"), []);
+		assert.equal(readFileSync(blocked, "utf8"), "in the way\n");
 	} finally {
 		harness.stop();
 	}
@@ -379,7 +441,7 @@ test("dsh ACP session: a home without credentials still starts, unlinked, with t
 // ---------------------------------------------------------------------------
 
 test("dsh ACP session sets reasoning_effort after session/new, mapped for every level", async () => {
-	const home = makeHome(true);
+	const home = makeHome();
 	const expected: Array<[Effort, string]> = [
 		["off", "off"],
 		["minimal", "low"],
@@ -424,7 +486,7 @@ test("dsh ACP session sets reasoning_effort after session/new, mapped for every 
 });
 
 test("dsh ACP session: no effort requested sends no set_config_option frame", async () => {
-	const home = makeHome(true);
+	const home = makeHome();
 	const harness = makeHarness("dsh", { home });
 	try {
 		await harness.start({ mode: "yolo" });
@@ -437,7 +499,7 @@ test("dsh ACP session: no effort requested sends no set_config_option frame", as
 });
 
 test("dsh ACP session: a rejected set_config_option fails the start with the server's error, and no turn runs", async () => {
-	const home = makeHome(true);
+	const home = makeHome();
 	const harness = makeHarness("dsh", { home, mockEnv: { DSH_MOCK_FAIL_CONFIG: "1" } });
 	try {
 		await assert.rejects(
@@ -470,7 +532,7 @@ const PERMISSION_ALLOW_ONLY = JSON.stringify([
 
 /** Start a session whose fixture raises one sandbox-escalation permission request. */
 async function answerPermission(mode: Mode, options: string): Promise<MockRecord> {
-	const home = makeHome(true);
+	const home = makeHome();
 	const harness = makeHarness("dsh", { home, mockEnv: { DSH_MOCK_PERMISSION_OPTIONS: options } });
 	try {
 		await harness.start({ mode });
@@ -507,7 +569,7 @@ test("dsh ACP session: repeated escalations are all answered, and none is read a
 	// method is never a reply: all four escalations must be answered, and the
 	// turn must end on the harness's own end_turn rather than on the approval
 	// request that shares the prompt's id.
-	const home = makeHome(true);
+	const home = makeHome();
 	const harness = makeHarness("dsh", {
 		home,
 		mockEnv: { DSH_MOCK_PERMISSION_OPTIONS: PERMISSION_WITH_REJECT, DSH_MOCK_ESCALATIONS: "4" },
@@ -536,7 +598,7 @@ test("dsh ACP session: repeated escalations are all answered, and none is read a
 // ---------------------------------------------------------------------------
 
 test("dsh ACP session: a steer with no advertised method lands as a second session/prompt", async () => {
-	const home = makeHome(true);
+	const home = makeHome();
 	const harness = makeHarness("dsh", { home, mockEnv: { DSH_MOCK_HOLD: "1" } });
 	try {
 		await harness.start({ mode: "yolo", task: "audit the parser" });

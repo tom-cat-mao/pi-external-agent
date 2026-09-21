@@ -15,7 +15,7 @@ import { appendFile, mkdir, readFile, readdir, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { ExtensionAPI, SessionShutdownEvent } from "@earendil-works/pi-coding-agent";
-import { ADAPTERS, AGENT_IDS, dshEffortToken, type AgentEvent, type AgentId, type Effort, type Mode } from "../adapters.ts";
+import { ADAPTERS, AGENT_IDS, dshEffortToken, mergeSpawnEnv, type AgentEvent, type AgentId, type Effort, type Mode } from "../adapters.ts";
 import { ensureStored, extractSummary, placeholderFor } from "../artifacts.ts";
 import {
 	FOLLOWUP_AGENT_IDS,
@@ -378,10 +378,11 @@ function notifySettled(pi: ExtensionAPI, task: Task): void {
 	if (task.spawnError) lines.push(`spawn error: ${task.spawnError}`);
 	const errs = errorsOf(task);
 	if (errs) lines.push(`errors: ${truncate(errs, 500).text}`);
-	// Non-fatal notices (dsh: the harness home's credentials fork) belong on the
-	// push too, not only in external_agent_status: a caller that ends its turn and
-	// waits for this notice would otherwise never learn of them. Same wording as
-	// the status report, and a line only when there is something to say.
+	// Non-fatal notices (dsh: the composition anchor finding the requested tier
+	// not in force) belong on the push too, not only in external_agent_status: a
+	// caller that ends its turn and waits for this notice would otherwise never
+	// learn of them. Same wording as the status report, and a line only when
+	// there is something to say.
 	const warns = warningsOf(task);
 	if (warns) lines.push(`non-fatal warnings: ${truncate(warns, 400).text}`);
 	if (task.worktree) lines.push(`worktree: ${task.worktree.path} (branch ${task.worktree.branch})`);
@@ -1160,9 +1161,9 @@ function startOneshotTask(
 
 	// An adapter that cannot honour the request says so instead of spelling out a
 	// command whose result would mislead the caller (dsh: an effort request on a
-	// path with no effort knob, or a harness home that cannot be provisioned at
-	// all). It fails like a spawn that never started — reason recorded, nothing
-	// spawned.
+	// path with no effort knob, or a settings document/overlay that cannot be
+	// created at all). It fails like a spawn that never started — reason
+	// recorded, nothing spawned.
 	if (adapterDispatch.refusal) {
 		// A refused dispatch is not a dispatch: counting it would inflate the
 		// meter's dispatchTotal. It is recorded under its own label instead, which
@@ -1170,10 +1171,11 @@ function startOneshotTask(
 		meter.recordRefused("adapter refusal");
 		return failBeforeStart(task, adapterDispatch.refusal);
 	}
-	// Non-fatal dispatch-time notices (dsh: the harness home holds a local
-	// credentials copy, or had no user credentials file to link) ride the task's
-	// warning stream, where the status report already surfaces them as "non-fatal
-	// warnings". Such a dispatch IS a dispatch: it is counted like any other.
+	// Non-fatal dispatch-time notices (dsh: the composition anchor finding a
+	// patch or a replaced row that leaves the requested tier not in force) ride
+	// the task's warning stream, where the status report already surfaces them as
+	// "non-fatal warnings". Such a dispatch IS a dispatch: it is counted like any
+	// other.
 	if (adapterDispatch.warning) pushEvent(task, { kind: "warning", text: adapterDispatch.warning });
 	meter.recordDispatch(task.id);
 
@@ -1184,9 +1186,11 @@ function startOneshotTask(
 			cwd: task.dispatch.cwd,
 			stdio: ["ignore", "pipe", "pipe"],
 			// Adapter-contributed env is merged OVER the inherited environment,
-			// never a replacement: it carries what the CLI needs (dsh's DSH_HOME
-			// and DSH_PERMISSION_MODE) without removing the rest.
-			env: adapterDispatch.env ? { ...process.env, ...adapterDispatch.env } : process.env,
+			// never a replacement: it carries what the CLI needs (dsh's
+			// DSH_PERMISSION_MODE) without removing the rest, and an undefined
+			// value deletes a key instead (dsh: an inherited DSH_HOME, which
+			// would resolve a different home than the provisioned one).
+			env: adapterDispatch.env ? mergeSpawnEnv(process.env, adapterDispatch.env) : process.env,
 		});
 	} catch (err) {
 		return failBeforeStart(task, err instanceof Error ? err.message : String(err));
