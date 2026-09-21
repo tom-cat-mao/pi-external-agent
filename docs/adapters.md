@@ -8,18 +8,18 @@ All eight agents share one dispatch path; an omitted `mode` takes its default, o
 |---|---|---|---|---|---|---|---|---|
 | `codex` | OpenAI (`codex`) | yolo | readonly–yolo | yes: `--sandbox read-only` | off, minimal–xhigh | yes | yes | — |
 | `pi` | pi itself (`pi`) | yolo | readonly–yolo | yes: `--tools read,grep,find,ls` | off–max | yes | yes | — |
-| `kimi` | Moonshot (`kimi`) | yolo | yolo only (`minMode: "yolo"`) | no: print mode forces Never Ask | none (refused) | no | no | — |
+| `kimi` | Moonshot (`kimi`) | yolo | readonly–yolo | yes: plan-mode guard vetoes Write/Edit + driver-rejected prompts | off–max, session-only (one-shot refused) | no | yes | — |
 | `codebuddy` | Tencent (`codebuddy`) | yolo | readonly–yolo | best-effort: `default` + `--settings` + PreToolUse Bash hook | minimal–max (no off) | yes | yes | — |
 | `claude` | Anthropic (`claude`) | yolo | readonly–yolo | yes: `dontAsk` mode denies what was not pre-approved | low–max | yes | yes | fixture-tested only |
 | `reasonix` | DeepSeek-native (`reasonix`) | yolo | readonly–yolo | no pinned tier: driver-rejected prompts confine ≤1.38.7; fail-open from ≥1.38.8 | off–max | yes | yes | — |
 | `qoder` | Alibaba (`qodercli`) | yolo | readonly–yolo | yes: `dont_ask` + built-in tool allowlist | off, low–max (no minimal) | yes, version-gated | yes | — |
 | `dsh` | DeepSeek harness (`dsh`) | yolo | readonly–yolo | yes: dsh sandbox via `DSH_PERMISSION_MODE` over a scoped settings document; ACP escalation driver-denied | off–max, session-only (one-shot refused) | yes | yes | — |
 
-`enforcesReadOnly` is `false` only for kimi; `degraded` marks a known-degraded upstream. Without a sandbox, `write`/`yolo` are permission-rule tiers, not an OS boundary; a readonly hook is heuristic.
+Every adapter enforces read-only, and the Read-only column names the layer that does it; `degraded` marks a known-degraded upstream. Without a sandbox, `write`/`yolo` are permission-rule tiers, not an OS boundary; a readonly hook is heuristic.
 
-## kimi: yolo-only enforcement
+## kimi: tiers over ACP, print mode still yolo-only
 
-`kimi-code` print mode cannot select a tier: `-p` rejects `--yolo`/`--auto`/`--plan`, the print path forces Never Ask (auto), and `--dangerously-skip-permissions` does not exist, so `config.toml`'s `default_permission_mode` is never consulted and the requested yolo is not what runs (Never Ask permits more than Ask When Needed). Static `[[permission.rules]]` denies still bind. `minMode: "yolo"` refuses lower tiers rather than label what it cannot bound; `effort` is refused (no control exists).
+A dispatch boots `kimi acp`, sets the tier with `session/set_mode` before the first prompt (`readonly` → `plan`, `write` → `auto`, `yolo` → `yolo`) and configures effort and model per session. The one-shot `-p` spelling pins no tier and refuses effort. Details: [kimi.md](kimi.md).
 
 ## reasonix: readonly version boundary
 
@@ -39,6 +39,7 @@ dsh runs against the user's own `~/.dsh`, where `settings.yaml`'s `permission.de
 - pi: readonly restricts `--tools`; with no sandbox, write and yolo are equivalent.
 - codebuddy: `default` + `--settings` (readonly)/`acceptEdits`/`bypassPermissions`.
 - claude: `dontAsk`/`acceptEdits`/`bypassPermissions` over stream-json; readonly is the CLI's `dontAsk` deny (`permissions.allow` rules and read-only Bash heuristics still apply), preempting the driver's `can_use_tool` backstop.
+- kimi (session; the `-p` spelling pins no tier): `plan`/`auto`/`yolo` over ACP, readonly fail-closed.
 - reasonix (one-shot spelling; `acp` pins no tier): `manual`/`acceptEdits`/`bypassPermissions`; deny rules and OS sandbox still apply.
 - qoder: `dont_ask` + built-in allowlist/`accept_edits`/`bypass_permissions`.
 - dsh: `DSH_PERMISSION_MODE=read-only`/`workspace-write`/`danger-full-access` (codex vocabulary); readonly fail-closed over ACP.

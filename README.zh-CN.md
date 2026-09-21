@@ -52,7 +52,7 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
 | `reasonix` | DeepSeek 原生 | yolo（deny 规则和 OS 沙箱仍生效） | ✅ ACP vendor 扩展 |
 | `codebuddy` | 腾讯 | yolo | ✅ ACP step 边界注入 |
 | `qoder` | 阿里 | yolo | follow-up ✅；steer ✅，需 CLI 声明的版本满足 1.1.49 基线 |
-| `kimi` | Moonshot | 仅 yolo（headless 拒收权限旗标） | ❌ |
+| `kimi` | Moonshot | yolo（ACP 会话内三档为 readonly–yolo；print 拼写仅 yolo） | ❌ |
 | `claude` | Anthropic | yolo（readonly–yolo 三档；effort low–max，无 off） | ✅ stream-json |
 | `dsh` | DeepSeek harness | yolo（readonly–yolo 三档；dsh 自带沙箱强制执行该档位） | ✅ ACP |
 

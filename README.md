@@ -52,7 +52,7 @@ All off by default; enable per call — `template` (output contract), `verify` (
 | `reasonix` | DeepSeek-native | yolo (deny rules + OS sandbox still apply) | ✅ via ACP vendor extension |
 | `codebuddy` | Tencent | yolo | ✅ via ACP step-boundary injection |
 | `qoder` | Alibaba | yolo | follow-up ✅; steer ✅ when the announced CLI meets the 1.1.49 baseline |
-| `kimi` | Moonshot | yolo only (its headless mode rejects permission flags) | ❌ |
+| `kimi` | Moonshot | yolo (readonly–yolo over its ACP session; the print spelling is yolo-only) | ❌ |
 | `claude` | Anthropic | yolo (readonly–yolo; effort low–max, no off) | ✅ via stream-json |
 | `dsh` | DeepSeek harness | yolo (readonly–yolo; dsh's own sandbox enforces the tier) | ✅ via ACP |
 
