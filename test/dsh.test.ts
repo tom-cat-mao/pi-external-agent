@@ -7,8 +7,8 @@
  *   - the composition anchor: the memoized `--dump-config` probe and the three
  *     ways the composed config can disagree with what provisioning wrote;
  *   - the generalized ACP entry argv and the dialect env/effort hooks;
- *   - the per-spawn env plumbing of both transports (the DSH_HOME deletion,
- *     the DSH_TELEMETRY_DISABLED opt-out), and the hub's refusal path.
+ *   - the per-spawn env plumbing of both transports (including the DSH_HOME
+ *     deletion), and the hub's refusal path.
  *
  * The hardening pass below drives the same ground adversarially: per-mode argv
  * and env exactness, a refusal that precedes every filesystem dependency, the
@@ -304,11 +304,7 @@ test("dsh one-shot dispatch: profile argv with the overlay before the task, and 
 		assert.equal(readonly.argv[readonly.promptArgIndex], "audit the repo");
 		assert.equal(readonly.cwdForwardedToCli, false);
 		assert.equal(readonly.refusal, undefined);
-		assert.deepEqual(readonly.env, {
-			DSH_PERMISSION_MODE: "read-only",
-			DSH_HOME: undefined,
-			DSH_TELEMETRY_DISABLED: "1",
-		});
+		assert.deepEqual(readonly.env, { DSH_PERMISSION_MODE: "read-only", DSH_HOME: undefined });
 		assert.equal(readonly.readOnlyEnforcement, "harness-enforced");
 		assert.match(readonly.effectivePolicy ?? "", /DSH_PERMISSION_MODE=read-only/);
 		assert.match(readonly.effectivePolicy ?? "", /re-pointing dsh's settings row/);
@@ -321,12 +317,10 @@ test("dsh one-shot dispatch: profile argv with the overlay before the task, and 
 
 		const write = ADAPTERS.dsh.buildDispatch({ task: "t", cwd: "/tmp", mode: "write" });
 		assert.equal(write.env?.DSH_PERMISSION_MODE, "workspace-write");
-		assert.equal(write.env?.DSH_TELEMETRY_DISABLED, "1", "write: the telemetry opt-out must ride along");
 		assert.equal(write.readOnlyEnforcement, "not-applicable");
 
 		const yolo = ADAPTERS.dsh.buildDispatch({ task: "t", cwd: "/tmp", mode: "yolo" });
 		assert.equal(yolo.env?.DSH_PERMISSION_MODE, "danger-full-access");
-		assert.equal(yolo.env?.DSH_TELEMETRY_DISABLED, "1", "yolo: the telemetry opt-out must ride along");
 		assert.equal(yolo.readOnlyEnforcement, "not-applicable");
 	} finally {
 		restoreHome();
@@ -812,11 +806,7 @@ test("dsh one-shot: an anchor warning rides AdapterDispatch.warning, and never r
 		const dispatch = ADAPTERS.dsh.buildDispatch({ task: "t", cwd: "/tmp", mode: "readonly" });
 		assert.equal(dispatch.refusal, undefined, "an anchor warning must never refuse a dispatch");
 		assert.deepEqual(dispatch.argv, ["--profile", "headless", "--patch", overlayIn(home), "t"]);
-		assert.deepEqual(dispatch.env, {
-			DSH_PERMISSION_MODE: "read-only",
-			DSH_HOME: undefined,
-			DSH_TELEMETRY_DISABLED: "1",
-		});
+		assert.deepEqual(dispatch.env, { DSH_PERMISSION_MODE: "read-only", DSH_HOME: undefined });
 		const warning = dispatch.warning ?? "";
 		assert.ok(warning.includes("/etc/company/dsh.patch.yml"), `the warning names the offending patch: ${warning}`);
 		assert.match(warning, /may not be the one in force/);
@@ -842,11 +832,7 @@ test("dsh one-shot: the real probe over a fixture home composes clean and warns 
 		const dispatch = ADAPTERS.dsh.buildDispatch({ task: "t", cwd: "/tmp", mode: "yolo" });
 		assert.equal(dispatch.warning, undefined);
 		assert.equal(dispatch.refusal, undefined);
-		assert.deepEqual(dispatch.env, {
-			DSH_PERMISSION_MODE: "danger-full-access",
-			DSH_HOME: undefined,
-			DSH_TELEMETRY_DISABLED: "1",
-		});
+		assert.deepEqual(dispatch.env, { DSH_PERMISSION_MODE: "danger-full-access", DSH_HOME: undefined });
 	} finally {
 		restoreEnv();
 		restorePath();
@@ -964,7 +950,6 @@ record({
   env: {
     DSH_HOME: process.env.DSH_HOME || null,
     DSH_PERMISSION_MODE: process.env.DSH_PERMISSION_MODE || null,
-    DSH_TELEMETRY_DISABLED: process.env.DSH_TELEMETRY_DISABLED || null,
     PATH_INHERITED: Boolean(process.env.PATH),
   },
 });
@@ -1034,7 +1019,6 @@ test("dsh ACP session: --patch overlay, the shared home provisioned, the mode en
 		assert.deepEqual(spawned.argv, ["--profile", "acp", "--patch", overlayIn(home)]);
 		assert.equal(spawned.env.DSH_HOME, null, "an inherited DSH_HOME must never reach the session");
 		assert.equal(spawned.env.DSH_PERMISSION_MODE, "workspace-write");
-		assert.equal(spawned.env.DSH_TELEMETRY_DISABLED, "1", "the session spawn must carry the telemetry opt-out");
 		// Merged over process.env, not a replacement: the CLI still has its PATH.
 		assert.equal(spawned.env.PATH_INHERITED, true);
 		// Provisioning ran before the session start: the empty document and the
@@ -1064,7 +1048,6 @@ test("dsh ACP session: an ambient DSH_HOME is deleted from the child's environme
 		const [spawned] = mockLog(log);
 		assert.equal(spawned.env.DSH_HOME, null);
 		assert.equal(spawned.env.DSH_PERMISSION_MODE, "read-only", "the requested tier must win over an inherited one");
-		assert.equal(spawned.env.DSH_TELEMETRY_DISABLED, "1", "the telemetry opt-out travels with the readonly tier too");
 		// The overlay it was handed is the one provisioning wrote, in the shared home.
 		assert.equal(spawned.argv[spawned.argv.indexOf("--patch") + 1], overlayIn(home));
 	} finally {
@@ -1243,15 +1226,12 @@ test("dsh one-shot: every mode's argv is the profile, our overlay and the task, 
 			for (const flag of DSH_UNVERIFIED_FLAGS) {
 				assert.equal(dispatch.argv.includes(flag), false, `${mode}: ${flag} does not exist in this release`);
 			}
-			// Exactly three keys, and DSH_HOME carries the deletion: an extra
-			// value would widen the contract silently, and a missing deletion
-			// would let an ambient DSH_HOME through.
-			assert.deepEqual(Object.keys(dispatch.env ?? {}).sort(), ["DSH_HOME", "DSH_PERMISSION_MODE", "DSH_TELEMETRY_DISABLED"]);
+			// Exactly two keys, and DSH_HOME carries the deletion: an extra value
+			// would widen the contract silently, and a missing deletion would let an
+			// ambient DSH_HOME through.
+			assert.deepEqual(Object.keys(dispatch.env ?? {}).sort(), ["DSH_HOME", "DSH_PERMISSION_MODE"]);
 			assert.equal(dispatch.env?.DSH_HOME, undefined);
 			assert.equal(dispatch.env?.DSH_PERMISSION_MODE, permissionMode);
-			// The opt-out is spawn-env, not a fact about the user's own dsh: every
-			// tier of every extension run carries it.
-			assert.equal(dispatch.env?.DSH_TELEMETRY_DISABLED, "1", `${mode}: the telemetry opt-out must ride along`);
 			assert.equal("DSH_HOME" in (dispatch.env ?? {}), true, "the deletion must be explicit, not absent");
 			assert.equal(dispatch.readOnlyEnforcement, mode === "readonly" ? "harness-enforced" : "not-applicable");
 			assert.match(dispatch.effectivePolicy ?? "", new RegExp(`DSH_PERMISSION_MODE=${permissionMode}`));
@@ -1515,7 +1495,6 @@ if (log) fs.appendFileSync(log, JSON.stringify({
   env: {
     DSH_HOME: process.env.DSH_HOME || null,
     DSH_PERMISSION_MODE: process.env.DSH_PERMISSION_MODE || null,
-    DSH_TELEMETRY_DISABLED: process.env.DSH_TELEMETRY_DISABLED || null,
     INHERITED: process.env.DSH_TEST_INHERITED || null,
     PATH_PRESENT: Boolean(process.env.PATH),
   },
@@ -1609,7 +1588,6 @@ test("hub one-shot dsh: stdout lines become the answer, stderr reasoning never d
 		assert.deepEqual(spawned.argv, ["--profile", "headless", "--patch", overlayIn(home), "do the thing"]);
 		assert.equal(spawned.env.DSH_HOME, null, "the shared home is the one resolved, so DSH_HOME must be gone");
 		assert.equal(spawned.env.DSH_PERMISSION_MODE, "read-only");
-		assert.equal(spawned.env.DSH_TELEMETRY_DISABLED, "1", "the spawned run must be opted out of dsh's telemetry");
 		// Merged over the hub's own environment, never a replacement.
 		assert.equal(spawned.env.PATH_PRESENT, true);
 		assert.equal(spawned.env.INHERITED, "from-pi");
@@ -1783,8 +1761,6 @@ test("dsh ACP: each effort request is one set_config_option — \"off\" included
 		);
 		// No session ever inherits a home override: the overlay names the home.
 		assert.deepEqual(spawns.map((spawn) => spawn.env.DSH_HOME), [null, null, null]);
-		// ...and every session is opted out of dsh's telemetry, whatever the tier.
-		assert.deepEqual(spawns.map((spawn) => spawn.env.DSH_TELEMETRY_DISABLED), ["1", "1", "1"]);
 	} finally {
 		restorePath();
 		restoreEnv();
