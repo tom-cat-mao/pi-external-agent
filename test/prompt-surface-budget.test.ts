@@ -2,10 +2,23 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { registerHooks } from "node:module";
 
-// The tool surface (descriptions, snippets, guidelines, parameter descriptions)
-// is injected into every provider request, so its size is a standing cost. This
-// budget exists for the same reason docs-budget does: growth must be a decision,
-// not drift. Raise it only with a note explaining what the extra chars buy.
+// The prompt surface is paid in two layers, and this file budgets each on its
+// own terms:
+//
+//   - Fixed layer — the three always-active tools (external_agent_start,
+//     external_agent_status, external_agent_stop). Their names, descriptions,
+//     snippets, guidelines and parameter descriptions are injected into every
+//     provider request, dispatch or not, so this layer is hard-budgeted below.
+//   - Lazy layer — the four tools parked at session_start and activated
+//     additively on the first dispatch that runs (external_agent_wait,
+//     external_agent_compare, external_agent_steer, external_agent_follow_up).
+//     They are paid only by sessions that dispatch, so their total is recorded
+//     and soft-checked: a regression past the same 3,500 chars shows up as a
+//     diagnostic, and the fix is a deliberate one in the commit, not drift.
+//
+// Both layers are counted by the same collector: name + description +
+// promptSnippet + promptGuidelines + every `description` in the parameter
+// schema. Raise a budget only with a note explaining what the extra chars buy.
 
 const STUBS: Record<string, string> = {
 	"@earendil-works/pi-coding-agent": `export function keyHint(key, description) { return key + " " + description; }`,
@@ -33,6 +46,9 @@ const moduleHooks = registerHooks({
 });
 
 const hub = (await import("../src/index.ts")) as { default: (pi: unknown) => void };
+// The split is the design's, so the test reads it from the same constant the
+// activation handshake uses instead of spelling the four names again.
+const { LAZY_TOOL_NAMES } = (await import("../src/hub/shared.ts")) as { LAZY_TOOL_NAMES: readonly string[] };
 moduleHooks.deregister();
 
 const tools = new Map<string, any>();
@@ -65,28 +81,47 @@ function surfaceChars(tool: any): number {
 	return total;
 }
 
-// Measured 2026-09-19 after the archive/verify/template wave: see
-// .agents/notes/implemented/2026-09-19-answer-archive-verify-templates.md.
-// Raised from 8_900 on 2026-09-20 for the dsh agent line in the
-// external_agent_start table ("dsh = DeepSeek harness (dsh) — <useFor>
-// [default: yolo; effort: off..max; steer+follow-up]"; 189 chars with its
-// separator, per the table's own join: dsh(3) + " = "(3) + provider(22) +
-// " — "(3) + useFor(107) + " ["(2) + flags(48) + "]"(1)). The dsh useFor text
-// is already trimmed to one sentence, and any shorter would drop what the table
-// is for. Measured total after the raise: 9_070. The next agent pays the same
-// way: raise deliberately, never drift.
-const PROMPT_SURFACE_BUDGET_CHARS = 9_100;
+// Measured 2026-09-24, after the thin-surface wave (slimmed descriptions, the
+// external-agent skill, lazy activation): see
+// .agents/notes/implemented/2026-09-24-thin-tool-surface-skill-delegation.md and
+// 2026-09-24-lazy-tool-activation.md.
+const FIXED_SURFACE_BUDGET_CHARS = 3_500;
+const LAZY_SURFACE_SOFT_BUDGET_CHARS = 3_500;
 
-test("prompt surface stays within budget", () => {
-	let total = 0;
-	const lines: string[] = [];
-	for (const [name, tool] of [...tools.entries()].sort()) {
-		const chars = surfaceChars(tool);
-		total += chars;
-		lines.push(`${name}: ${chars}`);
+test("fixed prompt surface stays within budget; the lazy layer is recorded", (t) => {
+	const lazyNames = new Set<string>(LAZY_TOOL_NAMES);
+	const entries = [...tools.entries()].sort(([left], [right]) => left.localeCompare(right));
+	const fixed = entries.filter(([name]) => !lazyNames.has(name));
+	const lazy = entries.filter(([name]) => lazyNames.has(name));
+	assert.equal(
+		lazy.length,
+		LAZY_TOOL_NAMES.length,
+		`not all lazy tools are registered: expected ${LAZY_TOOL_NAMES.join(", ")}, found ${lazy.map(([name]) => name).join(", ")}`,
+	);
+
+	const rows = (list: Array<[string, any]>): Array<[string, number]> => list.map(([name, tool]) => [name, surfaceChars(tool)]);
+	const sum = (list: Array<[string, number]>): number => list.reduce((total, [, chars]) => total + chars, 0);
+	const describe = (list: Array<[string, number]>): string => list.map(([name, chars]) => `${name}: ${chars}`).join("\n");
+
+	const fixedRows = rows(fixed);
+	const lazyRows = rows(lazy);
+	const fixedTotal = sum(fixedRows);
+	const lazyTotal = sum(lazyRows);
+
+	t.diagnostic(`fixed layer ${fixedTotal} chars (hard budget ${FIXED_SURFACE_BUDGET_CHARS})\n${describe(fixedRows)}`);
+	t.diagnostic(`lazy layer ${lazyTotal} chars (soft budget ${LAZY_SURFACE_SOFT_BUDGET_CHARS})\n${describe(lazyRows)}`);
+	if (lazyTotal > LAZY_SURFACE_SOFT_BUDGET_CHARS) {
+		// Soft on purpose: only dispatched sessions pay this layer, so a crossing is
+		// a judgment call, not a broken invariant. The diagnostic is the gate's
+		// warning light — a human sees it in the run output.
+		t.diagnostic(
+			`SOFT BUDGET CROSSED: the lazy layer is ${lazyTotal - LAZY_SURFACE_SOFT_BUDGET_CHARS} chars past ` +
+				`${LAZY_SURFACE_SOFT_BUDGET_CHARS}. Not failing the gate; justify the growth or trim the four descriptions.`,
+		);
 	}
+
 	assert.ok(
-		total <= PROMPT_SURFACE_BUDGET_CHARS,
-		`prompt surface ${total} chars exceeds budget ${PROMPT_SURFACE_BUDGET_CHARS}\n${lines.join("\n")}`,
+		fixedTotal <= FIXED_SURFACE_BUDGET_CHARS,
+		`fixed prompt surface ${fixedTotal} chars exceeds budget ${FIXED_SURFACE_BUDGET_CHARS}\n${describe(fixedRows)}`,
 	);
 });

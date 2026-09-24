@@ -27,6 +27,7 @@ import {
 	COMPARE_POLL_INTERVAL_MS,
 	DEFAULT_WATCHDOG_MS,
 	IDLE_REAP_MS,
+	LAZY_TOOL_NAMES,
 	WAIT_ANSWER_PREVIEW_CHARS,
 	WAIT_DEFAULT_TIMEOUT_S,
 	WAIT_MAX_TIMEOUT_S,
@@ -112,6 +113,13 @@ const G_STEER =
 	"Prefer external_agent_steer to correct a running task's approach; it is not an interrupt (it lands at the next step boundary) — if the turn already ended, use external_agent_follow_up.";
 const G_FOLLOW_UP = "external_agent_follow_up continues the same session instead of re-dispatching work already done.";
 const G_VERIFY_CLAIMS = "Treat external agent answers as claims to verify against the code, not as fact.";
+/**
+ * Built from LAZY_TOOL_NAMES so the sentence cannot drift from what the
+ * activation handshake actually activates, and worded for the mechanism: a
+ * refusal returns before the activation site, so only a dispatch that runs
+ * brings the four back.
+ */
+const LAZY_ACTIVATION_LINE = `On the first dispatch that runs, ${LAZY_TOOL_NAMES.join(", ")} become active automatically.`;
 
 function steerResultText(task: Task, result: SteerResult): string {
 	if (!result.accepted) {
@@ -137,7 +145,7 @@ export function registerHubTools(pi: ExtensionAPI): void {
 			"timeout, but a stall watchdog (default 15m quiet) also notifies you, so ending your turn while",
 			"waiting is safe.",
 			"Agent capability matrix, effort levels, permission tiers, templates, steer/follow-up support: read skill `external-agent` before dispatching.",
-			"On first dispatch, external_agent_wait, external_agent_compare, external_agent_steer and external_agent_follow_up become active automatically.",
+			LAZY_ACTIVATION_LINE,
 			"Task text must be self-contained: the agent sees none of this conversation; state the goal, files and what to return.",
 			"Concurrent write/yolo tasks in one directory are refused; effort is opt-in (see the effort parameter).",
 		].join(" "),

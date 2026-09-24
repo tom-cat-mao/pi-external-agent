@@ -44,7 +44,7 @@ non-default modes also need a trusted startup directory.
   dedicated flag (a `-c` config override, with `off` spelled `none`); `reasonix` maps
   onto its relay's `disabled|low|high|max`; `qoder` uses `--reasoning-effort`.
 
-## Mode tiers
+## Permission tiers
 
 `readonly` forbids mutations, `write` allows workspace edits, `yolo` removes the
 sandbox — a yolo agent can modify or delete anything on this machine. An omitted

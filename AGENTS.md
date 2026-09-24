@@ -5,9 +5,9 @@ Working rules for agents editing this repository.
 ## Layout
 
 - `src/index.ts` — extension entry: binds the tool surface, `pi.exec`, the stats command and the session lifecycle.
-- `src/hub/tools.ts` — the seven tool registrations and their description strings.
+- `src/hub/tools.ts` — the seven tool registrations and their descriptions.
 - `src/hub/registry.ts` — task registry and state machine: dispatch validation, one-shot and persistent transports, settle finalize, notifications, stall watchdog, worktrees, session lifecycle.
-- `src/hub/reporting.ts` — caller-facing text: status report, dispatch receipts, compare report, relay receipt.
+- `src/hub/reporting.ts` — caller-facing text: status, receipts, compare and relay reports.
 - `src/hub/shared.ts` — task/receipt types, hub constants, pure formatting helpers and input predicates.
 - `src/adapters.ts` — per-CLI one-shot adapters: argv spelling and stdout parsing (incl. usage/cost), plus the `ADAPTERS` registry.
 - `src/dsh-launch.ts` — the dsh launch path against the shared `~/.dsh`: lazy, idempotent provisioning of the scoped settings document and its `--patch` overlay, plus a best-effort anchor guard that warns when the overlay loses effect.
@@ -26,7 +26,7 @@ Working rules for agents editing this repository.
 
 Release flow: push a `v*` tag → [.github/workflows/release.yml](.github/workflows/release.yml) runs both gates, then creates the GitHub Release with generated notes. An existing Release is left untouched, so a re-run is a no-op; to publish a tag pushed earlier, run that workflow manually (`workflow_dispatch`) with the tag name.
 
-Run only the test file relevant to your change locally; run the full suite before committing.
+Run only the test file relevant to your change; run the full suite before committing.
 
 ## Invariants
 
@@ -40,4 +40,4 @@ Run only the test file relevant to your change locally; run the full suite befor
 - [docs/](docs/) holds present-tense facts about the current system — no change-of-state or revision history, in English or Chinese. History belongs to git and notes.
 - [.agents/notes/](.agents/notes/) holds decision records. Template: Problem / Decision / Alternatives considered / Consequences. Every alternative states its strongest reason and why it was rejected. No `INDEX.md` — the folder is the status.
 - Budgets are enforced by test: `AGENTS.md` ≤ 550 words, each `docs/*.md` ≤ 650 words, each `docs/postmortem/*.md` ≤ 800 words, each note ≤ 120 lines, each README ≤ 70 lines.
-- Index: [docs/architecture.md](docs/architecture.md) (dispatch flow, receipts, transports) · [docs/adapters.md](docs/adapters.md) (capability matrix) · [docs/capabilities.md](docs/capabilities.md) (archive, verify, templates, isolate) · [docs/qoder.md](docs/qoder.md) (Qoder stream-json contract) · [docs/dsh.md](docs/dsh.md) (shared home, scoped settings) · [docs/kimi.md](docs/kimi.md) (ACP session, tiers, effort) · [docs/postmortem/](docs/postmortem/) (incident write-ups).
+- Index: [docs/architecture.md](docs/architecture.md) (dispatch flow, receipts, transports) · [docs/adapters.md](docs/adapters.md) (capability matrix) · [docs/capabilities.md](docs/capabilities.md) (archive, verify, templates, isolate) · [docs/prompt-surface.md](docs/prompt-surface.md) (tool text, activation) · [docs/qoder.md](docs/qoder.md) (Qoder stream-json contract) · [docs/dsh.md](docs/dsh.md) (shared home, scoped settings) · [docs/kimi.md](docs/kimi.md) (ACP session, tiers, effort) · [docs/postmortem/](docs/postmortem/) (incident write-ups).
