@@ -59,7 +59,7 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
 ## 文档
 
 - [AGENTS.md](AGENTS.md) — 目录结构、命令、不变式、文档规则
-- [docs/architecture.md](docs/architecture.md) — 派发流程、回执、传输层 · [docs/adapters.md](docs/adapters.md) — 各 CLI 能力矩阵 · [docs/capabilities.md](docs/capabilities.md) — 归档、验收、模板、relay、隔离、证据板、计量 · [docs/qoder.md](docs/qoder.md) — Qoder stream-json 契约 · [docs/dsh.md](docs/dsh.md) — dsh 共享 home 与作用域 settings · [docs/kimi.md](docs/kimi.md) — kimi 的 ACP 会话、档位与 effort · [.agents/notes/](.agents/notes/) — 决策记录
+- [docs/architecture.md](docs/architecture.md) — 派发流程、回执、传输层 · [docs/adapters.md](docs/adapters.md) — 各 CLI 能力矩阵 · [docs/capabilities.md](docs/capabilities.md) — 归档、验收、模板、relay、隔离、证据板、计量 · [docs/prompt-surface.md](docs/prompt-surface.md) — 三层工具文本与激活 · [docs/qoder.md](docs/qoder.md) — Qoder stream-json 契约 · [docs/dsh.md](docs/dsh.md) — dsh 共享 home 与作用域 settings · [docs/kimi.md](docs/kimi.md) — kimi 的 ACP 会话、档位与 effort · [.agents/notes/](.agents/notes/) — 决策记录
 
 ## 社区
 

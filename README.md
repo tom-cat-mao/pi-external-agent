@@ -59,7 +59,7 @@ All off by default; enable per call — `template` (output contract), `verify` (
 ## Documentation
 
 - [AGENTS.md](AGENTS.md) — repository layout, commands, invariants, documentation rules
-- [docs/architecture.md](docs/architecture.md) — dispatch flow, receipts, transports · [docs/adapters.md](docs/adapters.md) — per-CLI capability matrix · [docs/capabilities.md](docs/capabilities.md) — archive, verify, templates, relay, isolate, board, meter · [docs/qoder.md](docs/qoder.md) — Qoder stream-json contract · [docs/dsh.md](docs/dsh.md) — dsh shared home, scoped settings · [docs/kimi.md](docs/kimi.md) — kimi's ACP session, tiers, effort · [.agents/notes/](.agents/notes/) — decision records
+- [docs/architecture.md](docs/architecture.md) — dispatch flow, receipts, transports · [docs/adapters.md](docs/adapters.md) — per-CLI capability matrix · [docs/capabilities.md](docs/capabilities.md) — archive, verify, templates, relay, isolate, board, meter · [docs/prompt-surface.md](docs/prompt-surface.md) — tool-text layers and activation · [docs/qoder.md](docs/qoder.md) — Qoder stream-json contract · [docs/dsh.md](docs/dsh.md) — dsh shared home, scoped settings · [docs/kimi.md](docs/kimi.md) — kimi's ACP session, tiers, effort · [.agents/notes/](.agents/notes/) — decision records
 
 ## Community
 

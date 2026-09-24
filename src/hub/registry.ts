@@ -2,8 +2,8 @@
  * The hub's task registry and state machine: dispatch validation, the two
  * transports (one-shot process, persistent session), settle-time finalize
  * (archive + verify + worktree diff + evidence board), the completion and stall
- * notifications, the stall watchdog, worktree isolation, and the session
- * lifecycle that owns all of it.
+ * notifications, the stall watchdog, worktree isolation, lazy tool activation,
+ * and the session lifecycle that owns all of it.
  *
  * The tool surface over this registry is hub/tools.ts; the text it prints comes
  * from hub/reporting.ts; the vocabulary both share is hub/shared.ts.
@@ -14,7 +14,7 @@ import { createHash } from "node:crypto";
 import { appendFile, mkdir, readFile, readdir, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
-import type { ExtensionAPI, SessionShutdownEvent } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, SessionShutdownEvent, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import { ADAPTERS, AGENT_IDS, dshEffortToken, mergeSpawnEnv, type AgentEvent, type AgentId, type Effort, type Mode } from "../adapters.ts";
 import { ensureStored, extractSummary, placeholderFor } from "../artifacts.ts";
 import {
@@ -31,6 +31,7 @@ import {
 	CANCEL_ESCALATE_MS,
 	IDLE_REAP_MS,
 	INHERITED_ENVIRONMENT_NOTICE,
+	LAZY_TOOL_NAMES,
 	MAX_EVENTS,
 	MAX_STDERR_CHARS,
 	MAX_WATCHDOG_NOTICES,
@@ -48,6 +49,7 @@ import {
 	escapeTerminalControls,
 	fmtDuration,
 	freezeDispatchReceipt,
+	isLazyTool,
 	sessionReadOnlyEnforcement,
 	stallClock,
 	taskSnapshot,
@@ -60,6 +62,8 @@ import {
 	type StallKind,
 	type Task,
 	type TaskWorktree,
+	type ToolActivationState,
+	type ToolListApi,
 	type Transport,
 	type VerifyResult,
 	type WorktreeRef,
@@ -936,7 +940,7 @@ function startPersistentTask(
 	applyExtras(task, extras);
 	// The session is started below, so this is a dispatch that runs (a start
 	// failure is a failed dispatch, not a refusal the hub decided on).
-	meter.recordDispatch(task.id);
+	recordDispatch(task);
 	task.driver = driver;
 
 	driver.onEvent((event) => {
@@ -1188,7 +1192,7 @@ function startOneshotTask(
 	// "non-fatal warnings". Such a dispatch IS a dispatch: it is counted like any
 	// other.
 	if (adapterDispatch.warning) pushEvent(task, { kind: "warning", text: adapterDispatch.warning });
-	meter.recordDispatch(task.id);
+	recordDispatch(task);
 
 	let proc: ChildProcess;
 	try {
@@ -1429,6 +1433,96 @@ export function requireCapableTask(taskId: unknown, capability: "steer" | "follo
 }
 
 // ---------------------------------------------------------------------------
+// Lazy tool activation
+// ---------------------------------------------------------------------------
+
+/**
+ * The tool surface costs context on every request, but a session needs only
+ * external_agent_start/status/stop to get work going: wait, compare, steer and
+ * follow_up have nothing to act on until a task exists. A session therefore
+ * starts with those four parked, and the first dispatch that really runs brings
+ * them back.
+ *
+ * Parking is the one removal this module ever performs, and it happens at
+ * session_start — the moment the host establishes its own active list.
+ * Activation afterwards is additive and deduped, so a user's choice to enable
+ * one of the four, or to disable anything else, survives untouched.
+ */
+
+/** The host accessors, captured rather than bound: the pi object outlives the call. */
+function toolListApiFrom(pi: ExtensionAPI): ToolListApi | undefined {
+	if (typeof pi.getActiveTools !== "function" || typeof pi.setActiveTools !== "function") return undefined;
+	return { getActiveTools: () => pi.getActiveTools(), setActiveTools: (names) => pi.setActiveTools(names) };
+}
+
+function parkLazyTools(state: ToolActivationState): void {
+	const active = state.getActiveTools?.();
+	if (!active || !state.setActiveTools) return;
+	const parked = active.filter((name) => !isLazyTool(name));
+	// Nothing to park: writing the same list back would only record a transcript
+	// delta that changes nothing.
+	if (parked.length === active.length) return;
+	state.setActiveTools(parked);
+}
+
+/** Add the four back, deduped against the host's list: no write when none is missing. */
+function addLazyTools(state: ToolActivationState): void {
+	const active = state.getActiveTools?.();
+	if (!active || !state.setActiveTools) return;
+	const missing = LAZY_TOOL_NAMES.filter((name) => !active.includes(name));
+	if (missing.length > 0) state.setActiveTools([...active, ...missing]);
+}
+
+/**
+ * Arm the four for the first dispatch that runs, reporting whether this call is
+ * the one that did it. The flag is written before the host call and nothing here
+ * awaits, so two dispatches racing in one tool batch cannot both activate — and
+ * only the dispatch that flipped it carries the announcement.
+ */
+function activateLazyTools(): boolean {
+	const state = taskRegistry.toolActivation;
+	if (!state || state.activated) return false;
+	state.activated = true;
+	addLazyTools(state);
+	return true;
+}
+
+/**
+ * A dispatch that runs is what the meter counts and what activates the lazy
+ * four. A refusal returns before reaching this — the hub's own validation or an
+ * adapter that declines to spell out a command — while a task that fails to
+ * spawn has still been dispatched, exactly as the meter reads it.
+ */
+function recordDispatch(task: Task): void {
+	meter.recordDispatch(task.id);
+	// The activating dispatch's own result announces the four, whichever tool ran
+	// it: the flag rides that task to its result builder (hub/reporting.ts).
+	if (activateLazyTools()) task.activatedNow = true;
+}
+
+/**
+ * Capture the host's tool list and settle this session's parking, while the host
+ * is establishing its active list. A reload is not a new session: pi reinstates
+ * every extension tool there, so a session that already earned the four gets
+ * them restored additively and keeps its flag — nothing re-arms, and no second
+ * announcement is owed.
+ */
+function armToolActivation(pi: ExtensionAPI, reason: SessionStartEvent["reason"] | undefined): void {
+	const api = toolListApiFrom(pi);
+	const state = (taskRegistry.toolActivation ??= { activated: false });
+	state.getActiveTools = api?.getActiveTools;
+	state.setActiveTools = api?.setActiveTools;
+	if (reason === "reload" && state.activated) {
+		addLazyTools(state);
+		return;
+	}
+	// A genuinely new session (startup/new/resume/fork), or a reload before the
+	// first dispatch: the four start parked on this host's list.
+	state.activated = false;
+	parkLazyTools(state);
+}
+
+// ---------------------------------------------------------------------------
 // Session lifecycle
 // ---------------------------------------------------------------------------
 
@@ -1437,10 +1531,11 @@ export function requireCapableTask(taskId: unknown, capability: "steer" | "follo
  * session could not: notices held for a waiter whose wait never finished, and
  * tasks that settled while no callback was installed.
  */
-export function sessionStarted(pi: ExtensionAPI): void {
+export function sessionStarted(pi: ExtensionAPI, event?: Pick<SessionStartEvent, "reason">): void {
 	taskRegistry.notifySettled = (task) => notifySettled(pi, task);
 	taskRegistry.notifyWatchdog = (task, stall) => notifyWatchdog(pi, task, stall);
 	ensureWatchdogTimer();
+	armToolActivation(pi, event?.reason);
 	// Waiters belong to the session that started them; a new session inherits no
 	// in-flight wait, so its tokens must not hold notices forever.
 	for (const task of tasks.values()) task.waiters?.clear();
@@ -1466,6 +1561,9 @@ export function sessionShutdown(event: SessionShutdownEvent): void {
 		clearInterval(taskRegistry.watchdogTimer);
 		taskRegistry.watchdogTimer = undefined;
 	}
+	// The active-tool list belonged to the session that just ended; the next
+	// session_start captures its own and parks the four again.
+	taskRegistry.toolActivation = undefined;
 	taskRegistry.pendingNotificationIds.clear();
 	// Persistent sessions are separate processes: they outlive the registry
 	// unless they are explicitly reaped, which would leave orphans behind.

@@ -27,6 +27,7 @@ import {
 	COMPARE_POLL_INTERVAL_MS,
 	DEFAULT_WATCHDOG_MS,
 	IDLE_REAP_MS,
+	LAZY_TOOL_NAMES,
 	WAIT_ANSWER_PREVIEW_CHARS,
 	WAIT_DEFAULT_TIMEOUT_S,
 	WAIT_MAX_TIMEOUT_S,
@@ -71,7 +72,6 @@ import {
 	pushEvent,
 	requireCapableTask,
 	FOLLOWUP_AGENTS,
-	STEER_AGENTS,
 	stallKind,
 	stallNoticeDue,
 	stallPhrase,
@@ -83,6 +83,7 @@ import {
 	verifyLine,
 } from "./registry.ts";
 import {
+	activationNotice,
 	boardDigest,
 	type CompareSlot,
 	type DispatchedCompareSlot,
@@ -100,34 +101,26 @@ import {
 	renderTaskSnapshot,
 	resultText,
 } from "./reporting.ts";
-/** Agents whose adapter advertises a persistent session, in AGENT_IDS order. */
-const PERSISTENT_AGENTS = AGENT_IDS.filter((id) => ADAPTERS[id].session).join(", ");
-
-const agentTable = AGENT_IDS.map((id) => {
-	const a = ADAPTERS[id];
-	const flags = [
-		`default: ${a.defaultMode}`,
-		a.maxMode !== "yolo" ? `max: ${a.maxMode}` : null,
-		a.minMode && a.minMode !== "readonly" ? `${a.minMode}-only` : null,
-		a.enforcesReadOnly ? null : "read-only NOT enforceable",
-		a.supportedEfforts
-			? `effort: ${a.supportedEfforts[0]}..${a.supportedEfforts[a.supportedEfforts.length - 1]}`
-			: "no effort control",
-		a.session
-			? a.session.steer && a.session.followUp
-				? "steer+follow-up"
-				: a.session.followUp
-					? "follow-up only"
-					: a.session.steer
-						? "steer only"
-						: "session"
-			: "no steer",
-		a.degraded ? `DEGRADED: ${a.degraded}` : null,
-	]
-		.filter(Boolean)
-		.join("; ");
-	return `${id} = ${a.provider} — ${a.useFor} [${flags}]`;
-}).join(" | ");
+/**
+ * Guidelines that govern more than one tool live here as single constants, so
+ * every carrier registers the byte-identical string: pi dedupes guidelines by
+ * exact string match, and the capability detail they lean on has one home in
+ * the `external-agent` skill.
+ */
+const G_END_TURN =
+	"Default: after dispatching tasks whose results you do not need now, end your turn — completion and stall notifications re-invoke you. Never sleep-poll.";
+const G_WAIT_WHEN_NEEDED = "Use external_agent_wait only when the result is needed in this turn.";
+const G_STEER =
+	"Prefer external_agent_steer to correct a running task's approach; it is not an interrupt (it lands at the next step boundary) — if the turn already ended, use external_agent_follow_up.";
+const G_FOLLOW_UP = "external_agent_follow_up continues the same session instead of re-dispatching work already done.";
+const G_VERIFY_CLAIMS = "Treat external agent answers as claims to verify against the code, not as fact.";
+/**
+ * Built from LAZY_TOOL_NAMES so the sentence cannot drift from what the
+ * activation handshake actually activates, and worded for the mechanism: a
+ * refusal returns before the activation site, so only a dispatch that runs
+ * brings the four back.
+ */
+const LAZY_ACTIVATION_LINE = `On the first dispatch that runs, ${LAZY_TOOL_NAMES.join(", ")} become active automatically.`;
 
 function steerResultText(task: Task, result: SteerResult): string {
 	if (!result.accepted) {
@@ -152,21 +145,13 @@ export function registerHubTools(pi: ExtensionAPI): void {
 			"background and notifies you when it settles. Start several and keep working. There is no wall-clock",
 			"timeout, but a stall watchdog (default 15m quiet) also notifies you, so ending your turn while",
 			"waiting is safe.",
-			`Agents: ${agentTable}.`,
+			"Agent capability matrix, effort levels, permission tiers, templates, steer/follow-up support: read skill `external-agent` before dispatching.",
+			LAZY_ACTIVATION_LINE,
 			"Task text must be self-contained: the agent sees none of this conversation; state the goal, files and what to return.",
 			"Concurrent write/yolo tasks in one directory are refused; effort is opt-in (see the effort parameter).",
-			`Persistent sessions: ${PERSISTENT_AGENTS} (the conversation survives the answer, so it can be followed up or steered);`,
-			"the others are one-shot with no way back in.",
 		].join(" "),
-		promptSnippet: "Delegate a task to an external coding agent CLI",
-		promptGuidelines: [
-			"Default: after dispatching tasks whose results you do not need now, end your turn — completion and stall notifications re-invoke you. Never sleep-poll.",
-			"Use external_agent_wait only when the result is needed in this turn.",
-			"external_agent_steer is not an interrupt (it lands at the next step boundary); if it reports that the turn already ended, use external_agent_follow_up.",
-			"external_agent_follow_up continues the same session instead of re-dispatching work already done.",
-			"Treat external agent answers as claims to verify against the code, not as fact.",
-			"Opt-in extras (per parameter): template · verify · isolate · status offset · follow_up fromTaskId · compare board.",
-		],
+		promptSnippet: "Dispatch a task to an external agent CLI",
+		promptGuidelines: [G_END_TURN, G_WAIT_WHEN_NEEDED, G_STEER, G_FOLLOW_UP, G_VERIFY_CLAIMS],
 		parameters: Type.Object({
 			agent: StringEnum(AGENT_IDS as unknown as readonly string[]),
 			task: Type.String({
@@ -176,35 +161,34 @@ export function registerHubTools(pi: ExtensionAPI): void {
 			mode: Type.Optional(
 				StringEnum(["readonly", "write", "yolo"] as const, {
 					description:
-						"readonly forbids mutations; write allows workspace edits; yolo removes the sandbox. " +
-						"An omitted mode uses the agent's own default.",
+						"readonly forbids mutations; write allows workspace edits; yolo removes the sandbox; " +
+						"omitted = the agent's own default.",
 				}),
 			),
-			model: Type.Optional(Type.String({ description: "Override the agent's model, if it supports one." })),
+			model: Type.Optional(Type.String({ description: "Override the agent's model." })),
 			effort: Type.Optional(
 				StringEnum(EFFORT_LEVELS, {
 					description:
 						"Opt-in reasoning-effort override: set it only when the user explicitly requests an effort level, never " +
-						"infer one from task complexity. Omit it to inherit the target CLI/config default (\"off\" is an override, " +
-						"not an omission). Per-agent levels: agent table.",
+						"infer one from task complexity. Omit it to inherit the target CLI/config default (\"off\" is an override); " +
+						"per-agent ranges: see skill `external-agent`.",
 				}),
 			),
 			notify: Type.Optional(
 				StringEnum(["steer", "followUp", "nextTurn", "off"] as const, {
 					description:
-						"How you are told it settled: steer interrupts at the end of the current tool batch, followUp when you " +
-						"are idle, nextTurn on the user's next message, off never (poll external_agent_status).",
+						"Settle notification: steer (at the end of the current tool batch), followUp (when idle), " +
+						"nextTurn (next user message), off (never; poll external_agent_status).",
 				}),
 			),
 			watchdog: Type.Optional(
 				Type.Number({
-					description:
-						"Minutes of no activity before a stall notice (default 15; 0 disables; notify off suppresses delivery only).",
+					description: "Minutes of no activity before a stall notice (default 15; 0 disables).",
 				}),
 			),
 			template: Type.Optional(
 				Type.String({
-					description: "Task template name (e.g. evidence-research, verify-report); wraps the task with an output contract.",
+					description: "Task template name; wraps the task with an output contract.",
 				}),
 			),
 			verify: Type.Optional(
@@ -341,7 +325,12 @@ export function registerHubTools(pi: ExtensionAPI): void {
 			if (task.state === "failed") {
 				return {
 					content: [
-						{ type: "text", text: `Failed to start ${agent}: ${task.spawnError ?? "unknown spawn error"}` },
+						{
+							type: "text",
+							text: [`Failed to start ${agent}: ${task.spawnError ?? "unknown spawn error"}`, activationNotice([task])]
+								.filter(Boolean)
+								.join("\n"),
+						},
 					],
 					details: { kind: "external-agent-start", task: taskSnapshot(task) },
 				};
@@ -371,6 +360,9 @@ export function registerHubTools(pi: ExtensionAPI): void {
 											: "Otherwise end your turn now: you will be notified when it settles. Do not sleep-poll.",
 									].join(" "),
 							sessionNote,
+							// The line this dispatch owes when it is the one that
+							// brought the lazy four back (hub/reporting.ts owns it).
+							activationNotice([task]),
 						]
 							.filter(Boolean)
 							.join("\n"),
@@ -421,15 +413,14 @@ export function registerHubTools(pi: ExtensionAPI): void {
 		label: "External Agent Status",
 		description: [
 			"Check background external agent tasks. Omit taskId to list all; one task shows elapsed and quiet time plus",
-			"recent activity, and its answer once settled. Steady activity means working; a long quiet stretch means",
-			"consider stopping it.",
+			"recent activity, and its answer once settled. A long quiet stretch means consider stopping it.",
 		].join(" "),
-		promptSnippet: "Check background external agent tasks and their answers",
+		promptSnippet: "Check external agent tasks and answers",
 		parameters: Type.Object({
 			taskId: Type.Optional(Type.String()),
 			tail: Type.Optional(Type.Number({ description: "Recent events to show. Default 8." })),
 			offset: Type.Optional(
-				Type.Number({ description: "Page the archived answer from this byte offset (from a placeholder's recall hint)." }),
+				Type.Number({ description: "Page the archived answer from this byte offset (from a recall hint)." }),
 			),
 		}),
 
@@ -529,11 +520,10 @@ export function registerHubTools(pi: ExtensionAPI): void {
 		name: "external_agent_wait",
 		label: "External Agent Wait",
 		description: [
-			"Block until external agent tasks settle or the timeout elapses; it also returns early once every",
-			"watched task is quiet for its watchdog. On settle it returns the answer and suppresses that task's",
-			"notification; otherwise a summary.",
+			"Block until external agent tasks settle or the timeout elapses; it returns early once every watched",
+			"task is quiet past its watchdog. On settle it returns the answer and suppresses that task's notification.",
 		].join(" "),
-		promptSnippet: "Block until external agent tasks settle or time out",
+		promptGuidelines: [G_WAIT_WHEN_NEEDED],
 		parameters: Type.Object({
 			taskIds: Type.Array(Type.String(), { description: "Task ids from external_agent_start." }),
 			timeout: Type.Optional(
@@ -541,7 +531,7 @@ export function registerHubTools(pi: ExtensionAPI): void {
 			),
 			mode: Type.Optional(
 				StringEnum(["all", "any"] as const, {
-					description: "all (default): return when every listed task has settled. any: return as soon as the first one settles.",
+					description: "all (default) waits for every listed task; any returns when the first settles.",
 				}),
 			),
 		}),
@@ -735,18 +725,14 @@ export function registerHubTools(pi: ExtensionAPI): void {
 		name: "external_agent_compare",
 		label: "External Agent Compare",
 		description: [
-			"Put one task to several agent CLIs in one blocking call (specs[].task overrides it per slot): every valid",
-			"spec is dispatched in parallel with its own mode, model, effort and cwd; the answers come back side by",
-			"side once they settle or the",
-			"timeout elapses. It never diffs, scores or ranks — judging is yours. A spec that fails validation",
-			"(unsupported mode or effort, write/yolo conflict in its cwd) is recorded as a refusal while the others",
-			"still run. On timeout the receipt lists the taskIds still running: finish them with external_agent_wait,",
-			"or end your turn; their notifications re-invoke you. Use external_agent_start to keep working meanwhile.",
+			"Put one task to several agent CLIs in one blocking call (specs[].task overrides it per slot, with per-slot",
+			"mode/model/effort/cwd); the answers come back side by side once they settle or the timeout elapses. It never",
+			"diffs, scores or ranks — judging is yours. A spec failing validation (unsupported mode or effort, write/yolo",
+			"conflict in its cwd) is recorded as a refusal while the others still run. On timeout the receipt lists the",
+			"taskIds still running: finish them with external_agent_wait or end your turn; their notifications re-invoke you.",
 		].join(" "),
-		promptSnippet: "Ask several external agent CLIs the same task at once",
 		promptGuidelines: [
 			"Prefer external_agent_compare over chaining agents in a pipeline: disagreement between answers is the signal.",
-			"specs[].task overrides the shared task per slot; template/verify apply to every slot.",
 		],
 		parameters: Type.Object({
 			task: Type.String({
@@ -756,22 +742,22 @@ export function registerHubTools(pi: ExtensionAPI): void {
 				Type.Object({
 					agent: StringEnum(AGENT_IDS as unknown as readonly string[]),
 					task: Type.Optional(
-						Type.String({ description: "Per-slot task override; defaults to the shared task." }),
+						Type.String({ description: "Per-slot override of the shared task." }),
 					),
 					cwd: Type.Optional(
 						Type.String({
-							description: "Working directory for this agent. Defaults to the session cwd.",
+							description: "Same semantics as external_agent_start.cwd.",
 						}),
 					),
 					mode: Type.Optional(
 						StringEnum(["readonly", "write", "yolo"] as const, {
-							description: "Permission mode for this agent. An omitted mode uses its own default.",
+							description: "Same semantics as external_agent_start.mode.",
 						}),
 					),
-					model: Type.Optional(Type.String({ description: "Override this agent's model." })),
+					model: Type.Optional(Type.String({ description: "Same semantics as external_agent_start.model." })),
 					effort: Type.Optional(
 						StringEnum(EFFORT_LEVELS, {
-							description: "Same opt-in effort rules as external_agent_start.",
+							description: "Same semantics as external_agent_start.effort.",
 						}),
 					),
 				}),
@@ -783,11 +769,11 @@ export function registerHubTools(pi: ExtensionAPI): void {
 			),
 			timeout: Type.Optional(
 				Type.Number({
-					description: `Seconds to wait for the whole batch (default ${WAIT_DEFAULT_TIMEOUT_S}, max ${WAIT_MAX_TIMEOUT_S}).`,
+					description: `Batch timeout seconds (default ${WAIT_DEFAULT_TIMEOUT_S}, max ${WAIT_MAX_TIMEOUT_S}).`,
 				}),
 			),
 			template: Type.Optional(
-				Type.String({ description: "Task template applied to every slot (see external_agent_start)." }),
+				Type.String({ description: "Same semantics as external_agent_start.template, per slot." }),
 			),
 			verify: Type.Optional(
 				Type.Object(
@@ -795,17 +781,17 @@ export function registerHubTools(pi: ExtensionAPI): void {
 						command: Type.String(),
 						timeoutSeconds: Type.Optional(Type.Number()),
 					},
-					{ description: "After each slot settles, run this acceptance command and report its exit code." },
+					{ description: "Same semantics as external_agent_start.verify, per slot." },
 				),
 			),
 			isolate: Type.Optional(
 				Type.Boolean({
-					description: "Run in a fresh git worktree under .external-agent/worktrees",
+					description: "Same semantics as external_agent_start.isolate.",
 				}),
 			),
 			board: Type.Optional(
 				Type.String({
-					description: "Append per-slot evidence rows to this JSONL board (\"\" disables)",
+					description: "JSONL board for per-slot evidence rows (\"\" disables).",
 				}),
 			),
 		}),
@@ -997,7 +983,16 @@ export function registerHubTools(pi: ExtensionAPI): void {
 				content: [
 					{
 						type: "text",
-						text: [compareReport(slots, timedOut, aborted, timeoutS), digest].filter(Boolean).join("\n"),
+						text: [
+							compareReport(slots, timedOut, aborted, timeoutS),
+							digest,
+							// A compare batch can be the dispatch that activated the
+							// four (a host that parks nothing): the line rides this
+							// result, not only external_agent_start's.
+							activationNotice(dispatched.map((slot) => slot.task)),
+						]
+							.filter(Boolean)
+							.join("\n"),
 					},
 				],
 				details: { kind: "external-agent-compare", timedOut, aborted, results: compareResults(slots) },
@@ -1039,15 +1034,12 @@ export function registerHubTools(pi: ExtensionAPI): void {
 		name: "external_agent_steer",
 		label: "External Agent Steer",
 		description: [
-			"Send a mid-run guidance message to a running external agent task: correct the approach, narrow the scope,",
-			"add a constraint, or tell it to wrap up early (to cancel instead, use external_agent_stop). Supported:",
-			`${STEER_AGENTS}; kimi is persistent but has no steer. Qoder steering requires qodercli stable >= 1.1.49 and is refused`,
-			"with the reported version otherwise. For a settled task, use external_agent_follow_up.",
+			"Send mid-run guidance to a running external agent task: correct the approach, narrow scope, add a constraint,",
+			"or tell it to wrap up early (to cancel instead, use external_agent_stop). Qoder steering requires qodercli",
+			"stable >= 1.1.49 and is refused with the reported version otherwise; support matrix: see skill `external-agent`.",
+			"For a settled task, use external_agent_follow_up.",
 		].join(" "),
-		promptSnippet: "Redirect a running external agent task mid-run",
-		promptGuidelines: [
-			`Use external_agent_steer while a ${STEER_AGENTS} task is running to correct its approach instead of stopping and re-dispatching it.`,
-		],
+		promptGuidelines: [G_STEER],
 		parameters: Type.Object({
 			taskId: Type.String({ description: "Task id from external_agent_start." }),
 			message: Type.String({
@@ -1101,16 +1093,16 @@ export function registerHubTools(pi: ExtensionAPI): void {
 		name: "external_agent_follow_up",
 		label: "External Agent Follow Up",
 		description: [
-			"Continue a settled external agent task with another message in the SAME session: it still has everything",
-			"it did and learned, so you need not restate the task. It runs again and notifies you when the new turn",
-			`settles. Supported: ${FOLLOWUP_AGENTS}. Reclaimed after 30 minutes idle; a follow-up is then refused — dispatch a new`,
-			"task instead.",
+			"Continue a settled external agent task in the SAME session: it still has everything it did and learned, so do",
+			`not restate the task. It runs again and notifies you when the new turn settles. Supported: ${FOLLOWUP_AGENTS}.`,
+			"Reclaimed after 30 minutes idle, and a follow-up is then refused — dispatch a new task.",
+			"Relay protocol: see skill `external-agent`.",
 		].join(" "),
-		promptSnippet: "Ask a follow-up in the same external agent session",
+		promptGuidelines: [G_FOLLOW_UP],
 		parameters: Type.Object({
 			taskId: Type.String({ description: "Task id from external_agent_start." }),
 			message: Type.String({ description: "Follow-up text; ignored for a relay." }),
-			fromTaskId: Type.Optional(Type.String({ description: "Relay source task; its answer is the body." })),
+			fromTaskId: Type.Optional(Type.String({ description: "Relay source task; its answer becomes the message." })),
 			purpose: Type.Optional(StringEnum(["reproduce", "combine", "challenge"] as const, { description: "Relay intent." })),
 			offset: Type.Optional(Type.Number({ description: "Start byte in the source answer." })),
 			length: Type.Optional(Type.Number({ description: "Excerpt bytes (default 4000, max 16000)." })),

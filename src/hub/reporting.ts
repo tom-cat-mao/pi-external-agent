@@ -32,6 +32,7 @@ import {
 	DEFAULT_WATCHDOG_MS,
 	IDLE_REAP_MS,
 	INHERITED_ENVIRONMENT_NOTICE,
+	LAZY_TOOL_NAMES,
 	MAX_ANSWER_CHARS,
 	WAIT_ANSWER_PREVIEW_CHARS,
 	allAnswersOf,
@@ -64,6 +65,25 @@ import {
 // ---------------------------------------------------------------------------
 // Reporting
 // ---------------------------------------------------------------------------
+
+/**
+ * The one-shot line that announces lazy activation. It rides the activating
+ * dispatch's own tool result because that is the one moment the model is
+ * looking: earlier would describe tools it cannot use yet, and later would not
+ * explain where the four came from.
+ */
+export const LAZY_ACTIVATION_NOTICE = `Tools ${LAZY_TOOL_NAMES.join(", ")} are now active.`;
+
+/**
+ * The line the result of the activating dispatch owes, or undefined for every
+ * other result. The flag lives on the task the activation site marked
+ * (`activatedNow`), not on a tool name: the dispatch may have come from any
+ * tool, so compare announces its own batch the same way start does. Per task,
+ * which is what keeps two dispatches racing in one batch from both carrying it.
+ */
+export function activationNotice(tasks: Array<Pick<Task, "activatedNow">>): string | undefined {
+	return tasks.some((task) => task.activatedNow === true) ? LAZY_ACTIVATION_NOTICE : undefined;
+}
 
 /**
  * Bounded one-line event profile for a wait report, counted over the call's own
