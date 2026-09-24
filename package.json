@@ -35,6 +35,7 @@
   },
   "files": [
     "src/",
+    "skills/",
     "templates/",
     "hooks/codebuddy-readonly.js",
     "README.md",
