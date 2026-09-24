@@ -8,7 +8,7 @@
 
 ```bash
 # 锁定版本（推荐，pi update 不会动它）
-pi install git:github.com/tom-cat-mao/pi-external-agent@v0.7.0
+pi install git:github.com/tom-cat-mao/pi-external-agent@v0.8.0
 # 或跟随 main 分支
 pi install git:github.com/tom-cat-mao/pi-external-agent
 ```
