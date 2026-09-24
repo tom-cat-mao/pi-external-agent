@@ -32,6 +32,7 @@ import {
 	DEFAULT_WATCHDOG_MS,
 	IDLE_REAP_MS,
 	INHERITED_ENVIRONMENT_NOTICE,
+	LAZY_TOOL_NAMES,
 	MAX_ANSWER_CHARS,
 	WAIT_ANSWER_PREVIEW_CHARS,
 	allAnswersOf,
@@ -64,6 +65,24 @@ import {
 // ---------------------------------------------------------------------------
 // Reporting
 // ---------------------------------------------------------------------------
+
+/**
+ * The one-shot line that announces lazy activation. It rides the first
+ * dispatch's tool result because that is the one moment the model is looking:
+ * earlier would describe tools it cannot use yet, and later would not explain
+ * where the four came from.
+ */
+export const LAZY_ACTIVATION_NOTICE = `Tools ${LAZY_TOOL_NAMES.join(", ")} are now active.`;
+
+/**
+ * Append the activation notice to a tool result's content blocks, unless it is
+ * already there. Returns undefined when there is nothing to add, which is what
+ * keeps the caller from rewriting a result it has no business in.
+ */
+export function withLazyActivationNotice<T extends { type: string; text?: string }>(content: T[]): T[] | undefined {
+	if (content.some((block) => block.type === "text" && block.text?.includes(LAZY_ACTIVATION_NOTICE))) return undefined;
+	return [...content, { type: "text", text: LAZY_ACTIVATION_NOTICE } as T];
+}
 
 /**
  * Bounded one-line event profile for a wait report, counted over the call's own
