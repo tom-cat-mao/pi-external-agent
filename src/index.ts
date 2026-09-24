@@ -26,6 +26,7 @@
  *    Why: .agents/notes/implemented/2026-08-17-single-tool-surface.md
  */
 
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	finalizeHooks,
@@ -39,8 +40,20 @@ import {
 import { stallClock } from "./hub/shared.ts";
 import { registerHubTools } from "./hub/tools.ts";
 
+/**
+ * The capability index shipped beside the extension. Resolved from this module's
+ * URL, like the codebuddy readonly hook, so it stays correct wherever the
+ * extension is installed.
+ */
+const SKILL_PATH = fileURLToPath(new URL("../skills/external-agent/SKILL.md", import.meta.url));
+
 export default function (pi: ExtensionAPI) {
 	registerHubTools(pi);
+
+	// Advertised through pi's resources_discover hook: only the skill's name and
+	// description enter the prompt, and the model reads the file itself when it
+	// needs the capability detail that used to sit in the tool descriptions.
+	pi.on("resources_discover", () => ({ skillPaths: [SKILL_PATH] }));
 
 	// Settle-time verify runs through pi.exec; absent in stubbed hosts (tests).
 	finalizeHooks.exec = typeof pi.exec === "function" ? pi.exec.bind(pi) : undefined;

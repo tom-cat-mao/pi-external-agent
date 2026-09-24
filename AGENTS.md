@@ -14,6 +14,7 @@ Working rules for agents editing this repository.
 - `src/drivers/` — persistent session drivers for steer / follow-up: `base.ts` (stdio + JSON-RPC plumbing), one file per wire protocol (`pi-rpc`, `codex-app-server`, `acp`, `stream-json`), and `index.ts` (`SESSION_DRIVERS`).
 - `src/artifacts.ts` — answer archive: settle-time content-addressed store, inline placeholder, paged recall.
 - `src/templates.ts` + `templates/` — task-template loading (project > user > builtin) and the five builtins.
+- `skills/external-agent/SKILL.md` — capability index pi loads on demand via `resources_discover`.
 - `src/meter.ts` — CLI-reported usage/cost counters behind `/external_agent_stats`.
 - `hooks/` — `codebuddy-readonly.js`, the PreToolUse Bash hook loaded by codebuddy's readonly `--settings`.
 - `test/` — `node:test` suites; pi packages are stubbed via `registerHooks`.
