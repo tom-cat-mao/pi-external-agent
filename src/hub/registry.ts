@@ -2,8 +2,8 @@
  * The hub's task registry and state machine: dispatch validation, the two
  * transports (one-shot process, persistent session), settle-time finalize
  * (archive + verify + worktree diff + evidence board), the completion and stall
- * notifications, the stall watchdog, worktree isolation, and the session
- * lifecycle that owns all of it.
+ * notifications, the stall watchdog, worktree isolation, lazy tool activation,
+ * and the session lifecycle that owns all of it.
  *
  * The tool surface over this registry is hub/tools.ts; the text it prints comes
  * from hub/reporting.ts; the vocabulary both share is hub/shared.ts.
@@ -31,6 +31,7 @@ import {
 	CANCEL_ESCALATE_MS,
 	IDLE_REAP_MS,
 	INHERITED_ENVIRONMENT_NOTICE,
+	LAZY_TOOL_NAMES,
 	MAX_EVENTS,
 	MAX_STDERR_CHARS,
 	MAX_WATCHDOG_NOTICES,
@@ -40,6 +41,7 @@ import {
 	STALL_FACTOR,
 	STALL_FLOOR_MS,
 	STALL_SAMPLE_MIN,
+	START_TOOL_NAME,
 	STRUGGLE_MS,
 	WATCHDOG_SCAN_INTERVAL_MS,
 	anchorRefs,
@@ -48,6 +50,7 @@ import {
 	escapeTerminalControls,
 	fmtDuration,
 	freezeDispatchReceipt,
+	isLazyTool,
 	sessionReadOnlyEnforcement,
 	stallClock,
 	taskSnapshot,
@@ -60,10 +63,13 @@ import {
 	type StallKind,
 	type Task,
 	type TaskWorktree,
+	type ToolActivationState,
+	type ToolListApi,
 	type Transport,
 	type VerifyResult,
 	type WorktreeRef,
 } from "./shared.ts";
+import { withLazyActivationNotice } from "./reporting.ts";
 import { createMeter, type MeterSnapshot, type UsageSample } from "../meter.ts";
 
 const TASK_REGISTRY_KEY = Symbol.for("pi.external-agent.task-registry.v1");
@@ -936,7 +942,7 @@ function startPersistentTask(
 	applyExtras(task, extras);
 	// The session is started below, so this is a dispatch that runs (a start
 	// failure is a failed dispatch, not a refusal the hub decided on).
-	meter.recordDispatch(task.id);
+	recordDispatch(task);
 	task.driver = driver;
 
 	driver.onEvent((event) => {
@@ -1188,7 +1194,7 @@ function startOneshotTask(
 	// "non-fatal warnings". Such a dispatch IS a dispatch: it is counted like any
 	// other.
 	if (adapterDispatch.warning) pushEvent(task, { kind: "warning", text: adapterDispatch.warning });
-	meter.recordDispatch(task.id);
+	recordDispatch(task);
 
 	let proc: ChildProcess;
 	try {
@@ -1429,6 +1435,99 @@ export function requireCapableTask(taskId: unknown, capability: "steer" | "follo
 }
 
 // ---------------------------------------------------------------------------
+// Lazy tool activation
+// ---------------------------------------------------------------------------
+
+/**
+ * The tool surface costs context on every request, but a session needs only
+ * external_agent_start/status/stop to get work going: wait, compare, steer and
+ * follow_up have nothing to act on until a task exists. A session therefore
+ * starts with those four parked, and the first dispatch that really runs brings
+ * them back.
+ *
+ * Parking is the one removal this module ever performs, and it happens at
+ * session_start — the moment the host establishes its own active list.
+ * Activation afterwards is additive and deduped, so a user's choice to enable
+ * one of the four, or to disable anything else, survives untouched.
+ */
+
+/** The host accessors, captured rather than bound: the pi object outlives the call. */
+function toolListApiFrom(pi: ExtensionAPI): ToolListApi | undefined {
+	if (typeof pi.getActiveTools !== "function" || typeof pi.setActiveTools !== "function") return undefined;
+	return { getActiveTools: () => pi.getActiveTools(), setActiveTools: (names) => pi.setActiveTools(names) };
+}
+
+/** Hosts already carrying this module's tool_result handler; a second session_start must not stack another. */
+const hookedHosts = new WeakSet<object>();
+
+function parkLazyTools(state: ToolActivationState): void {
+	const active = state.getActiveTools?.();
+	if (!active || !state.setActiveTools) return;
+	const parked = active.filter((name) => !isLazyTool(name));
+	// Nothing to park: writing the same list back would only record a transcript
+	// delta that changes nothing.
+	if (parked.length === active.length) return;
+	state.setActiveTools(parked);
+}
+
+/**
+ * Arm the four for the first dispatch that runs. Both flags are written before
+ * the host call and nothing here awaits, so two dispatches racing in one tool
+ * batch cannot both activate — and exactly one of their results carries the
+ * notice.
+ */
+function activateLazyTools(): void {
+	const state = taskRegistry.toolActivation;
+	if (!state || state.activated) return;
+	state.activated = true;
+	state.noticePending = true;
+	const active = state.getActiveTools?.();
+	if (!active || !state.setActiveTools) return;
+	const missing = LAZY_TOOL_NAMES.filter((name) => !active.includes(name));
+	if (missing.length > 0) state.setActiveTools([...active, ...missing]);
+}
+
+/**
+ * A dispatch that runs is what the meter counts and what activates the lazy
+ * four. A refusal returns before reaching this — the hub's own validation or an
+ * adapter that declines to spell out a command — while a task that fails to
+ * spawn has still been dispatched, exactly as the meter reads it.
+ */
+function recordDispatch(task: Task): void {
+	meter.recordDispatch(task.id);
+	activateLazyTools();
+}
+
+/**
+ * Capture the host's tool list, park the lazy four for this session, and hook
+ * the one result that announces them. Called from session_start, so the parking
+ * lands while the host is establishing its active list.
+ */
+function armToolActivation(pi: ExtensionAPI): void {
+	const api = toolListApiFrom(pi);
+	const state = (taskRegistry.toolActivation ??= { activated: false, noticePending: false });
+	state.getActiveTools = api?.getActiveTools;
+	state.setActiveTools = api?.setActiveTools;
+	// A session is where the handshake starts, whatever the last one reached.
+	state.activated = false;
+	state.noticePending = false;
+	parkLazyTools(state);
+	if (hookedHosts.has(pi)) return;
+	hookedHosts.add(pi);
+	// The announcement rides the model-visible text of the first dispatch's
+	// result, and hub/reporting.ts owns its wording. The start tool composes that
+	// result itself in hub/tools.ts, so the line is attached here as it passes.
+	pi.on("tool_result", (event) => {
+		if (event.toolName !== START_TOOL_NAME) return undefined;
+		const current = taskRegistry.toolActivation;
+		if (!current?.noticePending) return undefined;
+		current.noticePending = false;
+		const content = withLazyActivationNotice(event.content);
+		return content ? { content } : undefined;
+	});
+}
+
+// ---------------------------------------------------------------------------
 // Session lifecycle
 // ---------------------------------------------------------------------------
 
@@ -1441,6 +1540,7 @@ export function sessionStarted(pi: ExtensionAPI): void {
 	taskRegistry.notifySettled = (task) => notifySettled(pi, task);
 	taskRegistry.notifyWatchdog = (task, stall) => notifyWatchdog(pi, task, stall);
 	ensureWatchdogTimer();
+	armToolActivation(pi);
 	// Waiters belong to the session that started them; a new session inherits no
 	// in-flight wait, so its tokens must not hold notices forever.
 	for (const task of tasks.values()) task.waiters?.clear();
@@ -1466,6 +1566,9 @@ export function sessionShutdown(event: SessionShutdownEvent): void {
 		clearInterval(taskRegistry.watchdogTimer);
 		taskRegistry.watchdogTimer = undefined;
 	}
+	// The active-tool list belonged to the session that just ended; the next
+	// session_start captures its own and parks the four again.
+	taskRegistry.toolActivation = undefined;
 	taskRegistry.pendingNotificationIds.clear();
 	// Persistent sessions are separate processes: they outlive the registry
 	// unless they are explicitly reaped, which would leave orphans behind.
