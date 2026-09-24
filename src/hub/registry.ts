@@ -17,6 +17,7 @@ import { promisify } from "node:util";
 import type { ExtensionAPI, SessionShutdownEvent, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import { ADAPTERS, AGENT_IDS, dshEffortToken, mergeSpawnEnv, type AgentEvent, type AgentId, type Effort, type Mode } from "../adapters.ts";
 import { ensureStored, extractSummary, placeholderFor } from "../artifacts.ts";
+import { keepAwakeWhileRunning } from "../keep-awake.ts";
 import {
 	FOLLOWUP_AGENT_IDS,
 	SESSION_DRIVERS,
@@ -1212,6 +1213,10 @@ function startOneshotTask(
 	}
 
 	task.proc = proc;
+
+	// macOS: keep idle system sleep off for exactly as long as this task runs.
+	// The assertion is bound to the task pid, so the task's own exit releases it.
+	keepAwakeWhileRunning(proc.pid);
 
 	proc.on("error", (err) => {
 		if (task.state === "stopped") return;

@@ -8,6 +8,7 @@
 
 import { spawn, type ChildProcess } from "node:child_process";
 import { mergeSpawnEnv, type AgentEvent, type Effort, type Mode } from "../adapters.ts";
+import { keepAwakeWhileRunning } from "../keep-awake.ts";
 
 const MAX_STDERR_CHARS = 8_000;
 export const HANDSHAKE_TIMEOUT_MS = 30_000;
@@ -113,6 +114,11 @@ export abstract class StdioProcess {
 			env: extraEnv ? mergeSpawnEnv(process.env, extraEnv) : process.env,
 		});
 		this.proc = proc;
+
+		// A session process outlives the turn that started it (it stays up for
+		// steer / follow-up until the idle reap), and this spawn site is not the
+		// one-shot path registry.ts guards, so it takes its own binding.
+		keepAwakeWhileRunning(proc.pid);
 
 		proc.stdout?.setEncoding("utf8");
 		proc.stdout?.on("data", (chunk: string) => {
