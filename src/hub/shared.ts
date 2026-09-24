@@ -157,6 +157,8 @@ export interface Task {
 	boardError?: string;
 	/** Neutral inventory of worktrees left on disk, captured at settle for the notification. */
 	retainedWorktrees?: string;
+	/** Set on the dispatch that activated the lazy four; its own result announces them. */
+	activatedNow?: boolean;
 	/** Idle reap: kills a persistent session that got no follow-up in time. */
 	idleReapTimer?: ReturnType<typeof setTimeout>;
 }
@@ -305,16 +307,17 @@ export interface ToolListApi {
 
 /**
  * Session-scoped lazy-activation state, held on the shared registry so a
- * /reload cannot re-arm what this session already did. The accessors belong to
- * the host object session_start handed in, and are dropped with the session.
+ * /reload cannot re-arm what this session already did. A reload keeps
+ * `activated` and restores the four additively — the host reinstates every
+ * extension tool there — while only a genuinely new session parks them again.
+ * The accessors belong to the host object session_start handed in, and are
+ * dropped with the session.
  */
 export interface ToolActivationState {
 	getActiveTools?: () => string[];
 	setActiveTools?: (toolNames: string[]) => void;
 	/** True once the lazy four were activated in this session. */
 	activated: boolean;
-	/** Set by the first dispatch that runs; consumed by that dispatch's tool result. */
-	noticePending: boolean;
 }
 
 export interface SharedTaskRegistry {
@@ -330,18 +333,18 @@ export interface SharedTaskRegistry {
 }
 export const MAX_EVENTS = 400; // ring cap; oldest dropped
 /** Answers longer than this are archived at settle and replaced by a handle + summary/excerpt. */
-export const ARCHIVE_INLINE_CHARS = 4_000;
+export const ARCHIVE_INLINE_CHARS = 4_000; // pairs with NOTIFY_PREVIEW_CHARS: the push previews the head, recall pages the tail
 export const MODE_RANK: Record<Mode, number> = { readonly: 0, write: 1, yolo: 2 };
 export const MAX_ANSWER_CHARS = 50_000; // matches pi's own subagent cap
 export const MAX_STDERR_CHARS = 8_000;
-export const NOTIFY_PREVIEW_CHARS = 2_000; // completion callbacks stay small on purpose
+export const NOTIFY_PREVIEW_CHARS = 2_000; // completion callbacks stay small on purpose; an archived answer carries its recall pointer
 /**
  * The lazy half of the tool surface, in the order the activation line names it.
- * start/status/stop are always active (a session needs them to get work going
- * and to watch it); these four only have anything to act on once a task exists,
- * so a session starts with them parked and the first dispatch brings them back.
+ * external_agent_start/status/stop are always active (a session needs them to
+ * get work going and to watch it); these four only have anything to act on once
+ * a task exists, so a session starts with them parked and the first dispatch
+ * brings them back.
  */
-export const START_TOOL_NAME = "external_agent_start";
 export const LAZY_TOOL_NAMES = [
 	"external_agent_wait",
 	"external_agent_compare",

@@ -65,7 +65,9 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("session_start", () => sessionStarted(pi));
+	// The event's reason separates a genuinely new session (park the lazy four)
+	// from a reload, whose host reinstates every extension tool.
+	pi.on("session_start", (event) => sessionStarted(pi, event));
 	pi.on("session_shutdown", (event) => sessionShutdown(event));
 }
 

@@ -39,7 +39,9 @@ skill, and keep only what shapes a dispatch decision in the tool text:
   and stop keep snippets of 40 characters or fewer.
 
 Measured with `test/prompt-surface-budget.test.ts`'s own collector: 9,046 →
-5,966 characters. Budget stays 9,100.
+5,977 characters, now budgeted in two layers — fixed 2,915 against a hard 3,500
+(the three always-active tools, paid on every request) and lazy 3,062 against a
+soft 3,500 (the four parked tools, paid only by sessions that dispatch).
 
 ## Alternatives considered
 
@@ -57,7 +59,8 @@ Measured with `test/prompt-surface-budget.test.ts`'s own collector: 9,046 →
 The fixed surface no longer grows with the adapter roster; new capability
 detail lands in the skill, and a session must read the skill before dispatching
 to know default modes, effort ranges and steer/follow-up support. The budget
-test still guards the surface and now passes with ~3,100 characters of headroom
-that a later addition can use deliberately. Tools that lose their snippets stay
+test guards both layers: the fixed layer sits 585 characters under its hard
+budget and the lazy layer 438 under its soft ceiling, each of which a later
+addition spends deliberately. Tools that lose their snippets stay
 callable but leave the `<tools>` list until activation, which is the intended
 inactive-by-default behavior.

@@ -83,6 +83,7 @@ import {
 	verifyLine,
 } from "./registry.ts";
 import {
+	activationNotice,
 	boardDigest,
 	type CompareSlot,
 	type DispatchedCompareSlot,
@@ -324,7 +325,12 @@ export function registerHubTools(pi: ExtensionAPI): void {
 			if (task.state === "failed") {
 				return {
 					content: [
-						{ type: "text", text: `Failed to start ${agent}: ${task.spawnError ?? "unknown spawn error"}` },
+						{
+							type: "text",
+							text: [`Failed to start ${agent}: ${task.spawnError ?? "unknown spawn error"}`, activationNotice([task])]
+								.filter(Boolean)
+								.join("\n"),
+						},
 					],
 					details: { kind: "external-agent-start", task: taskSnapshot(task) },
 				};
@@ -354,6 +360,9 @@ export function registerHubTools(pi: ExtensionAPI): void {
 											: "Otherwise end your turn now: you will be notified when it settles. Do not sleep-poll.",
 									].join(" "),
 							sessionNote,
+							// The line this dispatch owes when it is the one that
+							// brought the lazy four back (hub/reporting.ts owns it).
+							activationNotice([task]),
 						]
 							.filter(Boolean)
 							.join("\n"),
@@ -974,7 +983,16 @@ export function registerHubTools(pi: ExtensionAPI): void {
 				content: [
 					{
 						type: "text",
-						text: [compareReport(slots, timedOut, aborted, timeoutS), digest].filter(Boolean).join("\n"),
+						text: [
+							compareReport(slots, timedOut, aborted, timeoutS),
+							digest,
+							// A compare batch can be the dispatch that activated the
+							// four (a host that parks nothing): the line rides this
+							// result, not only external_agent_start's.
+							activationNotice(dispatched.map((slot) => slot.task)),
+						]
+							.filter(Boolean)
+							.join("\n"),
 					},
 				],
 				details: { kind: "external-agent-compare", timedOut, aborted, results: compareResults(slots) },

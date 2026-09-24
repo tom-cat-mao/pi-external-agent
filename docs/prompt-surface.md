@@ -12,11 +12,11 @@ The four session-only tools — `external_agent_wait`, `external_agent_compare`,
 
 ## Activation flow
 
-- **Parked at `session_start`**: the extension removes the four from the host's active list (`setActiveTools` minus the four), the only removal it performs, while the host is establishing its own list.
+- **Parked at `session_start`**: the extension removes the four from the host's active list (`setActiveTools` minus the four), the only removal it performs, while the host is establishing its own list. Parking is unconditional — a host or a user that had them enabled loses them for this session too — and they return on the first dispatch. Only a genuinely new session is parked; a reload leaves an activated list alone (below).
 - **Activated additively by the first dispatch that runs**: the shared dispatch path calls `setActiveTools([...current, ...missing])` at most once per session, deduped against the host's list. A refusal — hub validation, or an adapter that declines to spell out a command — returns before that point, so it neither activates nor announces.
-- **Announced by the dispatching result**: that result carries one line naming the four (`LAZY_ACTIVATION_NOTICE` in `src/hub/reporting.ts`). Two dispatches racing in one tool batch activate once, and exactly one of their results carries the line.
+- **Announced by the dispatching result**: the result of the dispatch that activated carries one line naming the four (`LAZY_ACTIVATION_NOTICE` in `src/hub/reporting.ts`). The line follows the dispatch, not the tool name, so an activating `external_agent_compare` batch announces on its own result too. Two dispatches racing in one tool batch activate once, and exactly one of their results carries the line.
 
-A host without `getActiveTools`/`setActiveTools` parks nothing and activates nothing: the four are active from the start, and the line is still true. The `activated`/`noticePending` flags live on the shared task registry so `/reload` does not re-arm a session that already activated.
+A host without `getActiveTools`/`setActiveTools` parks nothing and activates nothing: the four are active from the start, and the line is still true. The `activated` flag lives on the shared task registry, so `/reload` cannot re-arm a session that already activated: pi reinstates every extension tool there, and the extension adds the four back to that list with the flag untouched; a session that never activated is parked again.
 
 ## Budgets
 

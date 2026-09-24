@@ -1,14 +1,12 @@
 /**
  * Offline tests for lazy tool activation: a session opens with
  * wait/compare/steer/follow_up parked, the first dispatch that really runs
- * brings them back, and exactly one result carries the announcement.
+ * brings them back, and that dispatch's own result carries the announcement.
  *
  * No real external agent is invoked. The host pi modules are stubbed via
  * registerHooks and the agent is a mock executable on PATH, so the tests
  * exercise the real dispatch path (validation, registry, activation handshake)
- * without a network or a vendor CLI. The tool_result step is driven the way
- * pi's own runner drives it: every handler sees the result and may replace its
- * content.
+ * without a network or a vendor CLI.
  *
  * Run with `node --test test/lazy-activation.test.ts`.
  */
@@ -46,6 +44,11 @@ const moduleHooks = registerHooks({
 });
 
 const hub = (await import("../src/index.ts")) as { default: (pi: unknown) => void };
+// The same module instance the extension entry uses: the activation state this
+// suite inspects is the one the handshake writes.
+const { taskRegistry } = (await import("../src/hub/registry.ts")) as {
+	taskRegistry: { toolActivation?: { activated: boolean } };
+};
 moduleHooks.deregister();
 
 /** The tool surface the design splits in two, spelled out rather than imported. */
@@ -57,7 +60,6 @@ const BYSTANDER = "bash";
 
 const tools = new Map<string, any>();
 const lifecycle = new Map<string, (event: unknown) => void>();
-const toolResultHandlers: Array<(event: any) => any> = [];
 const activeTools = new Set<string>();
 const setActiveCalls: string[][] = [];
 
@@ -71,10 +73,7 @@ function resetHost(): void {
 const host: Record<string, any> = {
 	registerTool: (tool: any) => tools.set(tool.name, tool),
 	registerMessageRenderer: () => {},
-	on: (event: string, handler: (event: any) => any) => {
-		if (event === "tool_result") toolResultHandlers.push(handler);
-		else lifecycle.set(event, handler);
-	},
+	on: (event: string, handler: (event: unknown) => void) => lifecycle.set(event, handler),
 	sendMessage: () => {},
 	getActiveTools: () => [...activeTools],
 	setActiveTools: (names: string[]) => {
@@ -87,24 +86,22 @@ hub.default(host);
 
 afterEach(() => lifecycle.get("session_shutdown")!({ reason: "quit" }));
 
-const startSession = () => lifecycle.get("session_start")!({});
+const startSession = (event: Record<string, unknown> = {}) => lifecycle.get("session_start")!(event);
+
+/**
+ * pi's reload sequence, in the order pi runs it: session_shutdown{reload}, the
+ * host reinstating every extension tool on its active list, then
+ * session_start{reload}. The hub registry survives it — that is the contract the
+ * activation state leans on. (Precedent: test/wait-dedup.test.ts.)
+ */
+function reloadSession(): void {
+	lifecycle.get("session_shutdown")!({ reason: "reload" });
+	for (const name of [...FIXED_TOOLS, ...LAZY_TOOLS]) activeTools.add(name);
+	startSession({ reason: "reload" });
+}
 
 function activeList(): string[] {
 	return [...activeTools].sort();
-}
-
-/**
- * pi's runner step: every tool_result handler is offered the result in order and
- * may replace its content. Details/isError are not returned by the hub's handler,
- * so the runner keeps the originals — the same shape a real session sees.
- */
-function runToolResult(toolName: string, result: any): any {
-	let content = result.content;
-	for (const handler of toolResultHandlers) {
-		const replacement = handler({ type: "tool_result", toolName, content, details: result.details, isError: false });
-		if (replacement?.content) content = replacement.content;
-	}
-	return { ...result, content };
 }
 
 function noticeCount(result: any): number {
@@ -172,10 +169,6 @@ test("lazy activation: session_start parks the four and leaves other tools alone
 
 	assert.deepEqual(activeList(), [...FIXED_TOOLS, BYSTANDER].sort());
 	assert.equal(setActiveCalls.length, 1, "parking is one write");
-	// Nothing left to park on a repeat session_start: no redundant transcript delta.
-	startSession();
-	assert.equal(setActiveCalls.length, 1);
-	assert.deepEqual(activeList(), [...FIXED_TOOLS, BYSTANDER].sort());
 });
 
 test("lazy activation: the first dispatch activates all seven and announces it once", async () => {
@@ -191,16 +184,16 @@ test("lazy activation: the first dispatch activates all seven and announces it o
 		// Additive: the host's list stays in place, the four are appended to it.
 		assert.deepEqual(setActiveCalls[1], [...FIXED_TOOLS, BYSTANDER, ...LAZY_TOOLS]);
 
-		// A result from another tool in between must not consume the announcement.
+		// Another tool's result never carries the line: only the dispatch that
+		// activated does.
 		const status = await call("external_agent_status", { taskId: first.details.task.taskId }, dir);
-		assert.equal(runToolResult("external_agent_status", status).content.length, status.content.length);
+		assert.equal(noticeCount(status), 0);
 
-		const annotated = runToolResult("external_agent_start", first);
-		assert.equal(noticeCount(annotated), 1);
-		const text = annotated.content.map((block: any) => block.text ?? "").join("\n");
+		const text = first.content.map((block: any) => block.text ?? "").join("\n");
+		assert.equal(noticeCount(first), 1);
 		assert.ok(text.includes(NOTICE), `activation line missing from:\n${text}`);
-		// The dispatch receipt is untouched: same details, same original text.
-		assert.equal(annotated.details, first.details);
+		// The dispatch receipt is untouched: same details, same report text.
+		assert.equal(first.details.kind, "external-agent-start");
 		assert.match(text, /Started claude as /);
 	} finally {
 		await call("external_agent_stop", { all: true }, dir);
@@ -219,12 +212,12 @@ test("lazy activation: a refused dispatch neither activates nor announces", asyn
 		assert.match(refused.content[0].text, /^Refused: /);
 		assert.deepEqual(activeList(), [...FIXED_TOOLS, BYSTANDER].sort());
 		assert.equal(setActiveCalls.length, 1, "only the parking write");
-		assert.equal(noticeCount(runToolResult("external_agent_start", refused)), 0);
+		assert.equal(noticeCount(refused), 0);
 
 		// The one-shot announcement is still ahead: the refusal did not burn it.
 		const started = await call("external_agent_start", { agent: "claude", task: "say hello", mode: "readonly", cwd: dir, notify: "off" }, dir);
 		assert.deepEqual(activeList(), [...FIXED_TOOLS, ...LAZY_TOOLS, BYSTANDER].sort());
-		assert.equal(noticeCount(runToolResult("external_agent_start", started)), 1);
+		assert.equal(noticeCount(started), 1);
 	} finally {
 		await call("external_agent_stop", { all: true }, dir);
 		restorePath();
@@ -245,7 +238,7 @@ test("lazy activation: a one-shot dispatch activates the four as well", async ()
 		assert.equal(started.details.task.transport, "oneshot");
 		assert.deepEqual(activeList(), [...FIXED_TOOLS, ...LAZY_TOOLS, BYSTANDER].sort());
 		assert.equal(setActiveCalls.length, 2, "parking then one additive activation");
-		assert.equal(noticeCount(runToolResult("external_agent_start", started)), 1);
+		assert.equal(noticeCount(started), 1);
 	} finally {
 		SESSION_DRIVERS.kimi = savedDriver;
 		await call("external_agent_stop", { all: true }, dir);
@@ -267,7 +260,72 @@ test("lazy activation: a host without a tool-list API parks nothing and activate
 		const started = await call("external_agent_start", { agent: "claude", task: "say hello", mode: "readonly", cwd: dir, notify: "off" }, dir);
 		assert.equal(setActiveCalls.length, 0, "nothing is written to a list the host does not expose");
 		// Nothing was parked on such a host, so the line describes the truth anyway.
-		assert.equal(noticeCount(runToolResult("external_agent_start", started)), 1);
+		assert.equal(noticeCount(started), 1);
+	} finally {
+		await call("external_agent_stop", { all: true }, dir);
+		host.getActiveTools = saved.get;
+		host.setActiveTools = saved.set;
+		restorePath();
+	}
+});
+
+test("lazy activation: a reload before any dispatch parks the four again", () => {
+	resetHost();
+	startSession();
+
+	reloadSession();
+
+	assert.deepEqual(activeList(), [...FIXED_TOOLS, BYSTANDER].sort());
+	assert.equal(setActiveCalls.length, 2, "the host reinstated all seven; the hub parks them once more");
+	assert.equal(taskRegistry.toolActivation?.activated, false);
+});
+
+test("lazy activation: a reload after an activation keeps the earned state and re-arms nothing", async () => {
+	const dir = makeFixtureDir();
+	const restorePath = withPath(dir);
+	resetHost();
+	startSession();
+	try {
+		const first = await call("external_agent_start", { agent: "claude", task: "first", mode: "readonly", cwd: dir, notify: "off" }, dir);
+		assert.equal(noticeCount(first), 1);
+		assert.equal(setActiveCalls.length, 2, "parking then one additive activation");
+
+		reloadSession();
+
+		// pi reinstated all seven, which is exactly the earned state: no write.
+		assert.deepEqual(activeList(), [...FIXED_TOOLS, ...LAZY_TOOLS, BYSTANDER].sort());
+		assert.equal(setActiveCalls.length, 2, "restoring what the host already reinstated is not a write");
+		assert.equal(taskRegistry.toolActivation?.activated, true, "a reload does not re-arm the handshake");
+
+		// The announcement already happened; the next dispatch is silent.
+		const second = await call("external_agent_start", { agent: "claude", task: "second", mode: "readonly", cwd: dir, notify: "off" }, dir);
+		assert.equal(noticeCount(second), 0, "no second announcement after a reload");
+		assert.equal(setActiveCalls.length, 2, "and no second activation");
+	} finally {
+		await call("external_agent_stop", { all: true }, dir);
+		restorePath();
+	}
+});
+
+test("lazy activation: an activating compare dispatch carries the line on its own result", async () => {
+	const dir = makeFixtureDir();
+	const restorePath = withPath(dir);
+	resetHost();
+	const saved = { get: host.getActiveTools, set: host.setActiveTools };
+	delete host.getActiveTools;
+	delete host.setActiveTools;
+	try {
+		startSession();
+		assert.equal(setActiveCalls.length, 0, "this host parks nothing, so compare can be the first dispatch");
+		const compared = await call(
+			"external_agent_compare",
+			{ task: "say hello", agents: [{ agent: "claude", mode: "readonly" }, { agent: "claude", mode: "readonly" }], cwd: dir },
+			dir,
+		);
+		assert.equal(compared.details.kind, "external-agent-compare");
+		assert.equal(noticeCount(compared), 1);
+		const text = compared.content.map((block: any) => block.text ?? "").join("\n");
+		assert.ok(text.includes(NOTICE), `activation line missing from:\n${text}`);
 	} finally {
 		await call("external_agent_stop", { all: true }, dir);
 		host.getActiveTools = saved.get;
@@ -283,10 +341,10 @@ test("lazy activation: a later dispatch re-activates nothing and says nothing", 
 	startSession();
 	try {
 		const first = await call("external_agent_start", { agent: "claude", task: "first", mode: "readonly", cwd: dir, notify: "off" }, dir);
-		assert.equal(noticeCount(runToolResult("external_agent_start", first)), 1);
+		assert.equal(noticeCount(first), 1);
 
 		const second = await call("external_agent_start", { agent: "claude", task: "second", mode: "readonly", cwd: dir, notify: "off" }, dir);
-		assert.equal(noticeCount(runToolResult("external_agent_start", second)), 0);
+		assert.equal(noticeCount(second), 0);
 		assert.deepEqual(activeList(), [...FIXED_TOOLS, ...LAZY_TOOLS, BYSTANDER].sort());
 		assert.equal(setActiveCalls.length, 2, "activation happens exactly once per session");
 	} finally {
@@ -309,7 +367,7 @@ test("lazy activation: dispatches racing in one batch activate once and announce
 
 		assert.deepEqual(activeList(), [...FIXED_TOOLS, ...LAZY_TOOLS, BYSTANDER].sort());
 		assert.equal(setActiveCalls.length, 2, "two racing dispatches still write one activation");
-		const carrying = [left, right].filter((result) => noticeCount(runToolResult("external_agent_start", result)) === 1);
+		const carrying = [left, right].filter((result) => noticeCount(result) === 1);
 		assert.equal(carrying.length, 1, "exactly one of the two results announces the four");
 	} finally {
 		await call("external_agent_stop", { all: true }, dir);

@@ -67,21 +67,22 @@ import {
 // ---------------------------------------------------------------------------
 
 /**
- * The one-shot line that announces lazy activation. It rides the first
- * dispatch's tool result because that is the one moment the model is looking:
- * earlier would describe tools it cannot use yet, and later would not explain
- * where the four came from.
+ * The one-shot line that announces lazy activation. It rides the activating
+ * dispatch's own tool result because that is the one moment the model is
+ * looking: earlier would describe tools it cannot use yet, and later would not
+ * explain where the four came from.
  */
 export const LAZY_ACTIVATION_NOTICE = `Tools ${LAZY_TOOL_NAMES.join(", ")} are now active.`;
 
 /**
- * Append the activation notice to a tool result's content blocks, unless it is
- * already there. Returns undefined when there is nothing to add, which is what
- * keeps the caller from rewriting a result it has no business in.
+ * The line the result of the activating dispatch owes, or undefined for every
+ * other result. The flag lives on the task the activation site marked
+ * (`activatedNow`), not on a tool name: the dispatch may have come from any
+ * tool, so compare announces its own batch the same way start does. Per task,
+ * which is what keeps two dispatches racing in one batch from both carrying it.
  */
-export function withLazyActivationNotice<T extends { type: string; text?: string }>(content: T[]): T[] | undefined {
-	if (content.some((block) => block.type === "text" && block.text?.includes(LAZY_ACTIVATION_NOTICE))) return undefined;
-	return [...content, { type: "text", text: LAZY_ACTIVATION_NOTICE } as T];
+export function activationNotice(tasks: Array<Pick<Task, "activatedNow">>): string | undefined {
+	return tasks.some((task) => task.activatedNow === true) ? LAZY_ACTIVATION_NOTICE : undefined;
 }
 
 /**

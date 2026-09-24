@@ -14,7 +14,7 @@ import { createHash } from "node:crypto";
 import { appendFile, mkdir, readFile, readdir, stat } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
-import type { ExtensionAPI, SessionShutdownEvent } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, SessionShutdownEvent, SessionStartEvent } from "@earendil-works/pi-coding-agent";
 import { ADAPTERS, AGENT_IDS, dshEffortToken, mergeSpawnEnv, type AgentEvent, type AgentId, type Effort, type Mode } from "../adapters.ts";
 import { ensureStored, extractSummary, placeholderFor } from "../artifacts.ts";
 import {
@@ -41,7 +41,6 @@ import {
 	STALL_FACTOR,
 	STALL_FLOOR_MS,
 	STALL_SAMPLE_MIN,
-	START_TOOL_NAME,
 	STRUGGLE_MS,
 	WATCHDOG_SCAN_INTERVAL_MS,
 	anchorRefs,
@@ -69,7 +68,6 @@ import {
 	type VerifyResult,
 	type WorktreeRef,
 } from "./shared.ts";
-import { withLazyActivationNotice } from "./reporting.ts";
 import { createMeter, type MeterSnapshot, type UsageSample } from "../meter.ts";
 
 const TASK_REGISTRY_KEY = Symbol.for("pi.external-agent.task-registry.v1");
@@ -1457,9 +1455,6 @@ function toolListApiFrom(pi: ExtensionAPI): ToolListApi | undefined {
 	return { getActiveTools: () => pi.getActiveTools(), setActiveTools: (names) => pi.setActiveTools(names) };
 }
 
-/** Hosts already carrying this module's tool_result handler; a second session_start must not stack another. */
-const hookedHosts = new WeakSet<object>();
-
 function parkLazyTools(state: ToolActivationState): void {
 	const active = state.getActiveTools?.();
 	if (!active || !state.setActiveTools) return;
@@ -1470,21 +1465,26 @@ function parkLazyTools(state: ToolActivationState): void {
 	state.setActiveTools(parked);
 }
 
-/**
- * Arm the four for the first dispatch that runs. Both flags are written before
- * the host call and nothing here awaits, so two dispatches racing in one tool
- * batch cannot both activate — and exactly one of their results carries the
- * notice.
- */
-function activateLazyTools(): void {
-	const state = taskRegistry.toolActivation;
-	if (!state || state.activated) return;
-	state.activated = true;
-	state.noticePending = true;
+/** Add the four back, deduped against the host's list: no write when none is missing. */
+function addLazyTools(state: ToolActivationState): void {
 	const active = state.getActiveTools?.();
 	if (!active || !state.setActiveTools) return;
 	const missing = LAZY_TOOL_NAMES.filter((name) => !active.includes(name));
 	if (missing.length > 0) state.setActiveTools([...active, ...missing]);
+}
+
+/**
+ * Arm the four for the first dispatch that runs, reporting whether this call is
+ * the one that did it. The flag is written before the host call and nothing here
+ * awaits, so two dispatches racing in one tool batch cannot both activate — and
+ * only the dispatch that flipped it carries the announcement.
+ */
+function activateLazyTools(): boolean {
+	const state = taskRegistry.toolActivation;
+	if (!state || state.activated) return false;
+	state.activated = true;
+	addLazyTools(state);
+	return true;
 }
 
 /**
@@ -1495,36 +1495,31 @@ function activateLazyTools(): void {
  */
 function recordDispatch(task: Task): void {
 	meter.recordDispatch(task.id);
-	activateLazyTools();
+	// The activating dispatch's own result announces the four, whichever tool ran
+	// it: the flag rides that task to its result builder (hub/reporting.ts).
+	if (activateLazyTools()) task.activatedNow = true;
 }
 
 /**
- * Capture the host's tool list, park the lazy four for this session, and hook
- * the one result that announces them. Called from session_start, so the parking
- * lands while the host is establishing its active list.
+ * Capture the host's tool list and settle this session's parking, while the host
+ * is establishing its active list. A reload is not a new session: pi reinstates
+ * every extension tool there, so a session that already earned the four gets
+ * them restored additively and keeps its flag — nothing re-arms, and no second
+ * announcement is owed.
  */
-function armToolActivation(pi: ExtensionAPI): void {
+function armToolActivation(pi: ExtensionAPI, reason: SessionStartEvent["reason"] | undefined): void {
 	const api = toolListApiFrom(pi);
-	const state = (taskRegistry.toolActivation ??= { activated: false, noticePending: false });
+	const state = (taskRegistry.toolActivation ??= { activated: false });
 	state.getActiveTools = api?.getActiveTools;
 	state.setActiveTools = api?.setActiveTools;
-	// A session is where the handshake starts, whatever the last one reached.
+	if (reason === "reload" && state.activated) {
+		addLazyTools(state);
+		return;
+	}
+	// A genuinely new session (startup/new/resume/fork), or a reload before the
+	// first dispatch: the four start parked on this host's list.
 	state.activated = false;
-	state.noticePending = false;
 	parkLazyTools(state);
-	if (hookedHosts.has(pi)) return;
-	hookedHosts.add(pi);
-	// The announcement rides the model-visible text of the first dispatch's
-	// result, and hub/reporting.ts owns its wording. The start tool composes that
-	// result itself in hub/tools.ts, so the line is attached here as it passes.
-	pi.on("tool_result", (event) => {
-		if (event.toolName !== START_TOOL_NAME) return undefined;
-		const current = taskRegistry.toolActivation;
-		if (!current?.noticePending) return undefined;
-		current.noticePending = false;
-		const content = withLazyActivationNotice(event.content);
-		return content ? { content } : undefined;
-	});
 }
 
 // ---------------------------------------------------------------------------
@@ -1536,11 +1531,11 @@ function armToolActivation(pi: ExtensionAPI): void {
  * session could not: notices held for a waiter whose wait never finished, and
  * tasks that settled while no callback was installed.
  */
-export function sessionStarted(pi: ExtensionAPI): void {
+export function sessionStarted(pi: ExtensionAPI, event?: Pick<SessionStartEvent, "reason">): void {
 	taskRegistry.notifySettled = (task) => notifySettled(pi, task);
 	taskRegistry.notifyWatchdog = (task, stall) => notifyWatchdog(pi, task, stall);
 	ensureWatchdogTimer();
-	armToolActivation(pi);
+	armToolActivation(pi, event?.reason);
 	// Waiters belong to the session that started them; a new session inherits no
 	// in-flight wait, so its tokens must not hold notices forever.
 	for (const task of tasks.values()) task.waiters?.clear();
