@@ -13,7 +13,7 @@ pi install git:github.com/tom-cat-mao/pi-external-agent@v0.9.0
 pi install git:github.com/tom-cat-mao/pi-external-agent
 ```
 
-Requires pi ≥ 0.85 and whichever agent CLIs you want to drive (they don't all need to be installed). Qoder needs `qodercli` on `PATH`, signed in; steering additionally needs an announced stable qodercli ≥ 1.1.49 — see [docs/qoder.md](docs/qoder.md). dsh uses your dsh setup (`~/.dsh`); permissions are pinned per dispatch through a scoped settings document, so dsh's own sandbox enforces the tier whatever your `settings.yaml` preset says. Models-page provider profiles don't apply to these runs, a plugin added in the web profile needs `dsh plugin --profile acp add <pkg>` to reach them, and the unused `~/.dsh-external-agent` directory is safe to delete.
+Requires pi ≥ 0.85 and whichever agent CLIs you want to drive (they don't all need to be installed). Qoder needs `qodercli` on `PATH`, signed in; steering additionally needs an announced stable qodercli ≥ 1.1.49 — see [docs/qoder.md](docs/qoder.md). dsh uses your dsh setup (`~/.dsh`); a scoped permission overlay pins each dispatch's tier, and readonly/write refuse to start when the composition cannot prove it. Models-page provider profiles don't apply to these runs, a plugin added in the web profile needs `dsh plugin --profile acp add <pkg>` to reach them, and the unused `~/.dsh-external-agent` directory is safe to delete.
 
 Releases are published by tag: pushing `vX.Y.Z` runs the suite and typecheck, then creates the GitHub Release.
 
@@ -54,12 +54,12 @@ All off by default; enable per call — `template` (output contract), `verify` (
 | `qoder` | Alibaba | yolo | follow-up ✅; steer ✅ when the announced CLI meets the 1.1.49 baseline |
 | `kimi` | Moonshot | yolo (readonly–yolo over its ACP session; the print spelling is yolo-only) | follow-up ✅; steer ❌ |
 | `claude` | Anthropic | yolo (readonly–yolo; effort low–max, no off) | ✅ via stream-json |
-| `dsh` | DeepSeek harness | yolo (readonly–yolo; dsh's own sandbox enforces the tier) | ✅ via ACP |
+| `dsh` | DeepSeek harness | yolo (readonly–yolo; dsh's own sandbox enforces the tier) | follow-up ✅; steer ❌ (one prompt in flight) |
 
 ## Documentation
 
 - [AGENTS.md](AGENTS.md) — repository layout, commands, invariants, documentation rules
-- [docs/architecture.md](docs/architecture.md) — dispatch flow, receipts, transports · [docs/adapters.md](docs/adapters.md) — per-CLI capability matrix · [docs/capabilities.md](docs/capabilities.md) — archive, verify, templates, relay, isolate, board, meter · [docs/prompt-surface.md](docs/prompt-surface.md) — tool-text layers and activation · [docs/qoder.md](docs/qoder.md) — Qoder stream-json contract · [docs/dsh.md](docs/dsh.md) — dsh shared home, scoped settings · [docs/kimi.md](docs/kimi.md) — kimi's ACP session, tiers, effort · [.agents/notes/](.agents/notes/) — decision records
+- [docs/architecture.md](docs/architecture.md) — dispatch flow, receipts, transports · [docs/adapters.md](docs/adapters.md) — per-CLI capability matrix · [docs/capabilities.md](docs/capabilities.md) — archive, verify, templates, relay, isolate, board, meter · [docs/prompt-surface.md](docs/prompt-surface.md) — tool-text layers and activation · [docs/qoder.md](docs/qoder.md) — Qoder stream-json contract · [docs/dsh.md](docs/dsh.md) — dsh shared home, permission overlay, ACP model/effort · [docs/kimi.md](docs/kimi.md) — kimi's ACP session, tiers, effort · [.agents/notes/](.agents/notes/) — decision records
 
 ## Community
 

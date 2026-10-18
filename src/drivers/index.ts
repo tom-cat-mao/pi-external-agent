@@ -41,14 +41,14 @@
  *   codebuddy-> plain ACP: steering is a second session/prompt on the active
  *               session; it lands at the next model step boundary, or becomes a
  *               follow-up if the turn is stuck inside one long tool call.
- *   dsh      -> `--profile acp` (verified 0.1.5-rc.2): standard ACP v1, with
+ *   dsh      -> `--profile acp` (verified 0.2.1-rc.2): standard ACP v1, with
  *               sessionCapabilities close/list/resume and no advertised steer
- *               method, so steering is the codebuddy fallback. session/new
- *               returns configOptions (model, reasoning_effort), and effort is
- *               forwarded with session/set_config_option — the CLI has no
- *               effort flag. DSH_PERMISSION_MODE carries the tier, and a
- *               `--patch` overlay keeps dsh's settings row pointed at pi's own
- *               empty settings document in the SHARED ~/.dsh.
+ *               method. One prompt may be in flight, so steering is explicitly
+ *               unsupported while follow-up works. session/new returns model
+ *               and reasoning_effort configOptions; both travel through
+ *               session/set_config_option. DSH_PERMISSION_MODE carries the tier,
+ *               and the last `--patch` overlay replaces the permission row so a
+ *               profile default cannot outrank it.
  *   kimi     -> `kimi acp` (a SUBCOMMAND, not `--acp`; verified against
  *               MoonshotAI/kimi-code @2.0.2): ACP v1, sessions persist, four
  *               modes (default/plan/auto/yolo) under a non-idempotent
@@ -111,27 +111,108 @@ function kimiBenignModeRejection(message: string, modeId: string): boolean {
 	return new RegExp(`\\balready\\b[\\s\\S]*\\bin\\b[\\s\\S]*\\b${requested}\\b`, "i").test(message);
 }
 
-/**
- * The values one config option advertises, read from whichever shape the
- * session describes them in (`values`, ACP's `options`, or a plain string list).
- * An unadvertised option yields [] — which is a refusal, not a guess.
- */
-function advertisedConfigValues(configOptions: AcpConfigOption[], configId: string): string[] {
-	const option = configOptions.find((entry) => entry && typeof entry === "object" && (entry.id === configId || entry.configId === configId));
-	if (!option) return [];
-	const raw = option.values ?? option.options ?? [];
+/** Find one config option by its ACP id. */
+function configOptionOf(configOptions: AcpConfigOption[], configId: string): AcpConfigOption | undefined {
+	return configOptions.find((entry) => entry && typeof entry === "object" && (entry.id === configId || entry.configId === configId));
+}
+
+/** Flatten simple option lists and ACP's grouped option lists into values. */
+function optionValues(raw: unknown): string[] {
 	if (!Array.isArray(raw)) return [];
-	return raw
-		.map((entry) => (typeof entry === "string" ? entry : String((entry as any)?.value ?? (entry as any)?.id ?? (entry as any)?.name ?? "")))
-		.filter(Boolean);
+	const values: string[] = [];
+	for (const entry of raw) {
+		if (typeof entry === "string") {
+			if (entry) values.push(entry);
+			continue;
+		}
+		if (!entry || typeof entry !== "object") continue;
+		const record = entry as Record<string, unknown>;
+		if (Array.isArray(record.options)) {
+			values.push(...optionValues(record.options));
+			continue;
+		}
+		const value = record.value ?? record.id ?? record.name;
+		if (typeof value === "string" && value) values.push(value);
+	}
+	return values;
 }
 
 /**
- * Why an effort request is refused instead of sent. The vocabulary is the
- * harness's own and is advertised per session, so a level kimi does not offer
- * would otherwise be a guess at a different level — the turn must never run at
- * an effort the caller did not ask for.
+ * The values one config option advertises, read from whichever shape the
+ * session describes them in (simple `values`, ACP's `options`, or grouped
+ * model option lists). An unadvertised option yields [].
  */
+function advertisedConfigValues(configOptions: AcpConfigOption[], configId: string): string[] {
+	const option = configOptionOf(configOptions, configId);
+	return optionValues(option?.values ?? option?.options);
+}
+
+interface AcpModelChoice {
+	value: string;
+	name: string;
+	provider?: string;
+}
+
+/** Flatten the model selector, retaining each choice's provider group. */
+function modelChoices(configOptions: AcpConfigOption[]): AcpModelChoice[] {
+	const option = configOptionOf(configOptions, "model");
+	const raw = option?.options ?? option?.values;
+	if (!Array.isArray(raw)) return [];
+	const choices: AcpModelChoice[] = [];
+	const visit = (entries: unknown[], provider?: string): void => {
+		for (const entry of entries) {
+			if (!entry || typeof entry !== "object") continue;
+			const record = entry as Record<string, unknown>;
+			const group = typeof record.group === "string" ? record.group : provider;
+			if (Array.isArray(record.options)) {
+				visit(record.options, group);
+				continue;
+			}
+			if (typeof record.value !== "string" || typeof record.name !== "string") continue;
+			choices.push({ value: record.value, name: record.name, ...(group === undefined ? {} : { provider: group }) });
+		}
+	};
+	visit(raw);
+	return choices;
+}
+
+function modelChoiceLabel(choice: AcpModelChoice): string {
+	return choice.provider ? `${choice.provider}/${choice.name}` : choice.name;
+}
+
+/**
+ * Resolve the public model string against what session/new advertised. The
+ * opaque selector value is accepted exactly; otherwise a unique model name, or
+ * a unique provider/model name, is accepted. Raw ids are never forwarded.
+ */
+function resolveModelChoice(configOptions: AcpConfigOption[], requested: string): AcpModelChoice {
+	const choices = modelChoices(configOptions);
+	if (choices.length === 0) {
+		throw new Error(`dsh session/new advertised no model choices; cannot forward model "${requested}"`);
+	}
+	const exact = choices.find((choice) => choice.value === requested);
+	if (exact) return exact;
+
+	const byName = choices.filter((choice) => choice.name === requested);
+	if (byName.length === 1) return byName[0];
+	if (byName.length > 1) {
+		throw new Error(
+			`dsh model "${requested}" is ambiguous across providers (${byName.map(modelChoiceLabel).join(", ")}); ` +
+				"pass provider/model or the exact advertised selector value",
+		);
+	}
+
+	const slash = requested.indexOf("/");
+	if (slash > 0 && slash < requested.length - 1) {
+		const provider = requested.slice(0, slash);
+		const model = requested.slice(slash + 1);
+		const qualified = choices.filter((choice) => choice.provider === provider && choice.name === model);
+		if (qualified.length === 1) return qualified[0];
+	}
+
+	throw new Error(`dsh does not advertise model "${requested}" for this session; available: ${choices.map(modelChoiceLabel).join(", ")}`);
+}
+
 function kimiEffortRefusal(token: string, offered: string[]): string {
 	return (
 		`kimi does not offer thinking effort "${token}" on this session: ` +
@@ -201,29 +282,18 @@ export const SESSION_DRIVERS: Partial<Record<AgentId, () => SessionDriver>> = {
 	dsh: () =>
 		new AcpDriver({
 			id: "dsh",
-			// dsh spells the ACP entry as a profile rather than a flag (verified
-			// 0.1.5-rc.2: standard ACP v1, no advertised steer method, so steering
-			// is a second session/prompt on the active session), and --patch is a
-			// LAUNCHER flag, so it belongs in the entry argv with its overlay —
-			// it is what makes the requested tier bind (src/dsh-launch.ts).
+			// dsh spells the ACP entry as a profile rather than a flag, and --patch is
+			// a LAUNCHER flag, so both belong in the entry argv. The overlay pins the
+			// permission row before any session can be created.
 			acpArgv: ["--profile", DSH_ACP_PROFILE, "--patch", dshOverlayPath()],
-			// The model comes from the profile; no session-start model flag is
-			// verified for this CLI, so nothing is appended. The receipt reports a
-			// model request as not forwarded rather than claiming it traveled.
+			// ACP config options carry the model and effort per session; there is no
+			// startup model or effort flag on this CLI.
 			baseArgv: () => [],
-			// Provisioning runs before the spawn and is lazy/idempotent: the empty
-			// settings document plus the overlay that points dsh's settings row at
-			// it. It fails the session start only when one of those files cannot
-			// exist at all — without them dsh reads the user's own settings
-			// document, whose permission.defaultPreset outranks the variable, and
-			// the requested tier stops binding silently. Anything the composition
-			// anchor finds is a warning instead: the session still starts.
+			// Provisioning runs before the spawn and is lazy/idempotent. readonly and
+			// write refuse if the composition anchor cannot prove the permission row
+			// and env hooks; yolo warns because it promises no confinement.
 			prepare: (input) => {
-				// The profile is passed, not assumed: dsh composes per profile, so
-				// this session's composition is anchored under `acp` — a user's
-				// `~/.dsh/profiles/acp/cordis.patch.yml` cannot hide behind a clean
-				// `headless` probe.
-				const launch = prepareDshLaunch(DSH_ACP_PROFILE);
+				const launch = prepareDshLaunch(DSH_ACP_PROFILE, input.mode);
 				if (!launch.ok) throw new Error(launch.reason);
 				return {
 					// DSH_HOME is deleted, not set: an ambient value would point the
@@ -232,18 +302,43 @@ export const SESSION_DRIVERS: Partial<Record<AgentId, () => SessionDriver>> = {
 					...(launch.warning ? { warning: launch.warning } : {}),
 				};
 			},
-			// dsh's effort has no flag on this CLI: the session carries it as
-			// reasoning_effort, set in the configure phase — after session/new,
-			// before the first prompt. A rejected set fails the session start
-			// with dsh's own error, so the turn never runs at a default the
-			// caller did not ask for.
-			configureSession: async ({ sessionId, effort, call }) => {
-				if (!effort) return;
-				await call(ACP_METHODS.sessionSetConfigOption, {
-					sessionId,
-					configId: "reasoning_effort",
-					value: dshEffortToken(effort),
-				});
+			// readonly and write deny every permission escalation. write's guarantee
+			// is workspace-write, not "workspace-write unless the model asks for
+			// full access"; yolo is the only mode that may allow the escalation.
+			failClosedPermissionModes: ["readonly", "write"],
+			// One in-flight prompt is all ACP allows and dsh advertises no steer
+			// method. Never pretend a second prompt is mid-run guidance.
+			steerViaConcurrentPrompt: false,
+			configureSession: async ({ sessionId, model, effort, configOptions, call }) => {
+				let advertised = configOptions;
+				if (model) {
+					const choice = resolveModelChoice(configOptions, model);
+					const updated = await call(ACP_METHODS.sessionSetConfigOption, {
+						sessionId,
+						configId: "model",
+						value: choice.value,
+					});
+					if (!Array.isArray(updated?.configOptions)) {
+						throw new Error("dsh session/set_config_option model returned no configOptions");
+					}
+					advertised = updated.configOptions as AcpConfigOption[];
+				}
+				if (effort) {
+					const token = dshEffortToken(effort);
+					const offered = advertisedConfigValues(advertised, "reasoning_effort");
+					if (!offered.includes(token)) {
+						throw new Error(
+							`dsh does not offer reasoning effort "${token}" for this session: ` +
+								(offered.length > 0 ? `session/new advertised ${offered.join(", ")}.` : "session/new advertised no reasoning_effort option.") +
+								" The request is refused rather than downgraded, and the session was not started.",
+						);
+					}
+					await call(ACP_METHODS.sessionSetConfigOption, {
+						sessionId,
+						configId: "reasoning_effort",
+						value: token,
+					});
+				}
 			},
 		}),
 	kimi: () =>

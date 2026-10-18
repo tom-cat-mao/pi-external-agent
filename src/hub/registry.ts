@@ -172,12 +172,7 @@ async function archiveTaskAnswer(task: Task): Promise<void> {
 	if (answer.length <= ARCHIVE_INLINE_CHARS && summary === undefined) return;
 	if (!finalizeHooks.sessionDir) return;
 	try {
-		const stored = await ensureStored(
-			join(finalizeHooks.sessionDir, "external-agent"),
-			task.id,
-			task.archives?.length ?? 0,
-			answer,
-		);
+		const stored = await ensureStored(join(finalizeHooks.sessionDir, "external-agent"), task.id, task.archives?.length ?? 0, answer);
 		(task.archives ??= []).push(stored);
 	} catch (err) {
 		task.archiveError = err instanceof Error ? err.message : String(err);
@@ -248,10 +243,7 @@ async function collectWorktreeDiff(task: Task): Promise<void> {
 	const worktree = task.worktree;
 	if (!worktree) return;
 	try {
-		const [diff, status] = await Promise.all([
-			runGit(["-C", worktree.path, "diff", "--stat", "HEAD"]),
-			runGit(["-C", worktree.path, "status", "--porcelain"]),
-		]);
+		const [diff, status] = await Promise.all([runGit(["-C", worktree.path, "diff", "--stat", "HEAD"]), runGit(["-C", worktree.path, "status", "--porcelain"])]);
 		const statLines = diff.stdout.trim().split("\n").filter(Boolean);
 		const statTail = statLines.length > 0 ? statLines.slice(-3).join(" · ") : "no diff";
 		const statusLines = status.stdout.trim() ? status.stdout.trim().split("\n").length : 0;
@@ -485,10 +477,7 @@ function medianOf(samples: number[]): number {
  */
 function effectiveStallMs(task: Task): number {
 	if (task.meaningfulIntervals.length < STALL_SAMPLE_MIN) return task.watchdogMs;
-	return Math.min(
-		Math.max(STALL_FACTOR * medianOf(task.meaningfulIntervals), STALL_FLOOR_MS),
-		task.watchdogMs,
-	);
+	return Math.min(Math.max(STALL_FACTOR * medianOf(task.meaningfulIntervals), STALL_FLOOR_MS), task.watchdogMs);
 }
 
 /** Quiet: no event at all for the effective threshold. watchdogMs 0 disables both detectors. */
@@ -502,11 +491,7 @@ function stallQuiet(task: Task, now: number): boolean {
  * struggling — pure silence stays the user's watchdog's call.
  */
 function stallStruggling(task: Task, now: number): boolean {
-	return (
-		task.watchdogMs > 0 &&
-		task.lastEventAt > task.lastMeaningfulEventAt &&
-		now - task.lastMeaningfulEventAt >= STRUGGLE_MS
-	);
+	return task.watchdogMs > 0 && task.lastEventAt > task.lastMeaningfulEventAt && now - task.lastMeaningfulEventAt >= STRUGGLE_MS;
 }
 
 /** The stall a task is in, or null. Silence outranks noise: both true reads quiet. */
@@ -685,9 +670,7 @@ export async function findGitTopLevel(cwd: string): Promise<{ ok: true; toplevel
 	} catch (err) {
 		return {
 			ok: false,
-			reason:
-				`${escapeTerminalControls(cwd)} is not inside a git repository (${gitErrorTail(err)}), ` +
-				"so isolate cannot give the task its own worktree",
+			reason: `${escapeTerminalControls(cwd)} is not inside a git repository (${gitErrorTail(err)}), ` + "so isolate cannot give the task its own worktree",
 		};
 	}
 }
@@ -997,7 +980,10 @@ export function effortSessionNote(agent: AgentId, effort: Effort): string {
 		return `requested "${effort}"; NOT forwarded — reasonix --acp accepts no effort flag (the one-shot path would have passed --effort).`;
 	}
 	if (agent === "dsh") {
-		return `Set inside the ACP session as session/set_config_option reasoning_effort=${dshEffortToken(effort)}; dsh accepts effort only there, never on its one-shot path.`;
+		return (
+			`Set inside the ACP session as session/set_config_option reasoning_effort=${dshEffortToken(effort)} after the model is selected; ` +
+			"the token must appear in the model's advertised configOptions or the session start is refused."
+		);
 	}
 	if (agent === "kimi") {
 		return (
@@ -1010,18 +996,20 @@ export function effortSessionNote(agent: AgentId, effort: Effort): string {
 }
 
 /**
- * Whether the persistent path forwards a model override. dsh takes its model
- * from the run profile (`--profile` is the whole entry point, verified
- * 0.1.5-rc.2) and no session-start model flag is verified, so a request is
- * reported as not forwarded rather than claimed.
+ * Whether the persistent path forwards a model override. Every persistent
+ * dialect now has a real model route; dsh uses the ACP model selector that
+ * session/new advertises.
  */
 export function modelForwardedOnSession(agent: AgentId): boolean {
-	return agent !== "dsh";
+	return true;
 }
 
 export function modelSessionNote(agent: AgentId, model: string): string {
 	if (agent === "dsh") {
-		return `requested "${model}"; NOT forwarded — dsh selects its model from the run profile, not from a session-start flag.`;
+		return (
+			`Set inside the ACP session as session/set_config_option model; "${model}" is resolved against ` +
+			"session/new's advertised model choices and the exact advertised selector value is sent, or the start is refused."
+		);
 	}
 	if (agent === "kimi") {
 		return `Set inside the ACP session as session/set_config_option model=${model}; kimi takes a raw model id there, not a provider/model pair.`;
@@ -1177,8 +1165,8 @@ function startOneshotTask(
 
 	// An adapter that cannot honour the request says so instead of spelling out a
 	// command whose result would mislead the caller (dsh: an effort request on a
-	// path with no effort knob, or a settings document/overlay that cannot be
-	// created at all). It fails like a spawn that never started — reason
+	// path with no effort knob, an overlay that cannot be created, or a permission
+	// composition that cannot prove the requested readonly/write tier). It fails like a spawn that never started — reason
 	// recorded, nothing spawned.
 	if (adapterDispatch.refusal) {
 		// A refused dispatch is not a dispatch: counting it would inflate the
@@ -1331,13 +1319,7 @@ type DispatchCheck = { ok: true } | { ok: false; reason: string };
  * its own fresh worktree, so the conflict check must not refuse it over a writer
  * in the directory the caller named.
  */
-export function validateDispatch(
-	agent: AgentId,
-	mode: Mode,
-	cwd: string,
-	effort: Effort | undefined,
-	conflictCwd: string = cwd,
-): DispatchCheck {
+export function validateDispatch(agent: AgentId, mode: Mode, cwd: string, effort: Effort | undefined, conflictCwd: string = cwd): DispatchCheck {
 	const adapter = ADAPTERS[agent];
 
 	// Fail closed below the adapter's floor: an adapter that declares one has no
