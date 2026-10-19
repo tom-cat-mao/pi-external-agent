@@ -7,9 +7,9 @@
  * defined"), so permissions are answered over session/request_permission and
  * effort cannot be forwarded. codebuddy is plain ACP: steering is a second
  * session/prompt on the active session. dsh spells the same entry point as a
- * profile (`--profile acp`, verified 0.1.5-rc.2) followed by `--patch` and its
- * overlay, and has no effort flag either, but its session exposes a
- * reasoning_effort config option. kimi spells it as a subcommand (`kimi acp`,
+ * profile (`--profile acp`, verified 0.2.1-rc.2) followed by `--patch` and its
+ * permission overlay; ACP allows one prompt in flight, so dsh is follow-up-only.
+ * kimi spells it as a subcommand (`kimi acp`,
  * verified against kimi-code 2.0.2): four modes (default/plan/auto/yolo), a
  * non-idempotent session/set_mode, a thinking config option whose vocabulary
  * session/new advertises, and no steer at all.
@@ -133,9 +133,9 @@ export interface AcpDialect {
 	sessionNewHint?: (err: Error) => string | undefined;
 	/**
 	 * Whether mid-run guidance can be delivered as a second session/prompt on
-	 * the active session (codebuddy, dsh). Default true. kimi rejects a
-	 * concurrent prompt with -32600 and advertises no steer method, so claiming
-	 * acceptance there would report guidance that was never delivered.
+	 * the active session. Default true for codebuddy. kimi and dsh reject a
+	 * concurrent prompt and advertise no steer method, so claiming acceptance
+	 * there would report guidance that was never delivered.
 	 */
 	steerViaConcurrentPrompt?: boolean;
 }
@@ -211,9 +211,9 @@ export class AcpDriver extends BaseSessionDriver implements SessionDriver {
 		// exactly why readonly moved off plan mode.
 		this.autoPermission = (this.dialect.failClosedPermissionModes ?? ["readonly"]).includes(input.mode) ? "reject" : "allow";
 		// The dialect's prepare hook runs before the spawn: a dialect that cannot
-		// provision what its process needs (dsh: the settings document and the
-		// overlay that pins dsh to it) throws here, and the session start fails
-		// with that reason instead of running a process that cannot work.
+		// provision what its process needs (dsh: the permission overlay that pins its
+		// tier) throws here, and the session start fails with that reason instead of
+		// running a process that cannot work.
 		const prepared = this.dialect.prepare?.(input);
 		this.spawnProcess(ADAPTERS[this.dialect.id].bin, this.buildArgv(input), input.cwd, prepared?.env);
 		this.onNotification((method, params) => this.handleNotification(method, params));
@@ -288,11 +288,7 @@ export class AcpDriver extends BaseSessionDriver implements SessionDriver {
 	 * start, so no prompt is ever sent under a configuration the caller did not
 	 * ask for.
 	 */
-	private async configureSession(
-		configure: (ctx: AcpSessionConfig) => Promise<void>,
-		input: SessionStartInput,
-		created: any,
-	): Promise<void> {
+	private async configureSession(configure: (ctx: AcpSessionConfig) => Promise<void>, input: SessionStartInput, created: any): Promise<void> {
 		const sessionId = this.sessionId;
 		if (!sessionId) throw new Error(`${this.dialect.id} ACP returned no sessionId`);
 		const call = (method: string, params: unknown) => this.request(method, params, HANDSHAKE_TIMEOUT_MS);
@@ -339,11 +335,7 @@ export class AcpDriver extends BaseSessionDriver implements SessionDriver {
 
 		if (this.steerMethod) {
 			try {
-				const res = await this.request(
-					this.steerMethod,
-					{ sessionId: this.sessionId, prompt: [{ type: "text", text: message }] },
-					COMMAND_TIMEOUT_MS,
-				);
+				const res = await this.request(this.steerMethod, { sessionId: this.sessionId, prompt: [{ type: "text", text: message }] }, COMMAND_TIMEOUT_MS);
 				const disposition = res?.disposition;
 				if (disposition === "queued_followup") {
 					return { accepted: true, note: "queued_followup: the turn had already moved on, so it runs as the next follow-up" };
@@ -354,12 +346,12 @@ export class AcpDriver extends BaseSessionDriver implements SessionDriver {
 			}
 		}
 
-		// No advertised steer method: for codebuddy and dsh a second prompt on
-		// the active session is the steer. Its response only lands when the turn
+		// No advertised steer method: where the dialect supports it, a second prompt
+		// on the active session is the steer. Its response only lands when the turn
 		// ends, so it is deliberately not tracked as this turn's own prompt — and
 		// a rejection is swallowed, because a steer that arrived too late to be
 		// accepted must not fail the task. A dialect whose harness REJECTS a
-		// concurrent prompt outright (kimi: -32600) must not come through here:
+		// concurrent prompt outright (kimi and dsh) must not come through here:
 		// swallowing that rejection would report guidance that never landed.
 		if (this.dialect.steerViaConcurrentPrompt === false) {
 			return {
@@ -367,9 +359,7 @@ export class AcpDriver extends BaseSessionDriver implements SessionDriver {
 				reason: `${this.dialect.id} has no mid-run steering: a concurrent session/prompt is rejected, and no steer method is advertised`,
 			};
 		}
-		void this
-			.request(ACP_METHODS.sessionPrompt, { sessionId: this.sessionId, prompt: [{ type: "text", text: message }] }, 0)
-			.catch(() => undefined);
+		void this.request(ACP_METHODS.sessionPrompt, { sessionId: this.sessionId, prompt: [{ type: "text", text: message }] }, 0).catch(() => undefined);
 		return {
 			accepted: true,
 			note: "sent as an extra prompt; injected at the next step boundary, or as a follow-up if the turn ends first",
@@ -383,11 +373,7 @@ export class AcpDriver extends BaseSessionDriver implements SessionDriver {
 	private startPrompt(text: string): void {
 		this.resetTurnBuffers();
 		this.markActive();
-		const { id, promise } = this.enqueue(
-			ACP_METHODS.sessionPrompt,
-			{ sessionId: this.sessionId, prompt: [{ type: "text", text }] },
-			0,
-		);
+		const { id, promise } = this.enqueue(ACP_METHODS.sessionPrompt, { sessionId: this.sessionId, prompt: [{ type: "text", text }] }, 0);
 		this.activePromptId = id;
 		promise
 			.then((result) => {
@@ -443,10 +429,7 @@ export class AcpDriver extends BaseSessionDriver implements SessionDriver {
 		const options: any[] = Array.isArray(msg.params?.options) ? msg.params.options : [];
 		if (this.autoPermission === "reject") {
 			const reject = options.find(
-				(o) =>
-					(o?.kind === "reject_once" || o?.kind === "reject_always") &&
-					typeof o?.optionId === "string" &&
-					o.optionId.length > 0,
+				(o) => (o?.kind === "reject_once" || o?.kind === "reject_always") && typeof o?.optionId === "string" && o.optionId.length > 0,
 			);
 			if (reject) {
 				this.respond(msg.id, { outcome: { outcome: "selected", optionId: reject.optionId } });

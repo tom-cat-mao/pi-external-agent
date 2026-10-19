@@ -24,7 +24,7 @@ one-shot process otherwise.
 | `claude` | Anthropic (`claude`) | Full coding agent; shares pi's gateway, so no model diversity | CLI mode `dontAsk` denies anything not pre-approved | low–max | yes | yes | unverified against a real endpoint; fixture-tested only |
 | `reasonix` | DeepSeek-native (`reasonix`) | Workhorse on a prefix-cache-tuned harness; omit `model` unless another provider is genuinely needed | driver rejects permission prompts (nothing pins the tier) | off–max | yes | yes | readonly confines ≤1.38.7, fail-open from ≥1.38.8 |
 | `qoder` | Alibaba Qoder (`qodercli`) | Third independent executor or reviewer | harness: `dont_ask` + built-in tool allowlist; MCP and Agent launches denied | off, low–max (no `minimal`) | yes, version-gated | yes | — |
-| `dsh` | DeepSeek harness (`dsh`) | Workhorse on a DeepSeek-native harness | harness: `DSH_PERMISSION_MODE` through dsh's own sandbox; escalations driver-denied | off–max (session only) | yes | yes | — |
+| `dsh` | DeepSeek harness (`dsh`) | Workhorse on a DeepSeek-native harness | harness: `DSH_PERMISSION_MODE` through dsh's own sandbox; readonly/write escalations driver-denied | off–max (ACP advertised) | no | yes | — |
 
 Read-only is always enforced mechanically — by the target harness or by the session
 driver answering protocol permission requests — never by a prompt request.
@@ -39,10 +39,11 @@ non-default modes also need a trusted startup directory.
   an override, not an omission.
 - Levels per agent are the Effort column above; a request outside the range is
   refused with the supported list.
-- `kimi` and `dsh` forward effort only inside their session — the one-shot spelling
-  has no effort knob and a request there is refused, not dropped. `codex` has no
-  dedicated flag (a `-c` config override, with `off` spelled `none`); `reasonix` maps
-  onto its relay's `disabled|low|high|max`; `qoder` uses `--reasoning-effort`.
+- `kimi` and dsh's ACP path forward effort per session, validated against the
+  advertised vocabulary; dsh's headless one-shot spelling is not production.
+  `codex` has no dedicated flag (a `-c` config override, with `off` spelled
+  `none`); `reasonix` maps onto its relay's `disabled|low|high|max`; `qoder`
+  uses `--reasoning-effort`.
 
 ## Permission tiers
 
@@ -71,11 +72,12 @@ Builtins:
 
 Both need the agent's persistent session; all eight agents have one.
 
-- `external_agent_steer` works on codex, pi, codebuddy, claude, reasonix, qoder and
-  dsh. It is not an interrupt: the message lands at the next step boundary. If the
-  turn already ended, use `external_agent_follow_up`.
-- `kimi` is follow-up only: a concurrent prompt is rejected and no steer method is
-  advertised, so guidance waits for the turn to end.
+- `external_agent_steer` works on codex, pi, codebuddy, claude, reasonix and
+  qoder. It is not an interrupt: the message lands at the next step boundary. If
+  the turn already ended, use `external_agent_follow_up`.
+- `kimi` and `dsh` are follow-up only: a concurrent prompt is rejected and no
+  steer method is advertised. A steer call is refused, never queued or claimed as
+  delivered.
 - `qoder` steering requires an announced stable `qodercli_version` >= 1.1.49; a
   missing, malformed, prerelease or older version refuses with the reported version,
   while start, status, follow-up and stop keep working.

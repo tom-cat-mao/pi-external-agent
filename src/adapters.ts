@@ -22,9 +22,10 @@
  *   reasonix  -> DeepSeek-native harness (prefix-cache tuned), yolo default
  *   qoder     -> yolo default, stream-json driven; steering is version-gated.
  *                Why: .agents/notes/implemented/2026-09-15-qoder-steering-version-gate.md
- *   dsh       -> DeepSeek harness; yolo default, all three tiers enforced by dsh's own
- *                sandbox through DSH_PERMISSION_MODE, with --patch re-pointing dsh's
- *                settings row at pi's empty settings document in the shared ~/.dsh.
+ *   dsh       -> DeepSeek harness; yolo default, all three tiers pinned by a
+ *                --patch overlay over the permission row and enforced by dsh's
+ *                own sandbox. Production runs use the ACP session driver; the
+ *                one-shot headless adapter is legacy/internal only.
  *
  * Effort flags as currently supported (hub/registry.ts refuses anything else):
  *   pi        -> --thinking <off|minimal|low|medium|high|xhigh|max>
@@ -89,9 +90,10 @@ export function reasonixEffortToken(effort: Effort): string {
 }
 
 /**
- * dsh's reasoning-effort vocabulary (the reasoning_effort config option an ACP
- * session exposes, verified 0.1.5-rc.2: off|low|high|max). Same four steps as
- * the reasonix relay, so the same mapping:
+ * dsh's normalized effort mapping. The ACP reasoning_effort selector is
+ * model-dependent; these target tokens are validated against the selected
+ * model's advertised vocabulary before the session publishes a prompt. Same
+ * four target steps as the reasonix relay, so the same mapping:
  *   off->off  minimal->low  low->low  medium->high  high->high
  *   xhigh->max  max->max
  */
@@ -115,11 +117,10 @@ export function dshPermissionMode(mode: Mode): string {
 }
 
 /**
- * Why an effort request is refused on dsh's one-shot path. The headless profile
- * has no effort knob at all (verified 0.1.5-rc.2), while an ACP session sets
- * reasoning_effort over the protocol; the hub's own effort check in
- * hub/registry.ts is adapter-level and cannot see that split, so the adapter
- * refuses here rather than dropping the override silently.
+ * Why an effort request is refused on dsh's legacy one-shot path. The headless
+ * profile has no effort flag, while an ACP session sets reasoning_effort over
+ * the protocol. The adapter refuses here rather than dropping the override
+ * silently; production dsh runs over ACP.
  */
 export const DSH_ONESHOT_EFFORT_REFUSAL =
 	"dsh forwards reasoning effort only inside an ACP session (session/set_config_option reasoning_effort); " +
@@ -172,14 +173,7 @@ export interface BuildArgsInput {
  * could be reached, and a reasonix ACP session pins no tier at all, so its
  * confinement is the driver rejecting `session/request_permission` prompts.
  */
-export const READ_ONLY_ENFORCEMENTS = [
-	"harness-enforced",
-	"cli-mode",
-	"driver-rejected-prompts",
-	"plan-mode-guard",
-	"not-enforced",
-	"not-applicable",
-] as const;
+export const READ_ONLY_ENFORCEMENTS = ["harness-enforced", "cli-mode", "driver-rejected-prompts", "plan-mode-guard", "not-enforced", "not-applicable"] as const;
 export type ReadOnlyEnforcement = (typeof READ_ONLY_ENFORCEMENTS)[number];
 
 export interface AdapterDispatch {
@@ -214,9 +208,10 @@ export interface AdapterDispatch {
 	 * records it as a task warning event, which is where non-fatal notices are
 	 * surfaced (external_agent_status: "non-fatal warnings"). dsh returns it
 	 * from its composition anchor: the offline probe found the composed config
-	 * disagreeing with what the adapter provisioned (a patch outranking our
-	 * overlay, a replaced sandbox/approval row, a preset in our settings
-	 * document), so the requested tier may not be the one in force.
+	 * disagreeing with what the adapter provisioned (the permission row not
+	 * pinned to our overlay, a replaced sandbox/approval row), so the requested
+	 * tier may not be the one in force. readonly/write turn that warning into a
+	 * refusal; only yolo may run with it.
 	 */
 	warning?: string;
 	/**
@@ -224,9 +219,9 @@ export interface AdapterDispatch {
 	 * the adapter refuses to spell out. hub/registry.ts fails the dispatch with
 	 * this reason instead of spawning a process that cannot work, so a refusal
 	 * is never a silent drop. dsh returns it for an effort request on the
-	 * one-shot path (no effort knob exists there) and for a settings document or
-	 * overlay that cannot be created at all (an unusable path), since without
-	 * them the requested tier is not what governs the run.
+	 * legacy one-shot path (no effort knob exists there), for an overlay that
+	 * cannot be created, and for readonly/write when the composition cannot
+	 * prove the requested sandbox tier.
 	 */
 	refusal?: string;
 }
@@ -237,10 +232,7 @@ export interface AdapterDispatch {
  * own, but the intent has to be expressible, because a variable the adapter
  * must not let through (dsh's DSH_HOME) can be sitting in the user's shell.
  */
-export function mergeSpawnEnv(
-	base: NodeJS.ProcessEnv,
-	extra: Record<string, string | undefined>,
-): NodeJS.ProcessEnv {
+export function mergeSpawnEnv(base: NodeJS.ProcessEnv, extra: Record<string, string | undefined>): NodeJS.ProcessEnv {
 	const merged: NodeJS.ProcessEnv = { ...base };
 	for (const [key, value] of Object.entries(extra)) {
 		// Windows environment variables are case-insensitive, and process.env
@@ -320,9 +312,7 @@ export interface Adapter {
 
 /** Shared receipt shape for the effort field; the no-request note is uniform. */
 function effortReceipt(effort: Effort | undefined, forwarded: boolean, note: string): AdapterDispatch["effort"] {
-	return effort
-		? { requested: effort, forwarded, note }
-		: { forwarded: false, note: "No effort override requested; the target CLI/config default applies." };
+	return effort ? { requested: effort, forwarded, note } : { forwarded: false, note: "No effort override requested; the target CLI/config default applies." };
 }
 
 function parseCodexLine(line: string): AgentEvent | null {
@@ -380,33 +370,33 @@ function codexFamily(
 		// The codex protocol tops out at "xhigh"; "max" is a pi/claude-family level.
 		supportedEfforts: ["off", "minimal", "low", "medium", "high", "xhigh"],
 		session,
-	enforcesReadOnly: true,
-	buildDispatch({ task, cwd, mode, model, effort }) {
-		const argv = ["exec", "--json", "--skip-git-repo-check", "-C", cwd];
+		enforcesReadOnly: true,
+		buildDispatch({ task, cwd, mode, model, effort }) {
+			const argv = ["exec", "--json", "--skip-git-repo-check", "-C", cwd];
 			// All three modes are real sandbox policies in this family, not prompt requests.
 			const sandbox = mode === "readonly" ? "read-only" : mode === "write" ? "workspace-write" : "danger-full-access";
 			argv.push("--sandbox", sandbox);
 			if (model) argv.push("--model", model);
-		// No dedicated flag exists; -c parses the value as TOML, hence the quotes.
-		const token = effort ? codexEffortToken(effort) : undefined;
-		if (token) argv.push("-c", `model_reasoning_effort="${token}"`);
-		argv.push(task);
-		return {
-			argv,
-			promptArgIndex: argv.length - 1,
-			cwdForwardedToCli: true,
-			effectivePolicy: `--sandbox ${sandbox}`,
-			readOnlyEnforcement: mode === "readonly" ? "harness-enforced" : "not-applicable",
-			model: model
-				? { requested: model, forwarded: true, note: "Passed to the target CLI as --model." }
-				: { forwarded: false, note: "No model override requested; target CLI/config selects the model." },
-			effort: effortReceipt(
-				effort,
-				true,
-				`Passed as -c model_reasoning_effort="${token}" (${effort === "off" ? "off is spelled none in this family" : "config override; no dedicated flag exists"}).`,
-			),
-		};
-	},
+			// No dedicated flag exists; -c parses the value as TOML, hence the quotes.
+			const token = effort ? codexEffortToken(effort) : undefined;
+			if (token) argv.push("-c", `model_reasoning_effort="${token}"`);
+			argv.push(task);
+			return {
+				argv,
+				promptArgIndex: argv.length - 1,
+				cwdForwardedToCli: true,
+				effectivePolicy: `--sandbox ${sandbox}`,
+				readOnlyEnforcement: mode === "readonly" ? "harness-enforced" : "not-applicable",
+				model: model
+					? { requested: model, forwarded: true, note: "Passed to the target CLI as --model." }
+					: { forwarded: false, note: "No model override requested; target CLI/config selects the model." },
+				effort: effortReceipt(
+					effort,
+					true,
+					`Passed as -c model_reasoning_effort="${token}" (${effort === "off" ? "off is spelled none in this family" : "config override; no dedicated flag exists"}).`,
+				),
+			};
+		},
 		parseEvent: parseCodexLine,
 	};
 }
@@ -442,9 +432,7 @@ function claudeResultEvent(rec: any): AgentEvent {
 	const failed = rec.is_error === true || /^API Error/i.test(text) || (Array.isArray(rec.errors) && rec.errors.length > 0);
 	const detail = Array.isArray(rec.errors) && rec.errors.length > 0 ? rec.errors.join("; ") : text;
 
-	const event: AgentEvent = failed
-		? { kind: "error", text: detail || "agent reported is_error without detail" }
-		: { kind: "message", text };
+	const event: AgentEvent = failed ? { kind: "error", text: detail || "agent reported is_error without detail" } : { kind: "message", text };
 
 	// The same record also carries the run's CLI-reported accounting (a failed
 	// run's burned tokens included). Attached only when actually present: an
@@ -511,9 +499,7 @@ function parseClaudeFamilyStreamLine(line: string): AgentEvent | null {
 	// retry loop looks like a stalled task, so surface it as a warning.
 	if (obj.api_retry && typeof obj.api_retry === "object") {
 		const retry = obj.api_retry;
-		const detail = [retry.error_status ? `status ${retry.error_status}` : "", retry.category ? String(retry.category) : ""]
-			.filter(Boolean)
-			.join(", ");
+		const detail = [retry.error_status ? `status ${retry.error_status}` : "", retry.category ? String(retry.category) : ""].filter(Boolean).join(", ");
 		return {
 			kind: "warning",
 			text: `api retry ${retry.attempt ?? "?"}/${retry.max_retries ?? "?"}${detail ? ` (${detail})` : ""}`,
@@ -627,8 +613,7 @@ function claudeFamily(
 				effectivePolicy: settingsJson
 					? "--permission-mode default --settings (allow/deny rules + PreToolUse Bash hook; denies are silent)"
 					: `--permission-mode ${permissionMode}`,
-				readOnlyEnforcement:
-					mode === "readonly" ? (readonlyEnforcement ?? "harness-enforced") : "not-applicable",
+				readOnlyEnforcement: mode === "readonly" ? (readonlyEnforcement ?? "harness-enforced") : "not-applicable",
 				model: model
 					? { requested: model, forwarded: true, note: "Passed to the target CLI as --model." }
 					: { forwarded: false, note: "No model override requested; target CLI/config selects the model." },
@@ -694,10 +679,7 @@ function kimiSessionPolicy(mode: Mode): string {
 			"every tool call), so dangerous Bash runs unasked; the driver allows any ask a user-configured rule still raises, and AskUserQuestion is denied"
 		);
 	}
-	return (
-		"kimi yolo mode: dangerous-command asks survive and the driver allows them (write/auto raises none); " +
-		"AskUserQuestion is approved"
-	);
+	return "kimi yolo mode: dangerous-command asks survive and the driver allows them (write/auto raises none); " + "AskUserQuestion is approved";
 }
 
 const kimiAdapter: Adapter = {
@@ -733,21 +715,16 @@ const kimiAdapter: Adapter = {
 			// The requested "yolo" is not what runs: print mode overrides the
 			// permission mode to Never Ask (auto) and skips config.toml's
 			// default_permission_mode entirely. Static deny rules still bind.
-			effectivePolicy:
-				`-p forces Never Ask (auto); config.toml's default_permission_mode is not consulted; static deny rules still apply`,
+			effectivePolicy: `-p forces Never Ask (auto); config.toml's default_permission_mode is not consulted; static deny rules still apply`,
 			readOnlyEnforcement: "not-applicable",
 			model: model
 				? {
-					requested: model,
-					forwarded: true,
-					note: "Passed to kimi as --model (a model alias from config.toml; the flag exists since kimi-code 0.36.x).",
-				}
+						requested: model,
+						forwarded: true,
+						note: "Passed to kimi as --model (a model alias from config.toml; the flag exists since kimi-code 0.36.x).",
+					}
 				: { forwarded: false, note: "No model override requested; kimi's default_model in config.toml applies." },
-			effort: effortReceipt(
-				effort,
-				false,
-				`NOT forwarded on this path: ${KIMI_ONESHOT_EFFORT_REFUSAL}`,
-			),
+			effort: effortReceipt(effort, false, `NOT forwarded on this path: ${KIMI_ONESHOT_EFFORT_REFUSAL}`),
 		};
 		// Both refusals are this spelling's own: the session path serves every
 		// tier and forwards effort, so neither is a kimi-wide limit.
@@ -871,19 +848,17 @@ const reasonixAdapter: Adapter = {
 			argv,
 			promptArgIndex: argv.length - 1,
 			cwdForwardedToCli: true,
-			effectivePolicy:
-				`--permission-mode ${permissionMode}` +
-				(mode === "yolo" ? " (deny rules and OS bash sandbox still apply)" : ""),
+			effectivePolicy: `--permission-mode ${permissionMode}` + (mode === "yolo" ? " (deny rules and OS bash sandbox still apply)" : ""),
 			// This one-shot spelling is the only path where a tier is pinned: the
 			// CLI fails ask decisions closed headless. The ACP path pins nothing
 			// and carries readonlyEnforcement above instead — see its comment.
 			readOnlyEnforcement: mode === "readonly" ? "harness-enforced" : "not-applicable",
 			model: model
 				? {
-					requested: model,
-					forwarded: true,
-					note: "Passed as --model; accepts a configured provider name, a bare model id, or a provider/model reference.",
-				}
+						requested: model,
+						forwarded: true,
+						note: "Passed as --model; accepts a configured provider name, a bare model id, or a provider/model reference.",
+					}
 				: { forwarded: false, note: "No model override requested; the configured default_model applies." },
 			effort: effortReceipt(
 				effort,
@@ -994,7 +969,7 @@ const qoderAdapter: Adapter = {
 		steer: true,
 		followUp: true,
 		steerNote:
-			"documented stream-json priority \"next\" + shouldQuery false, injected at the next step boundary of the active turn, never an interrupt; " +
+			'documented stream-json priority "next" + shouldQuery false, injected at the next step boundary of the active turn, never an interrupt; ' +
 			"steering needs an announced stable qodercli >= 1.1.49 (our documented-SDK pairing baseline) and is otherwise refused with the reported version",
 	},
 	sessionPolicy: qoderEffectivePolicy,
@@ -1023,40 +998,26 @@ const qoderAdapter: Adapter = {
 };
 
 // ---------------------------------------------------------------------------
-// dsh — DeepSeek harness; plain-text stdout, ACP sessions. Verified by hand
-// against dsh 0.1.5-rc.2 (installed at ~/.bun/bin/dsh):
+// dsh — DeepSeek harness. Production runs use the ACP session driver; the
+// headless one-shot adapter below is retained only for the uniform adapter
+// interface and internal tests.
 //
-//   one-shot: `dsh --profile headless "<task>"` prints the final assistant
-//             answer as plain text on stdout and streams reasoning on stderr as
-//             lines prefixed `dsh: reasoning:`; exit 0 on success, non-zero on
-//             failure. There is NO --json and NO --session-id in this release
-//             (both exist only in newer alphas), so stdout has no structure to
-//             parse and the exit code is the authority on success.
-//   session:  `dsh --profile acp` speaks standard ACP v1 over stdio;
-//             initialize advertises sessionCapabilities {close, list, resume}
-//             and no steer method, so steering is a second session/prompt on
-//             the active session (the codebuddy fallback in AcpDriver), and
-//             effort is settable with session/set_config_option
-//             (configId reasoning_effort, values off|low|high|max). See
-//             SESSION_DRIVERS.dsh in drivers/index.ts.
+// Production ACP facts, verified against dsh 0.2.1-rc.2:
+//   - `dsh --profile acp` is standard ACP v1 over stdio;
+//   - session/new advertises configOptions model and reasoning_effort;
+//   - model and effort travel via session/set_config_option;
+//   - one prompt at a time is allowed and no steer method is advertised.
 //
-// Permission modes are codex's vocabulary, carried in the environment:
-//   readonly -> DSH_PERMISSION_MODE=read-only
-//   write    -> DSH_PERMISSION_MODE=workspace-write
-//   yolo     -> DSH_PERMISSION_MODE=danger-full-access
-// dsh's own sandbox enforces them mechanically (writes outside the mode are
-// denied; an escalation with no approval answerer fails closed, and over ACP it
-// arrives as session/request_permission, which the driver answers).
-//
-// The tier only binds because of src/dsh-launch.ts: dsh reads the SETTINGS
-// DOCUMENT's permission.defaultPreset ahead of the variable, so a run under the
-// user's own ~/.dsh/settings.yaml would not be bounded by the requested tier at
-// all. --patch <overlay> replaces the settings row's whole config, pointing it at
-// pi's own empty document, and then the composed default — which the variable
-// drives — governs (verified 0.1.5-rc.2: against a real ~/.dsh holding
-// defaultPreset: danger-full-access, a read-only run's write was denied and the
-// escalation failed closed, settings.yaml untouched). --patch is a LAUNCHER flag:
-// it must precede the task positional.
+// Permission modes are carried in DSH_PERMISSION_MODE:
+//   readonly -> read-only
+//   write    -> workspace-write
+//   yolo     -> danger-full-access
+// dsh's sandbox enforces the file-effect mode. src/dsh-launch.ts writes the
+// last `--patch` overlay, which replaces the permission row with the three
+// extension presets and a defaultPreset expression reading the same env. The
+// permission service pins that preset into each fresh session, so a profile's
+// own default cannot outrank the requested tier. Composition findings are
+// warnings for yolo and refusals for readonly/write.
 // ---------------------------------------------------------------------------
 
 /**
@@ -1069,26 +1030,22 @@ const dshAdapter: Adapter = {
 	id: "dsh",
 	bin: "dsh",
 	provider: "DeepSeek harness (dsh)",
-	useFor:
-		"Execution workhorse on a DeepSeek-native harness; dsh's own sandbox enforces the requested permission tier.",
+	useFor: "Execution workhorse on a DeepSeek-native harness; dsh's own sandbox enforces the requested permission tier.",
 	defaultMode: "yolo",
 	maxMode: "yolo",
 	supportedEfforts: EFFORT_LEVELS,
 	session: {
-		steer: true,
+		steer: false,
 		followUp: true,
-		steerNote: "second session/prompt on the active session; injected at the next model step boundary",
+		steerNote: "none: dsh ACP permits only one in-flight prompt and advertises no steer method, so guidance waits for the turn to end and must use follow-up",
 	},
 	sessionPolicy: (mode) =>
-		// "Fail closed" is a readonly fact only: the ACP driver auto-denies
-		// session/request_permission for readonly and auto-allows it for
-		// write/yolo, where the requested tier permits the escalation.
-		`DSH_PERMISSION_MODE=${dshPermissionMode(mode)} with --patch replacing dsh's settings row config ` +
-		"(so the user's own settings document, whose permission.defaultPreset outranks that variable, is not read; " +
+		`DSH_PERMISSION_MODE=${dshPermissionMode(mode)} with --patch replacing dsh's permission row config ` +
+		"(the three presets are restated and defaultPreset reads that variable, so a profile default cannot outrank it; " +
 		"dsh's own sandbox enforces the tier; " +
-		(mode === "readonly"
-			? "the driver denies session/request_permission escalations, so readonly fails closed)"
-			: "escalations the harness raises are allowed by the driver, as this tier permits)"),
+		(mode === "yolo"
+			? "the driver allows permission escalations, as this tier is full access)"
+			: "the driver denies session/request_permission escalations, so the sandbox boundary fails closed)"),
 	enforcesReadOnly: true,
 	buildDispatch({ task, mode, model, effort }) {
 		// The overlay path is a pure function of the home directory — spelling it
@@ -1102,14 +1059,14 @@ const dshAdapter: Adapter = {
 			promptArgIndex: argv.length - 1,
 			cwdForwardedToCli: false,
 			effectivePolicy:
-				`DSH_PERMISSION_MODE=${dshPermissionMode(mode)} with --patch ${overlay} re-pointing dsh's settings row ` +
-				"at pi's empty settings document (a permissions preset in the user's own document would outrank that variable)",
+				`DSH_PERMISSION_MODE=${dshPermissionMode(mode)} with --patch ${overlay} replacing dsh's permission row config ` +
+				"(defaultPreset reads that variable and the sandbox/approval rows are anchored to it)",
 			readOnlyEnforcement: mode === "readonly" ? "harness-enforced" : "not-applicable",
 			model: model
 				? {
 						requested: model,
 						forwarded: false,
-						note: "NOT forwarded: dsh 0.1.5-rc.2 takes its model from the run profile, and no one-shot model flag is verified.",
+						note: "NOT forwarded on the legacy one-shot path: it has no model flag. Production ACP sessions select an advertised model over session/set_config_option.",
 					}
 				: { forwarded: false, note: "No model override requested; the run profile selects the model." },
 			effort: effortReceipt(effort, false, `NOT forwarded: ${DSH_ONESHOT_EFFORT_REFUSAL}`),
@@ -1121,7 +1078,7 @@ const dshAdapter: Adapter = {
 		if (effort) return { ...dispatch, refusal: DSH_ONESHOT_EFFORT_REFUSAL };
 		// The probe runs under the same profile this dispatch boots: the
 		// composition is per profile, so the anchor has to read the right one.
-		const launch = prepareDshLaunch(DSH_ONESHOT_PROFILE);
+		const launch = prepareDshLaunch(DSH_ONESHOT_PROFILE, mode);
 		if (!launch.ok) return { ...dispatch, refusal: launch.reason };
 		return {
 			...dispatch,
@@ -1132,13 +1089,11 @@ const dshAdapter: Adapter = {
 			env: { DSH_PERMISSION_MODE: dshPermissionMode(mode), DSH_HOME: undefined },
 		};
 	},
-	// Plain-text stdout: no --json exists in this release, so every non-empty
-	// line is answer prose, and hub/registry.ts joins the message events back
-	// with newlines (plus its close-time flush for a final line without one).
-	// Reasoning never reaches here — it streams on stderr as `dsh: reasoning:`
-	// lines, captured raw as stderr by the one-shot path — but a line carrying
-	// that prefix anyway is reported as reasoning rather than smuggled into the
-	// answer. Failures are a non-zero exit, not stdout text.
+	// Legacy one-shot stdout is plain text; this parser is retained for the
+	// uniform adapter interface but is not dsh's production transport. Every
+	// non-empty line is answer prose, and hub/registry.ts joins the message
+	// events back with newlines. Reasoning normally streams on stderr, but a
+	// line carrying that prefix on stdout is still classified as reasoning.
 	parseEvent(line) {
 		const trimmed = line.trim();
 		if (!trimmed) return null;
@@ -1202,10 +1157,10 @@ const piAdapter: Adapter = {
 			readOnlyEnforcement: readOnly ? "harness-enforced" : "not-applicable",
 			model: model
 				? {
-					requested: model,
-					forwarded: true,
-					note: "Passed to the child pi as --model; accepts provider/id patterns and a :<thinking> suffix.",
-				}
+						requested: model,
+						forwarded: true,
+						note: "Passed to the child pi as --model; accepts provider/id patterns and a :<thinking> suffix.",
+					}
 				: { forwarded: false, note: "No model override requested; the child pi uses its configured default model." },
 			effort: effortReceipt(
 				effort,
@@ -1326,8 +1281,7 @@ export const ADAPTERS: Record<AgentId, Adapter> = {
 		{
 			steer: true,
 			followUp: true,
-			steerNote:
-				"LF-framed user messages with uuid; sent as priority next / shouldQuery false at next step boundary when active turn detected",
+			steerNote: "LF-framed user messages with uuid; sent as priority next / shouldQuery false at next step boundary when active turn detected",
 		},
 		undefined, // no readonlySettings for claude
 		true, // use stream-json mapping

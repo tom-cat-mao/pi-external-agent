@@ -13,7 +13,7 @@ pi install git:github.com/tom-cat-mao/pi-external-agent@v0.9.0
 pi install git:github.com/tom-cat-mao/pi-external-agent
 ```
 
-要求 pi ≥ 0.85，以及按需安装的各 agent CLI（不需要全部装齐）。Qoder 需要 `qodercli` 在 `PATH` 上并已登录；steer 还要求 CLI 声明的稳定版本 ≥ 1.1.49（见 [docs/qoder.md](docs/qoder.md)）。dsh 直接使用你自己的 dsh 环境（`~/.dsh`）；每次派发通过一份独立作用域的 settings 文档锁定权限档位，由 dsh 自带沙箱强制执行——不随你 `settings.yaml` 里的 preset 变化。Models 页里的 provider 配置不适用于这些运行；web profile 里装的插件需用 `dsh plugin --profile acp add <pkg>` 才能进入扩展所用的 profile。旧布局遗留的 `~/.dsh-external-agent` 目录无人引用，可安全删除。
+要求 pi ≥ 0.85，以及按需安装的各 agent CLI（不需要全部装齐）。Qoder 需要 `qodercli` 在 `PATH` 上并已登录；steer 还要求 CLI 声明的稳定版本 ≥ 1.1.49（见 [docs/qoder.md](docs/qoder.md)）。dsh 直接使用你自己的 dsh 环境（`~/.dsh`）；每次派发通过一份作用域内的 permission overlay 锁定档位，readonly/write 在无法证明权限边界时会拒绝启动。Models 页里的 provider 配置不适用于这些运行；web profile 里装的插件需用 `dsh plugin --profile acp add <pkg>` 才能进入扩展所用的 profile。旧布局遗留的 `~/.dsh-external-agent` 目录无人引用，可安全删除。
 
 发布由 tag 自动完成：推送 `vX.Y.Z` 后先跑测试与类型检查，通过即创建 GitHub Release。
 
@@ -54,12 +54,12 @@ pi install git:github.com/tom-cat-mao/pi-external-agent
 | `qoder` | 阿里 | yolo | follow-up ✅；steer ✅，需 CLI 声明的版本满足 1.1.49 基线 |
 | `kimi` | Moonshot | yolo（ACP 会话内三档为 readonly–yolo；print 拼写仅 yolo） | follow-up ✅；steer ❌ |
 | `claude` | Anthropic | yolo（readonly–yolo 三档；effort low–max，无 off） | ✅ stream-json |
-| `dsh` | DeepSeek harness | yolo（readonly–yolo 三档；dsh 自带沙箱强制执行该档位） | ✅ ACP |
+| `dsh` | DeepSeek harness | yolo（readonly–yolo 三档；dsh 自带沙箱强制执行该档位） | follow-up ✅；steer ❌（同一 session 仅一个 in-flight prompt） |
 
 ## 文档
 
 - [AGENTS.md](AGENTS.md) — 目录结构、命令、不变式、文档规则
-- [docs/architecture.md](docs/architecture.md) — 派发流程、回执、传输层 · [docs/adapters.md](docs/adapters.md) — 各 CLI 能力矩阵 · [docs/capabilities.md](docs/capabilities.md) — 归档、验收、模板、relay、隔离、证据板、计量 · [docs/prompt-surface.md](docs/prompt-surface.md) — 三层工具文本与激活 · [docs/qoder.md](docs/qoder.md) — Qoder stream-json 契约 · [docs/dsh.md](docs/dsh.md) — dsh 共享 home 与作用域 settings · [docs/kimi.md](docs/kimi.md) — kimi 的 ACP 会话、档位与 effort · [.agents/notes/](.agents/notes/) — 决策记录
+- [docs/architecture.md](docs/architecture.md) — 派发流程、回执、传输层 · [docs/adapters.md](docs/adapters.md) — 各 CLI 能力矩阵 · [docs/capabilities.md](docs/capabilities.md) — 归档、验收、模板、relay、隔离、证据板、计量 · [docs/prompt-surface.md](docs/prompt-surface.md) — 三层工具文本与激活 · [docs/qoder.md](docs/qoder.md) — Qoder stream-json 契约 · [docs/dsh.md](docs/dsh.md) — dsh 共享 home、permission overlay 与 ACP model/effort · [docs/kimi.md](docs/kimi.md) — kimi 的 ACP 会话、档位与 effort · [.agents/notes/](.agents/notes/) — 决策记录
 
 ## 社区
 

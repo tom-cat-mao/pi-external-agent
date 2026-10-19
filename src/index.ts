@@ -13,7 +13,7 @@
  *    (side by side, no judging). Why: .agents/notes/implemented/2026-08-17-no-wall-clock-timeout.md
  *
  * 2. Permission tiers are enforced mechanically — by the target harness, or by the
- *    session driver answering protocol permission requests (dsh's ACP escalation deny) —
+ *    session driver answering protocol permission requests (dsh readonly/write ACP escalation deny) —
  *    never by a prompt request, and defaults are per-adapter:
  *    codex/pi/kimi/codebuddy/reasonix/qoder/claude/dsh
  *    yolo, with every tier open (kimi's readonly is plan mode plus the driver
@@ -28,15 +28,7 @@
 
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import {
-	finalizeHooks,
-	formatMeterSnapshot,
-	meter,
-	scanWatchdogs,
-	sessionShutdown,
-	sessionStarted,
-	stallTestApi,
-} from "./hub/registry.ts";
+import { finalizeHooks, formatMeterSnapshot, meter, scanWatchdogs, sessionShutdown, sessionStarted, stallTestApi } from "./hub/registry.ts";
 import { stallClock } from "./hub/shared.ts";
 import { registerHubTools } from "./hub/tools.ts";
 

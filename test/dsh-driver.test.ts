@@ -1,29 +1,27 @@
 /**
  * dsh (DeepSeek harness) ACP session driver, over a fake `dsh` executable.
  *
- * What the driver owes dsh 0.1.5-rc.2, and what this suite pins down:
+ * What the driver owes dsh 0.2.1-rc.2, and what this suite pins down:
  *   - the entry is a profile, `--profile acp`, never a bare `--acp`, followed by
- *     the `--patch` overlay that keeps dsh's settings row off the user's own
- *     settings document, and the task travels on the protocol rather than in the
- *     startup argv;
+ *     the `--patch` permission overlay; the task travels on the protocol rather
+ *     than in the startup argv;
  *   - every spawn carries the tier as DSH_PERMISSION_MODE and DELETES an
  *     inherited DSH_HOME (the home is the shared ~/.dsh the overlay was written
  *     into), merged over process.env (never replacing it);
- *   - effort has no flag on this CLI, so it is set on the session as
- *     reasoning_effort AFTER session/new, mapped off|low|high|max — and no
- *     frame at all is sent when the caller requested no effort;
+ *   - model and effort are advertised by session/new and set through
+ *     session/set_config_option, model first and effort from the refreshed
+ *     options; unsupported values refuse the start;
  *   - a rejected set_config_option fails the start with the server's own error,
  *     so a turn never runs at a default the caller did not ask for;
- *   - a settings document or overlay that cannot be created fails the start
- *     before anything is spawned: without them the requested tier stops binding;
- *   - permission requests are answered mechanically: readonly selects the
- *     reject option (or cancels when the server offers none), write/yolo allow
+ *   - an overlay that cannot be created fails the start before anything is
+ *     spawned: without it the requested tier stops binding;
+ *   - permission requests are answered mechanically: readonly and write select
+ *     the reject option (or cancel when the server offers none), yolo allows
  *     — and an escalation is answered even when the harness, numbering its own
  *     requests independently, happens to use an id the client is still waiting
  *     on (a request is never a response);
- *   - a harness that advertises no steer method steers by sending a second
- *     session/prompt on the active session (a harness that DOES advertise one
- *     keeps using it — the reasonix regression at the end).
+ *   - dsh refuses steer without sending a second prompt; a harness that DOES
+ *     advertise a vendor steer method keeps using it (reasonix regression).
  *
  * No live dsh run happens here: the protocol client talks to the fixture, and
  * provisioning is exercised against a temporary HOME. The composition anchor's
@@ -40,14 +38,10 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { ADAPTERS, EFFORT_LEVELS, type Effort, type Mode } from "../src/adapters.ts";
-import {
-	DSH_OVERLAY_NAME,
-	DSH_SETTINGS_DOC_NAME,
-	dshCompositionWarnings,
-	dshSettingsDocPath,
-	resetDshCompositionGuard,
-} from "../src/dsh-launch.ts";
+import { DSH_OVERLAY_NAME, dshCompositionWarnings, dshOverlayContent, resetDshCompositionGuard } from "../src/dsh-launch.ts";
 import { SESSION_DRIVERS, type SessionDriver, type TurnOutcome } from "../src/drivers/index.ts";
+
+const BB_JS = '!!js';
 
 /**
  * A fake ACP harness for both dsh and reasonix. It records every frame it
@@ -60,6 +54,21 @@ const fs = require("node:fs");
 const log = process.env.DSH_MOCK_LOG;
 function record(entry) { if (log) fs.appendFileSync(log, JSON.stringify(entry) + "\\n"); }
 function send(value) { process.stdout.write(JSON.stringify(value) + "\\n"); }
+
+if (process.argv.slice(2).includes("--dump-config")) {
+  const mode = process.env.DSH_MOCK_DUMP || "clean";
+  if (mode === "foreign") {
+    process.stdout.write(
+      "# == base, patched by /etc/company/dsh.patch.yml\\n" +
+      "- id: permission\\n  config:\\n    defaultPreset: danger-full-access\\n" +
+      "- id: sandbox-policy\\n  config:\\n    mode: ${BB_JS} process.env.DSH_PERMISSION_MODE ?? 'workspace-write'\\n" +
+      "- id: approval\\n  config:\\n    policy: ${BB_JS} process.env.DSH_PERMISSION_MODE === 'danger-full-access' ? 'never' : 'ask'\\n",
+    );
+  } else {
+    process.stdout.write("# == base, patched by /fixtures/overlay.yml\\n- id: permission\\n  config:\\n    defaultPreset: danger-full-access\\n");
+  }
+  process.exit(0);
+}
 
 record({
   kind: "spawn",
@@ -77,6 +86,26 @@ const permissionOptions = process.env.DSH_MOCK_PERMISSION_OPTIONS;
 const escalations = Number(process.env.DSH_MOCK_ESCALATIONS || "0");
 const failConfig = process.env.DSH_MOCK_FAIL_CONFIG === "1";
 const steerMethod = process.env.DSH_MOCK_STEER_METHOD;
+const effortValues = process.env.DSH_MOCK_EFFORT_OPTIONS
+  ? JSON.parse(process.env.DSH_MOCK_EFFORT_OPTIONS)
+  : ["off", "low", "high", "max"];
+const modelChoices = [
+  { group: "provider-a", name: "Provider A", options: [
+    { value: JSON.stringify(["provider-a", "alpha"]), name: "alpha" },
+    { value: JSON.stringify(["provider-a", "shared"]), name: "shared" },
+  ] },
+  { group: "provider-b", name: "Provider B", options: [
+    { value: JSON.stringify(["provider-b", "beta"]), name: "beta" },
+    { value: JSON.stringify(["provider-b", "shared"]), name: "shared" },
+  ] },
+];
+let selectedModel = JSON.stringify(["provider-a", "alpha"]);
+function configOptions() {
+  return [
+    { id: "model", currentValue: selectedModel, options: modelChoices },
+    { id: "reasoning_effort", currentValue: "off", options: effortValues.map(value => ({ value, name: value })) },
+  ];
+}
 
 const heldPrompts = [];
 const permissionTurns = new Map();
@@ -133,10 +162,7 @@ function handle(msg) {
   }
   if (msg.method === "session/new") {
     record({ kind: "session/new", cwd: msg.params.cwd, mcpServers: msg.params.mcpServers });
-    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s1", configOptions: [
-      { id: "model", currentValue: "default" },
-      { id: "reasoning_effort", currentValue: "off" },
-    ] } });
+    send({ jsonrpc: "2.0", id: msg.id, result: { sessionId: "s1", configOptions: configOptions() } });
     return;
   }
   if (msg.method === "session/set_config_option") {
@@ -144,7 +170,8 @@ function handle(msg) {
     if (failConfig) {
       send({ jsonrpc: "2.0", id: msg.id, error: { code: -32602, message: "unknown config option" } });
     } else {
-      send({ jsonrpc: "2.0", id: msg.id, result: { configOptions: [{ id: msg.params.configId, currentValue: msg.params.value }] } });
+      if (msg.params.configId === "model") selectedModel = msg.params.value;
+      send({ jsonrpc: "2.0", id: msg.id, result: { configOptions: configOptions() } });
     }
     return;
   }
@@ -195,7 +222,7 @@ interface MockRecord {
 interface Harness {
 	driver: SessionDriver;
 	records(): MockRecord[];
-	start(input?: { task?: string; mode?: Mode; effort?: Effort }): Promise<void>;
+	start(input?: { task?: string; mode?: Mode; effort?: Effort; model?: string }): Promise<void>;
 	turnOutcome(): Promise<TurnOutcome>;
 	stop(): void;
 }
@@ -215,13 +242,9 @@ function makeHome(): string {
 	return mkdtempSync(path.join(tmpdir(), "dsh-driver-home-"));
 }
 
-/** The shared home under a fake user home, and the two files provisioning puts in it. */
+/** The shared home under a fake user home, and our overlay inside it. */
 function sharedHome(home: string): string {
 	return path.join(home, ".dsh");
-}
-
-function settingsDocIn(home: string): string {
-	return dshSettingsDocPath(sharedHome(home));
 }
 
 function overlayIn(home: string): string {
@@ -239,21 +262,28 @@ function overlayIn(home: string): string {
  * test probing through the fixture.
  */
 function armedAnchor(home: string): void {
-	const settingsDoc = settingsDocIn(home);
 	resetDshCompositionGuard();
 	for (const profile of ["headless", "acp"] as const) {
 		dshCompositionWarnings({
 			overlay: overlayIn(home),
-			settingsDoc,
 			profile,
 			run: () => ({
 				ok: true,
 				dump: [
 					`# == @deepseek-ai/dsh-base, patched by ${overlayIn(home)}`,
-					"- id: settings",
-					"  name: '@deepseek-ai/dsh-settings-file'",
+					"- id: permission",
 					"  config:",
-					`    path: ${settingsDoc}`,
+					"    presets:",
+					"      read-only:",
+					"        sandbox: read-only",
+					"        approval: ask",
+					"      workspace-write:",
+					"        sandbox: workspace-write",
+					"        approval: ask",
+					"      danger-full-access:",
+					"        sandbox: danger-full-access",
+					"        approval: never",
+					"    defaultPreset: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'",
 					"- id: sandbox-policy",
 					"  config:",
 					"    mode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'",
@@ -302,7 +332,7 @@ function withTimeout<T>(promise: Promise<T>, label: string, timeoutMs = 10_000):
 	]);
 }
 
-function makeHarness(agent: "dsh" | "reasonix", options: { home?: string; mockEnv?: Record<string, string> } = {}): Harness {
+function makeHarness(agent: "dsh" | "reasonix", options: { home?: string; mockEnv?: Record<string, string>; armAnchor?: boolean } = {}): Harness {
 	const bin = ADAPTERS[agent].bin;
 	const dir = makeFixtureDir({ [bin]: ACP_MOCK });
 	const logPath = path.join(dir, "session.jsonl");
@@ -318,7 +348,7 @@ function makeHarness(agent: "dsh" | "reasonix", options: { home?: string; mockEn
 	for (const [key, value] of Object.entries(options.mockEnv ?? {})) setEnv(key, value);
 	// The anchor's probe is memoized for the whole process: arm it for this
 	// fixture home so the fixture `dsh` is never asked to compose a config.
-	if (agent === "dsh" && options.home) armedAnchor(options.home);
+	if (agent === "dsh" && options.home && options.armAnchor !== false) armedAnchor(options.home);
 
 	const driver = SESSION_DRIVERS[agent]!();
 	const settled = new Promise<TurnOutcome>((resolve) => driver.onTurnEnd(resolve));
@@ -326,8 +356,7 @@ function makeHarness(agent: "dsh" | "reasonix", options: { home?: string; mockEn
 	return {
 		driver,
 		records: () => mockRecords(logPath),
-		start: (input = {}) =>
-			driver.start({ task: input.task ?? "do the thing", cwd: dir, mode: input.mode ?? "yolo", effort: input.effort }),
+		start: (input = {}) => driver.start({ task: input.task ?? "do the thing", cwd: dir, mode: input.mode ?? "yolo", effort: input.effort, model: input.model }),
 		turnOutcome: () => withTimeout(settled, "the turn to settle"),
 		stop: () => {
 			driver.kill();
@@ -362,8 +391,8 @@ test("dsh ACP session spawns `--profile acp --patch <overlay>` — never --acp �
 		await harness.start({ mode: "yolo", task: "audit the repo" });
 
 		// The receipt's argv (what the caller is told) and the argv the process
-		// actually got are the same profile entry, with the overlay that keeps
-		// dsh's settings row off the user's own settings document.
+		// actually got are the same profile entry, with the permission overlay that
+		// pins the requested tier.
 		const expected = ["--profile", "acp", "--patch", overlayIn(home)];
 		assert.deepEqual(harness.driver.argv, expected);
 		const spawn = harness.records()[0];
@@ -371,10 +400,9 @@ test("dsh ACP session spawns `--profile acp --patch <overlay>` — never --acp �
 		assert.deepEqual(spawn.argv, expected);
 		assert.equal(spawn.argv.includes("--acp"), false);
 
-		// The overlay is provisioned, and dsh's settings row is pinned to an
-		// empty document rather than to the user's settings.yaml.
-		assert.equal(readFileSync(settingsDocIn(home), "utf8"), "");
-		assert.match(readFileSync(overlayIn(home), "utf8"), new RegExp(`path: ${settingsDocIn(home)}`));
+		// The overlay is provisioned and pins the 0.2.1 permission row.
+		assert.equal(readFileSync(overlayIn(home), "utf8"), dshOverlayContent());
+		assert.match(readFileSync(overlayIn(home), "utf8"), /^- id: permission$/m);
 
 		// No prompt, model or effort flag in the startup argv: the task is a
 		// protocol frame, and this CLI has no effort flag at all.
@@ -417,11 +445,10 @@ test("dsh ACP session env: the mode's DSH_PERMISSION_MODE, no inherited DSH_HOME
 	}
 });
 
-test("dsh ACP session: an unusable shared home refuses the session start instead of running under the user's settings", async () => {
+test("dsh ACP session: an unusable shared home refuses the session start instead of running with an unproven tier", async () => {
 	const root = mkdtempSync(path.join(tmpdir(), "dsh-driver-blocked-"));
-	// A file where the shared home would have to be: neither of provisioning's
-	// two files can exist, and without them dsh would read the user's own
-	// settings document, whose permission.defaultPreset outranks the tier.
+	// A file where the shared home would have to be: the overlay cannot exist, so
+	// the requested permission tier cannot be pinned.
 	const blocked = sharedHome(root);
 	writeFileSync(blocked, "in the way\n");
 	const harness = makeHarness("dsh", { home: root });
@@ -460,7 +487,10 @@ test("dsh ACP session sets reasoning_effort after session/new, mapped for every 
 		["xhigh", "max"],
 		["max", "max"],
 	];
-	assert.deepEqual(EFFORT_LEVELS, expected.map(([effort]) => effort));
+	assert.deepEqual(
+		EFFORT_LEVELS,
+		expected.map(([effort]) => effort),
+	);
 	for (const [effort, token] of expected) {
 		const harness = makeHarness("dsh", { home });
 		try {
@@ -479,12 +509,10 @@ test("dsh ACP session sets reasoning_effort after session/new, mapped for every 
 
 			// The CLI only accepts the config once the session exists, and the
 			// turn must not start before the level is set.
-			assert.deepEqual(records.slice(0, 4).map((record) => record.kind), [
-				"spawn",
-				"initialize",
-				"session/new",
-				"set_config_option",
-			]);
+			assert.deepEqual(
+				records.slice(0, 4).map((record) => record.kind),
+				["spawn", "initialize", "session/new", "set_config_option"],
+			);
 			assert.equal(records[4].kind, "prompt", "the prompt left before the effort was applied");
 			// Never an effort flag on this CLI.
 			assert.equal(harness.driver.argv.includes("--effort"), false);
@@ -520,6 +548,78 @@ test("dsh ACP session: a rejected set_config_option fails the start with the ser
 			},
 		);
 		assert.deepEqual(ofKind(harness.records(), "prompt"), [], "the turn ran at a default the caller did not ask for");
+	} finally {
+		harness.stop();
+	}
+});
+
+// ---------------------------------------------------------------------------
+// Model selection and effort capability negotiation
+// ---------------------------------------------------------------------------
+
+test("dsh ACP session sets the advertised model before effort", async () => {
+	const home = makeHome();
+	const harness = makeHarness("dsh", { home });
+	try {
+		await harness.start({ mode: "yolo", model: "alpha", effort: "high" });
+		await waitFor("the first session/prompt", () => ofKind(harness.records(), "prompt")[0]);
+		const configured = ofKind(harness.records(), "set_config_option");
+		assert.deepEqual(
+			configured.map((entry) => entry.configId),
+			["model", "reasoning_effort"],
+		);
+		assert.deepEqual(configured[0], {
+			kind: "set_config_option",
+			sessionId: "s1",
+			configId: "model",
+			value: JSON.stringify(["provider-a", "alpha"]),
+		});
+		assert.equal(configured[1].value, "high");
+	} finally {
+		harness.stop();
+	}
+});
+
+test("dsh ACP session resolves provider/model and exact opaque model selectors", async () => {
+	for (const [requested, expected] of [
+		["provider-b/beta", JSON.stringify(["provider-b", "beta"])],
+		[JSON.stringify(["provider-a", "shared"]), JSON.stringify(["provider-a", "shared"])],
+	] as const) {
+		const home = makeHome();
+		const harness = makeHarness("dsh", { home });
+		try {
+			await harness.start({ mode: "yolo", model: requested });
+			await waitFor("the model set", () => ofKind(harness.records(), "set_config_option")[0]);
+			assert.equal(ofKind(harness.records(), "set_config_option")[0].value, expected);
+		} finally {
+			harness.stop();
+		}
+	}
+});
+
+test("dsh ACP session refuses an ambiguous or unknown model before the prompt", async () => {
+	for (const [requested, expected] of [
+		["shared", /ambiguous across providers/],
+		["missing", /does not advertise model/],
+	] as const) {
+		const home = makeHome();
+		const harness = makeHarness("dsh", { home });
+		try {
+			await assert.rejects(() => harness.start({ mode: "yolo", model: requested }), expected);
+			assert.deepEqual(ofKind(harness.records(), "set_config_option"), []);
+			assert.deepEqual(ofKind(harness.records(), "prompt"), []);
+		} finally {
+			harness.stop();
+		}
+	}
+});
+
+test("dsh ACP session refuses an effort the selected model does not advertise", async () => {
+	const home = makeHome();
+	const harness = makeHarness("dsh", { home, mockEnv: { DSH_MOCK_EFFORT_OPTIONS: JSON.stringify(["high", "max"]) } });
+	try {
+		await assert.rejects(() => harness.start({ mode: "yolo", effort: "off" }), /does not offer reasoning effort "off"/);
+		assert.deepEqual(ofKind(harness.records(), "prompt"), []);
 	} finally {
 		harness.stop();
 	}
@@ -563,12 +663,16 @@ test("dsh ACP session readonly: with no reject option offered, the escalation an
 	assert.deepEqual(response.outcome, { outcome: "cancelled" });
 });
 
-test("dsh ACP session write and yolo: a sandbox escalation is allowed", async () => {
-	for (const mode of ["write", "yolo"] as Mode[]) {
-		const response = await answerPermission(mode, PERMISSION_WITH_REJECT);
-		assert.equal(response.error, null, `${mode} did not answer the permission request`);
-		assert.deepEqual(response.outcome, { outcome: "selected", optionId: "allow-once-1" }, `${mode} did not allow the escalation`);
-	}
+test("dsh ACP session write: a sandbox escalation is rejected, keeping write inside the workspace", async () => {
+	const response = await answerPermission("write", PERMISSION_WITH_REJECT);
+	assert.equal(response.error, null);
+	assert.deepEqual(response.outcome, { outcome: "selected", optionId: "reject-once-1" });
+});
+
+test("dsh ACP session yolo: a sandbox escalation is allowed", async () => {
+	const response = await answerPermission("yolo", PERMISSION_WITH_REJECT);
+	assert.equal(response.error, null);
+	assert.deepEqual(response.outcome, { outcome: "selected", optionId: "allow-once-1" });
 });
 
 test("dsh ACP session: repeated escalations are all answered, and none is read as the prompt's reply", async () => {
@@ -589,7 +693,10 @@ test("dsh ACP session: repeated escalations are all answered, and none is read a
 
 		const outcome = await harness.turnOutcome();
 		const records = harness.records();
-		assert.deepEqual(ofKind(records, "ask").map((ask) => ask.id), [0, 1, 2, 3]);
+		assert.deepEqual(
+			ofKind(records, "ask").map((ask) => ask.id),
+			[0, 1, 2, 3],
+		);
 		const answers = ofKind(records, "client_response");
 		assert.equal(answers.length, 4, "the turn settled before every escalation had been answered");
 		for (const answer of answers) {
@@ -603,10 +710,43 @@ test("dsh ACP session: repeated escalations are all answered, and none is read a
 });
 
 // ---------------------------------------------------------------------------
+// Mode-aware composition fail-closed
+// ---------------------------------------------------------------------------
+
+test("dsh ACP start refuses readonly/write when the composition is unproven and warns for yolo", async () => {
+	for (const mode of ["readonly", "write"] as Mode[]) {
+		const home = makeHome();
+		resetDshCompositionGuard();
+		const harness = makeHarness("dsh", { home, armAnchor: false, mockEnv: { DSH_MOCK_DUMP: "foreign" } });
+		try {
+			await assert.rejects(() => harness.start({ mode }), new RegExp(`did not prove the requested ${mode} permission tier`));
+			assert.deepEqual(ofKind(harness.records(), "spawn"), []);
+		} finally {
+			harness.stop();
+		}
+	}
+
+	const home = makeHome();
+	resetDshCompositionGuard();
+	const harness = makeHarness("dsh", { home, armAnchor: false, mockEnv: { DSH_MOCK_DUMP: "foreign" } });
+	const warnings: string[] = [];
+	harness.driver.onEvent((event) => {
+		if (event.kind === "warning") warnings.push(event.text);
+	});
+	try {
+		await harness.start({ mode: "yolo" });
+		await waitFor("the yolo prompt", () => ofKind(harness.records(), "prompt")[0]);
+		assert.match(warnings.join(" "), /defaultPreset|permission row/);
+	} finally {
+		harness.stop();
+	}
+});
+
+// ---------------------------------------------------------------------------
 // Steering
 // ---------------------------------------------------------------------------
 
-test("dsh ACP session: a steer with no advertised method lands as a second session/prompt", async () => {
+test("dsh ACP session: steer is refused without a concurrent session/prompt", async () => {
 	const home = makeHome();
 	const harness = makeHarness("dsh", { home, mockEnv: { DSH_MOCK_HOLD: "1" } });
 	try {
@@ -614,22 +754,10 @@ test("dsh ACP session: a steer with no advertised method lands as a second sessi
 		await waitFor("the first session/prompt", () => ofKind(harness.records(), "prompt")[0]);
 
 		const result = await harness.driver.steer("focus on the lexer");
-		assert.equal(result.accepted, true);
-		assert.match(result.note ?? "", /extra prompt/);
-
-		const prompts = await waitFor("the steer to land as a second session/prompt", () => {
-			const list = ofKind(harness.records(), "prompt");
-			return list.length >= 2 ? list : undefined;
-		});
-		assert.deepEqual(prompts.map((prompt) => prompt.text), ["audit the parser", "focus on the lexer"]);
-		assert.equal(prompts[1].sessionId, "s1");
-		// No vendor steer method was invented for a harness that advertises none.
+		assert.equal(result.accepted, false);
+		assert.match(result.reason ?? "", /no mid-run steering/);
+		assert.equal(ofKind(harness.records(), "prompt").length, 1, "dsh sent a concurrent prompt");
 		assert.deepEqual(ofKind(harness.records(), "steer_method"), []);
-		assert.deepEqual(ofKind(harness.records(), "initialize")[0].advertisedSteerMethod, null);
-
-		// The held turn resolves once the steer arrives, and the session stays up
-		// for a follow-up.
-		assert.deepEqual(await harness.turnOutcome(), { status: "done" });
 		assert.equal(harness.driver.alive, true);
 	} finally {
 		harness.stop();
